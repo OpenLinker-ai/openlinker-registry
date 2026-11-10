@@ -115,36 +115,43 @@ func (s *Service) recentlyVerified(v model.Version) bool {
 }
 
 // GCArtifacts deletes permanent artifacts that no hosted version references
-// and that were not written or refreshed since before. Publishing refreshes a
-// blob's modification time before committing the version row, and deletion
-// re-checks the time right before removing, so a blob being published within
-// the grace period is never collected. It returns the number removed.
+// and that were not written or refreshed since before. For each candidate it
+// takes the digest's exclusive lock, which waits for any in-flight publish of
+// the same digest to commit or fail, then re-checks the reference and the age
+// and only then deletes. A publish that starts afterwards waits for the lock
+// and rewrites the blob. It returns the number removed.
 func (s *Service) GCArtifacts(ctx context.Context, before time.Time) (int, error) {
 	old, err := s.Blobs.Older(ctx, blobstore.Artifacts, before)
-	if err != nil || len(old) == 0 {
+	if err != nil {
 		return 0, err
 	}
 	removed := 0
-	for start := 0; start < len(old); start += 500 {
-		batch := old[start:min(start+500, len(old))]
-		refs, err := s.Store.ReferencedArtifacts(ctx, batch)
+	for _, d := range old {
+		ok, err := s.gcOne(ctx, d, before)
 		if err != nil {
 			return removed, err
 		}
-		for _, d := range batch {
-			if refs[d] {
-				continue
-			}
-			ok, err := s.Blobs.DeleteIfOlder(ctx, blobstore.Artifacts, d, before)
-			if err != nil {
-				return removed, err
-			}
-			if ok {
-				removed++
-			}
+		if ok {
+			removed++
 		}
 	}
 	return removed, nil
+}
+
+func (s *Service) gcOne(ctx context.Context, digest string, before time.Time) (bool, error) {
+	if s.gcBeforeLock != nil {
+		s.gcBeforeLock(digest)
+	}
+	unlock := s.locks.exclusive(digest)
+	defer unlock()
+	refs, err := s.Store.ReferencedArtifacts(ctx, []string{digest})
+	if err != nil || refs[digest] {
+		return false, err
+	}
+	if s.gcBeforeDelete != nil {
+		s.gcBeforeDelete(digest)
+	}
+	return s.Blobs.DeleteIfOlder(ctx, blobstore.Artifacts, digest, before)
 }
 
 func (s *Service) markCheck(ctx context.Context, v model.Version, result string) error {

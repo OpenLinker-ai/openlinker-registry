@@ -89,6 +89,12 @@ type Service struct {
 	GitHub *github.Client
 	Cfg    Config
 	Now    func() time.Time
+
+	locks digestLocks
+	// Test hooks for deterministic concurrency tests; nil in production.
+	afterArtifactPut func(digest string)
+	gcBeforeLock     func(digest string)
+	gcBeforeDelete   func(digest string)
 }
 
 // New builds a service.
@@ -277,11 +283,17 @@ func (s *Service) publishHosted(ctx context.Context, o PublishOptions, files []s
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
-	// The blob is written (or its mtime refreshed) before the version row is
-	// committed. If the publish fails, the blob may be orphaned; GCArtifacts
-	// removes unreferenced blobs once they are older than the grace period.
+	// The blob is written before the version row is committed, under a
+	// shared lease that GCArtifacts must wait for. If the publish fails, the
+	// blob may be orphaned; GCArtifacts removes it after the grace period.
+	digest := skill.Digest(artifact)
+	unlock := s.locks.shared(digest)
+	defer unlock()
 	if _, err := s.Blobs.Put(ctx, blobstore.Artifacts, artifact); err != nil {
 		return model.Skill{}, model.Version{}, err
+	}
+	if s.afterArtifactPut != nil {
+		s.afterArtifactPut(digest)
 	}
 	v := b.version
 	v.Version, v.Source, v.CreatedBy = o.Version, &src, o.Actor

@@ -66,7 +66,7 @@ Secrets are read from the environment only.
 | `REGISTRY_MAX_FILES` / `_MAX_FILE_BYTES` / `_MAX_TOTAL_BYTES` | flags | 256 / 2 MiB / 16 MiB | Skill limits |
 | `REGISTRY_CACHE_MAX_AGE` / `_CACHE_MAX_BYTES` | flags | `720h` / 1 GiB | Evictable cache for indexed content |
 | `REGISTRY_VERIFY_INTERVAL` | `-verify-interval` | `1h` | Cached indexed content is served only this long after the last successful source verification (`0` = verify on every read) |
-| `REGISTRY_ARTIFACT_GC_GRACE` | `-artifact-gc-grace` | `24h` | Unreferenced hosted artifacts (left by failed publishes) older than this are deleted hourly |
+| `REGISTRY_ARTIFACT_GC_GRACE` | `-artifact-gc-grace` | `24h` | Unreferenced hosted artifacts (left by failed publishes) older than this are deleted hourly. GC and publishes of the same digest are serialized by an in-process per-digest lock, so one registry process must own a storage directory |
 
 ## API summary
 
