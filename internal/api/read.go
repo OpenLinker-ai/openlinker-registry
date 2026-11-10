@@ -212,12 +212,24 @@ func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.versionJSON(sk, v))
 }
 
-func cacheHeader(w http.ResponseWriter, sk model.Skill) {
-	if sk.Visibility == model.VisibilityPublic {
-		w.Header().Set("Cache-Control", "public, max-age=300")
-	} else {
-		w.Header().Set("Cache-Control", "private, no-store")
+// sharedCacheMaxAge is deliberately short: visibility, listing and status
+// can change after a response is cached.
+const sharedCacheMaxAge = "60"
+
+// setCache allows shared caching only for responses that are identical for
+// every caller: anonymous reads enabled, an anonymous request, and content
+// that is public (and, for indexes, built only from public entries).
+// Everything else is "private, no-store". Vary: Authorization is always set
+// so a cache never serves an anonymous response to an authenticated request
+// or vice versa.
+func (s *Server) setCache(w http.ResponseWriter, r *http.Request, public bool) {
+	h := w.Header()
+	h.Add("Vary", "Authorization")
+	if public && s.AllowAnonRead && r.Header.Get("Authorization") == "" && !principal(r).Authenticated {
+		h.Set("Cache-Control", "public, max-age="+sharedCacheMaxAge)
+		return
 	}
+	h.Set("Cache-Control", "private, no-store")
 }
 
 func safeFilename(s string) string {
@@ -229,9 +241,9 @@ func safeFilename(s string) string {
 	}, s)
 }
 
-func writeBlob(w http.ResponseWriter, sk model.Skill, data []byte, contentType, disposition, digest string) {
+func (s *Server) writeBlob(w http.ResponseWriter, r *http.Request, sk model.Skill, data []byte, contentType, disposition, digest string) {
 	h := w.Header()
-	cacheHeader(w, sk)
+	s.setCache(w, r, sk.Visibility == model.VisibilityPublic)
 	h.Set("Content-Type", contentType)
 	h.Set("Content-Disposition", disposition)
 	h.Set("Content-Length", strconv.Itoa(len(data)))
@@ -258,11 +270,11 @@ func (s *Server) getArtifact(w http.ResponseWriter, r *http.Request) {
 	base := safeFilename(sk.Name + "-" + v.Version)
 	switch v.ArtifactType {
 	case "skill-md":
-		writeBlob(w, sk, data, "text/plain; charset=utf-8", `attachment; filename="SKILL.md"`, v.ArtifactDigest)
+		s.writeBlob(w, r, sk, data, "text/plain; charset=utf-8", `attachment; filename="SKILL.md"`, v.ArtifactDigest)
 	case "tar":
-		writeBlob(w, sk, data, "application/x-tar", `attachment; filename="`+base+`.tar"`, v.ArtifactDigest)
+		s.writeBlob(w, r, sk, data, "application/x-tar", `attachment; filename="`+base+`.tar"`, v.ArtifactDigest)
 	default:
-		writeBlob(w, sk, data, "application/json", `attachment; filename="`+base+`.json"`, v.ArtifactDigest)
+		s.writeBlob(w, r, sk, data, "application/json", `attachment; filename="`+base+`.json"`, v.ArtifactDigest)
 	}
 }
 
@@ -277,7 +289,7 @@ func (s *Server) getArchive(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeBlob(w, sk, data, "application/gzip", `attachment; filename="`+safeFilename(sk.Name+"-"+v.Version)+`.tar.gz"`, v.ArchiveDigest)
+	s.writeBlob(w, r, sk, data, "application/gzip", `attachment; filename="`+safeFilename(sk.Name+"-"+v.Version)+`.tar.gz"`, v.ArchiveDigest)
 }
 
 func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
@@ -312,7 +324,7 @@ func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 			writeError(w, &registry.Error{Status: http.StatusUnsupportedMediaType, Code: "not_text", Msg: "file is not UTF-8 text; download the artifact"})
 			return
 		}
-		writeBlob(w, sk, f.Data, "text/plain; charset=utf-8", `inline; filename="`+safeFilename(path.Base(p))+`"`, skill.Digest(f.Data))
+		s.writeBlob(w, r, sk, f.Data, "text/plain; charset=utf-8", `inline; filename="`+safeFilename(path.Base(p))+`"`, skill.Digest(f.Data))
 		return
 	}
 	s.fail(w, r, errNotFound)
@@ -322,13 +334,10 @@ func (s *Server) wellKnownSite(w http.ResponseWriter, r *http.Request) {
 	s.wellKnown(w, r, "")
 }
 
+// wellKnownNamespace returns the same empty index for unknown namespaces and
+// for namespaces without public entries, so existence is not revealed.
 func (s *Server) wellKnownNamespace(w http.ResponseWriter, r *http.Request) {
-	ns := r.PathValue("ns")
-	if _, err := s.Svc.Store.GetNamespace(r.Context(), ns); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	s.wellKnown(w, r, ns)
+	s.wellKnown(w, r, r.PathValue("ns"))
 }
 
 func (s *Server) wellKnown(w http.ResponseWriter, r *http.Request, ns string) {
@@ -337,7 +346,8 @@ func (s *Server) wellKnown(w http.ResponseWriter, r *http.Request, ns string) {
 		s.fail(w, r, err)
 		return
 	}
-	w.Header().Set("Cache-Control", "public, max-age=300")
+	// Indexes contain only public entries, but they are mutable.
+	s.setCache(w, r, true)
 	writeJSON(w, http.StatusOK, idx)
 }
 

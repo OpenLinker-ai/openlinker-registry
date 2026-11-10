@@ -40,7 +40,7 @@ func conflict(code, msg string) error { return &model.ConflictError{Code: code, 
 func (m *Memory) Ping(context.Context) error { return nil }
 
 // CreateNamespace implements Store.
-func (m *Memory) CreateNamespace(_ context.Context, ns model.Namespace) (model.Namespace, error) {
+func (m *Memory) CreateNamespace(_ context.Context, ns model.Namespace, audit model.AuditEvent) (model.Namespace, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.ns[ns.Name]; ok {
@@ -55,6 +55,7 @@ func (m *Memory) CreateNamespace(_ context.Context, ns model.Namespace) (model.N
 	}
 	ns.ID, ns.CreatedAt = m.id(), time.Now().UTC()
 	m.ns[ns.Name] = ns
+	m.appendAudit(audit)
 	return ns, nil
 }
 
@@ -70,7 +71,7 @@ func (m *Memory) GetNamespace(_ context.Context, name string) (model.Namespace, 
 }
 
 // SetRole implements Store.
-func (m *Memory) SetRole(_ context.Context, namespace, subject string, role model.Role) error {
+func (m *Memory) SetRole(_ context.Context, namespace, subject string, role model.Role, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.ns[namespace]; !ok {
@@ -80,6 +81,7 @@ func (m *Memory) SetRole(_ context.Context, namespace, subject string, role mode
 		m.roles[subject] = map[string]model.Role{}
 	}
 	m.roles[subject][namespace] = role
+	m.appendAudit(audit)
 	return nil
 }
 
@@ -95,7 +97,7 @@ func (m *Memory) RolesForSubject(_ context.Context, subject string) (map[string]
 }
 
 // CreateToken implements Store.
-func (m *Memory) CreateToken(_ context.Context, t model.Token, roles []model.RoleBinding) error {
+func (m *Memory) CreateToken(_ context.Context, t model.Token, roles []model.RoleBinding, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.tokens[t.ID]; ok {
@@ -116,6 +118,7 @@ func (m *Memory) CreateToken(_ context.Context, t model.Token, roles []model.Rol
 		}
 		m.roles[subject][rb.Namespace] = rb.Role
 	}
+	m.appendAudit(audit)
 	return nil
 }
 
@@ -131,7 +134,7 @@ func (m *Memory) GetToken(_ context.Context, id string) (model.Token, error) {
 }
 
 // RevokeToken implements Store.
-func (m *Memory) RevokeToken(_ context.Context, id string, at time.Time) error {
+func (m *Memory) RevokeToken(_ context.Context, id string, at time.Time, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t, ok := m.tokens[id]
@@ -142,6 +145,7 @@ func (m *Memory) RevokeToken(_ context.Context, id string, at time.Time) error {
 		t.RevokedAt = &at
 		m.tokens[id] = t
 	}
+	m.appendAudit(audit)
 	return nil
 }
 
@@ -166,7 +170,7 @@ func (m *Memory) GetSkill(_ context.Context, namespace, name string) (model.Skil
 }
 
 // PublishVersion implements Store.
-func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput) (model.Skill, model.Version, error) {
+func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.ns[in.Namespace]; !ok {
@@ -193,7 +197,7 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput) (model
 		if in.SourceKey != "" {
 			for _, other := range m.skills {
 				if other.SourceKey == in.SourceKey {
-					return model.Skill{}, model.Version{}, conflict("source_already_indexed", "this source is already indexed as "+other.Namespace+"/"+other.Name)
+					return model.Skill{}, model.Version{}, conflict("source_already_indexed", "this source is already indexed on this registry")
 				}
 			}
 		}
@@ -206,6 +210,7 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput) (model
 	m.versions[v.ID] = v
 	s.Description, s.UpdatedAt = v.FrontmatterDescription, now
 	m.skills[s.ID] = s
+	m.appendAudit(audit)
 	return s, v, nil
 }
 
@@ -249,7 +254,7 @@ func (m *Memory) GetVersion(_ context.Context, skillID int64, version string) (m
 }
 
 // UpdateSkill implements Store.
-func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatch) (model.Skill, error) {
+func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.skills[skillID]
@@ -264,11 +269,12 @@ func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatc
 	}
 	s.UpdatedAt = time.Now().UTC()
 	m.skills[skillID] = s
+	m.appendAudit(audit)
 	return s, nil
 }
 
 // SetSkillStatus implements Store.
-func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason string) (model.Skill, error) {
+func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.skills[skillID]
@@ -277,11 +283,12 @@ func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason
 	}
 	s.Status, s.StatusReason, s.UpdatedAt = status, reason, time.Now().UTC()
 	m.skills[skillID] = s
+	m.appendAudit(audit)
 	return s, nil
 }
 
 // SetAlias implements Store.
-func (m *Memory) SetAlias(_ context.Context, skillID int64, alias string) error {
+func (m *Memory) SetAlias(_ context.Context, skillID int64, alias string, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.skills[skillID]
@@ -297,10 +304,11 @@ func (m *Memory) SetAlias(_ context.Context, skillID int64, alias string) error 
 	}
 	s.GlobalAlias = alias
 	m.skills[skillID] = s
+	m.appendAudit(audit)
 	return nil
 }
 
-func (m *Memory) mutateVersion(id int64, f func(*model.Version)) error {
+func (m *Memory) mutateVersion(id int64, audit *model.AuditEvent, f func(*model.Version)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	v, ok := m.versions[id]
@@ -309,12 +317,15 @@ func (m *Memory) mutateVersion(id int64, f func(*model.Version)) error {
 	}
 	f(&v)
 	m.versions[id] = v
+	if audit != nil {
+		m.appendAudit(*audit)
+	}
 	return nil
 }
 
 // YankVersion implements Store.
-func (m *Memory) YankVersion(_ context.Context, id int64, reason string, at time.Time) error {
-	return m.mutateVersion(id, func(v *model.Version) {
+func (m *Memory) YankVersion(_ context.Context, id int64, reason string, at time.Time, audit model.AuditEvent) error {
+	return m.mutateVersion(id, &audit, func(v *model.Version) {
 		if v.YankedAt == nil {
 			v.YankedAt, v.YankReason = &at, reason
 		}
@@ -322,13 +333,13 @@ func (m *Memory) YankVersion(_ context.Context, id int64, reason string, at time
 }
 
 // ApproveLicense implements Store.
-func (m *Memory) ApproveLicense(_ context.Context, id int64) error {
-	return m.mutateVersion(id, func(v *model.Version) { v.LicenseApproved = true })
+func (m *Memory) ApproveLicense(_ context.Context, id int64, audit model.AuditEvent) error {
+	return m.mutateVersion(id, &audit, func(v *model.Version) { v.LicenseApproved = true })
 }
 
 // SetVersionCheck implements Store.
 func (m *Memory) SetVersionCheck(_ context.Context, id int64, result string, at time.Time) error {
-	return m.mutateVersion(id, func(v *model.Version) { v.CheckResult, v.CheckedAt = result, &at })
+	return m.mutateVersion(id, nil, func(v *model.Version) { v.CheckResult, v.CheckedAt = result, &at })
 }
 
 // Search implements Store.
@@ -394,13 +405,34 @@ func (m *Memory) IndexCandidates(_ context.Context, namespace string, aliasOnly 
 	return out, nil
 }
 
+func (m *Memory) appendAudit(e model.AuditEvent) {
+	e.ID, e.At = m.id(), time.Now().UTC()
+	m.audit = append(m.audit, e)
+}
+
 // AppendAudit implements Store.
 func (m *Memory) AppendAudit(_ context.Context, e model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	e.ID, e.At = m.id(), time.Now().UTC()
-	m.audit = append(m.audit, e)
+	m.appendAudit(e)
 	return nil
+}
+
+// ReferencedArtifacts implements Store.
+func (m *Memory) ReferencedArtifacts(_ context.Context, digests []string) (map[string]bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	want := map[string]bool{}
+	for _, d := range digests {
+		want[d] = true
+	}
+	out := map[string]bool{}
+	for _, v := range m.versions {
+		if v.Mode == "hosted" && want[v.ArtifactDigest] {
+			out[v.ArtifactDigest] = true
+		}
+	}
+	return out, nil
 }
 
 // ListAudit implements Store (newest first).

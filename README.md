@@ -52,7 +52,7 @@ Secrets are read from the environment only.
 | `REGISTRY_BASE_PATH` | `-base-path` | `""` | Path prefix such as `/registry` |
 | `REGISTRY_DATABASE_URL` | `-database-url` | required | PostgreSQL DSN |
 | `REGISTRY_STORAGE_DIR` | `-storage-dir` | `./data` | Local content-addressed blob store |
-| `REGISTRY_PUBLIC_URL` | `-public-url` | required | External URL of the registry root **including** the base path; used in discovery URLs |
+| `REGISTRY_PUBLIC_URL` | `-public-url` | required | External URL of the registry root; used in discovery URLs. When a base path is set, its path must end with the base path |
 | `REGISTRY_MODE` | `-mode` | `private` | `public` or `private` |
 | `REGISTRY_ALLOW_ANONYMOUS_READ` | `-allow-anonymous-read` | `true` if public, else `false` | Anonymous read access |
 | `REGISTRY_ALLOW_PUBLIC_VISIBILITY` | `-allow-public` | `true` | Allow `public` visibility |
@@ -65,6 +65,8 @@ Secrets are read from the environment only.
 | `REGISTRY_MAX_UPLOAD_BYTES` | `-max-upload-bytes` | 16 MiB | Upload body limit |
 | `REGISTRY_MAX_FILES` / `_MAX_FILE_BYTES` / `_MAX_TOTAL_BYTES` | flags | 256 / 2 MiB / 16 MiB | Skill limits |
 | `REGISTRY_CACHE_MAX_AGE` / `_CACHE_MAX_BYTES` | flags | `720h` / 1 GiB | Evictable cache for indexed content |
+| `REGISTRY_VERIFY_INTERVAL` | `-verify-interval` | `1h` | Cached indexed content is served only this long after the last successful source verification (`0` = verify on every read) |
+| `REGISTRY_ARTIFACT_GC_GRACE` | `-artifact-gc-grace` | `24h` | Unreferenced hosted artifacts (left by failed publishes) older than this are deleted hourly |
 
 ## API summary
 
@@ -115,9 +117,17 @@ Invisible entries return 404 on every read path.
   numeric GitHub id, which must be unique), `ai.openlinker.<handle>` (public
   instance only), `internal.<team>` (private instance only) or a reverse
   domain (verification not implemented yet).
-- **Immutability.** Versions never change; only review, check and yank fields
-  may be updated, enforced by a database trigger. The audit table is
-  append-only (trigger rejects UPDATE, DELETE and TRUNCATE).
+- **Immutability and audit.** Versions never change; only review, check and
+  yank fields may be updated, enforced by database triggers (UPDATE, DELETE and
+  TRUNCATE). The audit table is append-only, and every mutation writes its
+  audit row in the same transaction: if auditing fails, the request fails.
+- **Archives.** Uploads are bounded by file count, per-file and total size,
+  and a cap on every decompressed byte (headers, PAX/GNU metadata, padding).
+  Gzip streams must end cleanly with a valid checksum; trailing data is
+  rejected.
+- **Caching.** Only anonymous requests for public content on an instance with
+  anonymous reads get `Cache-Control: public, max-age=60`; everything else is
+  `private, no-store`. Responses carry `Vary: Authorization`.
 - **GitHub.** URLs take the ref as one path segment; refs containing `/` are
   rejected (use a commit SHA). The registry resolves to a 40-hex commit, lists
   `git/trees/{commit}:{path}?recursive=1`, rejects truncated trees, symlinks
@@ -132,13 +142,18 @@ Invisible entries return 404 on every read path.
 - **Licenses (indexed content).** Redistributable SPDX: full text and cached
   artifact served. `custom`: only after admin approval. `unknown`: metadata,
   manifest and source link only. Hosted `public` skills need an SPDX license or
-  `custom` with text; `unknown` can only be `internal` or `private`. Indexed
-  entries take the license from the SKILL.md frontmatter.
+  `custom` with non-empty text (`license_text` or a root LICENSE file), which is
+  stored and returned as `license.text`; `unknown` can only be `internal` or
+  `private`. Indexed entries take the license from the SKILL.md frontmatter.
+  Indexed content is re-verified against the source once the verification
+  interval has passed, even if the bytes are cached.
 - **Discovery.** Only `public`, listed, active skills whose latest non-yanked
   version is eligible: hosted entries, single-file indexed entries (raw URL at
   the commit), and multi-file indexed entries whose license permits
   redistribution and whose last source check did not fail. No URL contains
-  credentials or signed parameters.
+  credentials or signed parameters. A namespace index for an unknown namespace
+  is the same empty index as for a namespace without public entries.
+  Duplicate-source conflicts do not name the existing entry.
 
 ## Not in R1
 

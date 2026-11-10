@@ -18,6 +18,21 @@ func TestLoad(t *testing.T) {
 			t.Errorf("%v accepted", bad)
 		}
 	}
+	// Base path and public URL must agree.
+	env["REGISTRY_PUBLIC_URL"] = "https://r.example"
+	if _, err := Load([]string{"-base-path", "/registry"}, get); err == nil {
+		t.Fatal("public URL without the base path accepted")
+	}
+	if _, err := Load([]string{"-base-path", "/registry", "-public-url", "https://r.example/edge/registry"}, get); err != nil {
+		t.Fatalf("proxy prefix before base path rejected: %v", err)
+	}
+	if _, err := Load(nil, get); err != nil {
+		t.Fatalf("no base path: %v", err)
+	}
+	if _, err := Load([]string{"-verify-interval", "-1s"}, get); err == nil {
+		t.Fatal("negative verify interval accepted")
+	}
+	env["REGISTRY_PUBLIC_URL"] = "https://r.example/registry/"
 	env["REGISTRY_ADMIN_TOKEN"] = "short"
 	if _, err := Load(nil, get); err == nil {
 		t.Fatal("short admin token accepted")

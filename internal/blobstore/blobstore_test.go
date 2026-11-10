@@ -57,3 +57,25 @@ func TestLocalPutGetEvict(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOlderAndDeleteIfOlder(t *testing.T) {
+	ctx := context.Background()
+	l, _ := NewLocal(t.TempDir())
+	d, _ := l.Put(ctx, Artifacts, []byte("a"))
+	p, _ := l.path(Artifacts, d)
+	past := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(p, past, past)
+	cut := time.Now().Add(-time.Hour)
+	if old, _ := l.Older(ctx, Artifacts, cut); len(old) != 1 || old[0] != d {
+		t.Fatalf("older = %v", old)
+	}
+	// Re-putting refreshes the time, so a concurrent publish is protected.
+	l.Put(ctx, Artifacts, []byte("a"))
+	if ok, _ := l.DeleteIfOlder(ctx, Artifacts, d, cut); ok {
+		t.Fatal("refreshed blob deleted")
+	}
+	os.Chtimes(p, past, past)
+	if ok, _ := l.DeleteIfOlder(ctx, Artifacts, d, cut); !ok {
+		t.Fatal("old blob not deleted")
+	}
+}

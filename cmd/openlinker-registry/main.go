@@ -69,7 +69,8 @@ func run(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	svc := registry.New(st, blobs, gh, registry.Config{Mode: cfg.Mode, AllowPublic: cfg.AllowPublic, Limits: cfg.Limits, PublicURL: cfg.PublicURL})
+	svc := registry.New(st, blobs, gh, registry.Config{Mode: cfg.Mode, AllowPublic: cfg.AllowPublic, Limits: cfg.Limits,
+		PublicURL: cfg.PublicURL, VerifyInterval: cfg.VerifyInterval})
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, cfg.AdminToken), BasePath: cfg.BasePath,
 		AllowAnonRead: cfg.AllowAnonRead, MaxUploadBytes: cfg.MaxUploadBytes, Log: log}
 
@@ -81,6 +82,11 @@ func run(args []string, log *slog.Logger) error {
 				log.Warn("cache eviction failed", "err", err.Error())
 			} else if n > 0 {
 				log.Info("cache evicted", "entries", n)
+			}
+			if n, err := svc.GCArtifacts(ctx, time.Now().Add(-cfg.ArtifactGCGrace)); err != nil {
+				log.Warn("artifact gc failed", "err", err.Error())
+			} else if n > 0 {
+				log.Info("unreferenced artifacts removed", "entries", n)
 			}
 			select {
 			case <-ctx.Done():

@@ -113,6 +113,37 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func insertAudit(ctx context.Context, q execer, e model.AuditEvent) error {
+	details := e.Details
+	if details == nil {
+		details = map[string]any{}
+	}
+	b, err := json.Marshal(details)
+	if err != nil {
+		return err
+	}
+	_, err = q.Exec(ctx, `INSERT INTO audit_events (actor, action, namespace, target, details) VALUES ($1,$2,$3,$4,$5)`,
+		e.Actor, e.Action, e.Namespace, e.Target, b)
+	if err != nil {
+		return fmt.Errorf("audit: %w", err)
+	}
+	return nil
+}
+
+// inTx runs fn and the audit insert in one transaction.
+func (s *Store) inTx(ctx context.Context, audit model.AuditEvent, fn func(tx pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, audit)
+	})
+}
+
 func conflict(code, msg string) error { return &model.ConflictError{Code: code, Msg: msg} }
 
 func uniqueViolation(err error) (string, bool) {
@@ -131,9 +162,11 @@ func notFound(err error) error {
 }
 
 // CreateNamespace implements store.Store.
-func (s *Store) CreateNamespace(ctx context.Context, ns model.Namespace) (model.Namespace, error) {
-	err := s.pool.QueryRow(ctx, `INSERT INTO namespaces (name, kind, github_id, display_name)
+func (s *Store) CreateNamespace(ctx context.Context, ns model.Namespace, audit model.AuditEvent) (model.Namespace, error) {
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `INSERT INTO namespaces (name, kind, github_id, display_name)
 		VALUES ($1, $2, $3, $4) RETURNING id, created_at`, ns.Name, ns.Kind, ns.GitHubID, ns.DisplayName).Scan(&ns.ID, &ns.CreatedAt)
+	})
 	if c, ok := uniqueViolation(err); ok {
 		if strings.Contains(c, "github_id") {
 			return model.Namespace{}, conflict("github_id_bound", "GitHub id is already bound to a namespace")
@@ -152,17 +185,19 @@ func (s *Store) GetNamespace(ctx context.Context, name string) (model.Namespace,
 }
 
 // SetRole implements store.Store.
-func (s *Store) SetRole(ctx context.Context, namespace, subject string, role model.Role) error {
-	tag, err := s.pool.Exec(ctx, `INSERT INTO namespace_roles (namespace_id, subject, role)
-		SELECT id, $2, $3 FROM namespaces WHERE name = $1
-		ON CONFLICT (namespace_id, subject) DO UPDATE SET role = EXCLUDED.role`, namespace, subject, string(role))
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return model.ErrNotFound
-	}
-	return nil
+func (s *Store) SetRole(ctx context.Context, namespace, subject string, role model.Role, audit model.AuditEvent) error {
+	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `INSERT INTO namespace_roles (namespace_id, subject, role)
+			SELECT id, $2, $3 FROM namespaces WHERE name = $1
+			ON CONFLICT (namespace_id, subject) DO UPDATE SET role = EXCLUDED.role`, namespace, subject, string(role))
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return model.ErrNotFound
+		}
+		return nil
+	})
 }
 
 // RolesForSubject implements store.Store.
@@ -184,8 +219,8 @@ func (s *Store) RolesForSubject(ctx context.Context, subject string) (map[string
 }
 
 // CreateToken implements store.Store.
-func (s *Store) CreateToken(ctx context.Context, t model.Token, roles []model.RoleBinding) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+func (s *Store) CreateToken(ctx context.Context, t model.Token, roles []model.RoleBinding, audit model.AuditEvent) error {
+	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `INSERT INTO api_tokens (id, secret_hash, name, scopes, created_by, expires_at)
 			VALUES ($1, $2, $3, $4, $5, $6)`, t.ID, t.SecretHash, t.Name, t.Scopes, t.CreatedBy, t.ExpiresAt)
 		if _, ok := uniqueViolation(err); ok {
@@ -218,8 +253,13 @@ func (s *Store) GetToken(ctx context.Context, id string) (model.Token, error) {
 }
 
 // RevokeToken implements store.Store.
-func (s *Store) RevokeToken(ctx context.Context, id string, at time.Time) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, $2) WHERE id = $1`, id, at)
+func (s *Store) RevokeToken(ctx context.Context, id string, at time.Time, audit model.AuditEvent) error {
+	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		return rowsOrNotFound(tx.Exec(ctx, `UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, $2) WHERE id = $1`, id, at))
+	})
+}
+
+func rowsOrNotFound(tag pgconn.CommandTag, err error) error {
 	if err != nil {
 		return err
 	}
@@ -255,10 +295,10 @@ func (s *Store) GetSkill(ctx context.Context, namespace, name string) (model.Ski
 }
 
 // PublishVersion implements store.Store.
-func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput) (model.Skill, model.Version, error) {
+func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error) {
 	var outSkill model.Skill
 	var outVer model.Version
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
 		var nsID int64
 		if err := tx.QueryRow(ctx, `SELECT id FROM namespaces WHERE name = $1`, in.Namespace).Scan(&nsID); err != nil {
 			return notFound(err)
@@ -272,9 +312,8 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput) (mode
 			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (namespace_id, name) DO NOTHING`,
 			nsID, in.Name, in.Visibility, in.Listed, in.Mode, sourceKey)
 		if c, ok := uniqueViolation(err); ok && strings.Contains(c, "source_key") {
-			var ns, name string
-			_ = s.pool.QueryRow(ctx, `SELECT n.name, s.name FROM skills s JOIN namespaces n ON n.id = s.namespace_id WHERE s.source_key = $1`, in.SourceKey).Scan(&ns, &name)
-			return conflict("source_already_indexed", "this source is already indexed as "+ns+"/"+name)
+			// Do not reveal which (possibly private) entry holds the source.
+			return conflict("source_already_indexed", "this source is already indexed on this registry")
 		}
 		if err != nil {
 			return err
@@ -392,47 +431,52 @@ func (s *Store) GetVersion(ctx context.Context, skillID int64, version string) (
 }
 
 // UpdateSkill implements store.Store.
-func (s *Store) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch) (model.Skill, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE skills SET visibility = COALESCE($2, visibility), listed = COALESCE($3, listed),
-		updated_at = now() WHERE id = $1`, skillID, p.Visibility, p.Listed)
-	if err != nil {
-		return model.Skill{}, err
-	}
-	if tag.RowsAffected() == 0 {
-		return model.Skill{}, model.ErrNotFound
-	}
-	return s.getSkillByID(ctx, s.pool, skillID)
+func (s *Store) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
+	var out model.Skill
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		if err := rowsOrNotFound(tx.Exec(ctx, `UPDATE skills SET visibility = COALESCE($2, visibility), listed = COALESCE($3, listed),
+			updated_at = now() WHERE id = $1`, skillID, p.Visibility, p.Listed)); err != nil {
+			return err
+		}
+		var err error
+		out, err = s.getSkillByID(ctx, tx, skillID)
+		return err
+	})
+	return out, err
 }
 
 // SetSkillStatus implements store.Store.
-func (s *Store) SetSkillStatus(ctx context.Context, skillID int64, status, reason string) (model.Skill, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE skills SET status = $2, status_reason = $3, updated_at = now() WHERE id = $1`, skillID, status, reason)
-	if err != nil {
-		return model.Skill{}, err
-	}
-	if tag.RowsAffected() == 0 {
-		return model.Skill{}, model.ErrNotFound
-	}
-	return s.getSkillByID(ctx, s.pool, skillID)
+func (s *Store) SetSkillStatus(ctx context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error) {
+	var out model.Skill
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		if err := rowsOrNotFound(tx.Exec(ctx, `UPDATE skills SET status = $2, status_reason = $3, updated_at = now() WHERE id = $1`,
+			skillID, status, reason)); err != nil {
+			return err
+		}
+		var err error
+		out, err = s.getSkillByID(ctx, tx, skillID)
+		return err
+	})
+	return out, err
 }
 
 // SetAlias implements store.Store.
-func (s *Store) SetAlias(ctx context.Context, skillID int64, alias string) error {
+func (s *Store) SetAlias(ctx context.Context, skillID int64, alias string, audit model.AuditEvent) error {
 	var a *string
 	if alias != "" {
 		a = &alias
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE skills SET global_alias = $2, updated_at = now() WHERE id = $1`, skillID, a)
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		return rowsOrNotFound(tx.Exec(ctx, `UPDATE skills SET global_alias = $2, updated_at = now() WHERE id = $1`, skillID, a))
+	})
 	if _, ok := uniqueViolation(err); ok {
 		return conflict("alias_taken", "global alias is already assigned")
 	}
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return model.ErrNotFound
-	}
-	return nil
+	return err
+}
+
+func (s *Store) execVersionAudit(ctx context.Context, audit model.AuditEvent, sql string, args ...any) error {
+	return s.inTx(ctx, audit, func(tx pgx.Tx) error { return rowsOrNotFound(tx.Exec(ctx, sql, args...)) })
 }
 
 func (s *Store) execVersion(ctx context.Context, sql string, args ...any) error {
@@ -447,14 +491,14 @@ func (s *Store) execVersion(ctx context.Context, sql string, args ...any) error 
 }
 
 // YankVersion implements store.Store.
-func (s *Store) YankVersion(ctx context.Context, id int64, reason string, at time.Time) error {
-	return s.execVersion(ctx, `UPDATE skill_versions SET yanked_at = COALESCE(yanked_at, $2),
+func (s *Store) YankVersion(ctx context.Context, id int64, reason string, at time.Time, audit model.AuditEvent) error {
+	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET yanked_at = COALESCE(yanked_at, $2),
 		yank_reason = CASE WHEN yanked_at IS NULL THEN $3 ELSE yank_reason END WHERE id = $1`, id, at, reason)
 }
 
 // ApproveLicense implements store.Store.
-func (s *Store) ApproveLicense(ctx context.Context, id int64) error {
-	return s.execVersion(ctx, `UPDATE skill_versions SET license_approved = true WHERE id = $1`, id)
+func (s *Store) ApproveLicense(ctx context.Context, id int64, audit model.AuditEvent) error {
+	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET license_approved = true WHERE id = $1`, id)
 }
 
 // SetVersionCheck implements store.Store.
@@ -569,17 +613,28 @@ func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly
 
 // AppendAudit implements store.Store.
 func (s *Store) AppendAudit(ctx context.Context, e model.AuditEvent) error {
-	details := e.Details
-	if details == nil {
-		details = map[string]any{}
+	return insertAudit(ctx, s.pool, e)
+}
+
+// ReferencedArtifacts implements store.Store.
+func (s *Store) ReferencedArtifacts(ctx context.Context, digests []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(digests) == 0 {
+		return out, nil
 	}
-	b, err := json.Marshal(details)
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT artifact_digest FROM skill_versions WHERE mode = 'hosted' AND artifact_digest = ANY($1)`, digests)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO audit_events (actor, action, namespace, target, details) VALUES ($1,$2,$3,$4,$5)`,
-		e.Actor, e.Action, e.Namespace, e.Target, b)
-	return err
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out[d] = true
+	}
+	return out, rows.Err()
 }
 
 // ListAudit implements store.Store (newest first).

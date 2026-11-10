@@ -13,7 +13,7 @@ import (
 func TestTokens(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMemory()
-	st.CreateNamespace(ctx, model.Namespace{Name: "com.example", Kind: "domain"})
+	st.CreateNamespace(ctx, model.Namespace{Name: "com.example", Kind: "domain"}, model.AuditEvent{})
 	plain, id, hash, err := NewToken()
 	if err != nil || !strings.HasPrefix(plain, Prefix) {
 		t.Fatal(err)
@@ -23,7 +23,7 @@ func TestTokens(t *testing.T) {
 	}
 	exp := time.Now().Add(time.Hour)
 	st.CreateToken(ctx, model.Token{ID: id, SecretHash: hash, Name: "t", Scopes: []string{ScopeWrite}, ExpiresAt: &exp},
-		[]model.RoleBinding{{Namespace: "com.example", Role: model.RolePublisher}})
+		[]model.RoleBinding{{Namespace: "com.example", Role: model.RolePublisher}}, model.AuditEvent{})
 	a := NewAuthenticator(st, strings.Repeat("A", 40))
 	p, err := a.Authenticate(ctx, plain)
 	if err != nil || p.Subject != "token:"+id || !p.HasRole("com.example", model.RolePublisher) || p.HasRole("com.example", model.RoleOwner) || p.Admin {

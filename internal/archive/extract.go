@@ -33,6 +33,65 @@ func aerr(code, msg string) error { return &Error{Code: code, Msg: msg} }
 // header-only bombs before file limits apply.
 func maxEntries(lim skill.Limits) int { return lim.MaxFiles*4 + 64 }
 
+// maxTarStream caps every byte read from a (decompressed) tar stream:
+// file data, headers, PAX/GNU metadata entries, padding and the trailer.
+// Each visible entry is allowed 2 KiB of header and metadata overhead plus a
+// fixed 64 KiB allowance for end-of-archive record padding.
+func maxTarStream(lim skill.Limits) int64 {
+	return lim.MaxTotalBytes + int64(maxEntries(lim))*2048 + 64<<10
+}
+
+var errStreamTooLarge = &Error{Code: "archive_too_large", Msg: "archive expands beyond the size limit"}
+
+// capReader fails once more than max bytes have been read.
+type capReader struct {
+	r   io.Reader
+	n   int64
+	max int64
+}
+
+func (c *capReader) Read(p []byte) (int, error) {
+	if c.n >= c.max {
+		// Probe for one more byte to distinguish EOF from overflow.
+		var one [1]byte
+		n, err := c.r.Read(one[:])
+		if n > 0 {
+			return 0, errStreamTooLarge
+		}
+		return 0, err
+	}
+	if int64(len(p)) > c.max-c.n {
+		p = p[:c.max-c.n]
+	}
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// drainZeros consumes the rest of a tar stream after the end-of-archive
+// marker; only zero padding is allowed.
+func drainZeros(r io.Reader) error {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := r.Read(buf)
+		for _, b := range buf[:n] {
+			if b != 0 {
+				return aerr("archive_trailing_data", "unexpected data after the end of the tar archive")
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			var ae *Error
+			if errors.As(err, &ae) {
+				return err
+			}
+			return aerr("archive_invalid", "invalid archive stream")
+		}
+	}
+}
+
 // Extract reads an uploaded tar, tar.gz or zip archive into regular files,
 // enforcing limits while decompressing. Symlinks, hard links, devices, FIFOs
 // and unsafe paths are rejected. If SKILL.md is not at the root and every file
@@ -43,14 +102,20 @@ func Extract(data []byte, format string, lim skill.Limits) ([]skill.File, error)
 	var err error
 	switch format {
 	case FormatTar:
-		files, err = readTar(bytes.NewReader(data), lim)
+		files, err = readTarStream(bytes.NewReader(data), lim)
 	case FormatTarGz:
-		zr, gerr := gzip.NewReader(bytes.NewReader(data))
+		br := bytes.NewReader(data)
+		zr, gerr := gzip.NewReader(br)
 		if gerr != nil {
 			return nil, aerr("archive_invalid", "invalid gzip stream")
 		}
 		zr.Multistream(false)
-		files, err = readTar(zr, lim)
+		// readTarStream drains the decompressed stream to EOF, which makes
+		// the gzip reader verify the CRC-32 and size trailer.
+		files, err = readTarStream(zr, lim)
+		if err == nil && br.Len() != 0 {
+			err = aerr("archive_trailing_data", "unexpected data after the gzip stream")
+		}
 	case FormatZip:
 		files, err = readZip(data, lim)
 	default:
@@ -61,6 +126,20 @@ func Extract(data []byte, format string, lim skill.Limits) ([]skill.File, error)
 	}
 	files = stripSingleRoot(files)
 	return skill.ValidateFiles(files, lim)
+}
+
+// readTarStream reads a tar stream under the total byte cap and requires
+// that only zero padding follows the end-of-archive marker.
+func readTarStream(r io.Reader, lim skill.Limits) ([]skill.File, error) {
+	cr := &capReader{r: r, max: maxTarStream(lim)}
+	files, err := readTar(cr, lim)
+	if err != nil {
+		return nil, err
+	}
+	if err := drainZeros(cr); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 func readTar(r io.Reader, lim skill.Limits) ([]skill.File, error) {
@@ -76,7 +155,14 @@ func readTar(r io.Reader, lim skill.Limits) ([]skill.File, error) {
 			break
 		}
 		if err != nil {
+			var ae *Error
+			if errors.As(err, &ae) {
+				return nil, err
+			}
 			return nil, aerr("archive_invalid", "invalid tar archive")
+		}
+		if len(hdr.PAXRecords) > 64 {
+			return nil, aerr("archive_metadata", "too many PAX records")
 		}
 		name := strings.TrimPrefix(hdr.Name, "./")
 		switch hdr.Typeflag {
@@ -101,6 +187,12 @@ func readTar(r io.Reader, lim skill.Limits) ([]skill.File, error) {
 			return nil, aerr("total_too_large", "archive exceeds the total size limit")
 		}
 		buf, err := io.ReadAll(io.LimitReader(tr, hdr.Size+1))
+		if err != nil {
+			var ae *Error
+			if errors.As(err, &ae) {
+				return nil, err
+			}
+		}
 		if err != nil || int64(len(buf)) != hdr.Size {
 			return nil, aerr("archive_invalid", "truncated tar entry")
 		}

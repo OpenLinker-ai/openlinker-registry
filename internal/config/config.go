@@ -38,6 +38,12 @@ type Config struct {
 	Limits         skill.Limits
 	CacheMaxAge    time.Duration
 	CacheMaxBytes  int64
+	// VerifyInterval bounds how long cached indexed content is served
+	// before the source is re-verified.
+	VerifyInterval time.Duration
+	// ArtifactGCGrace is how old an unreferenced artifact must be before it
+	// is garbage collected.
+	ArtifactGCGrace time.Duration
 }
 
 // Load reads REGISTRY_* environment variables and then args.
@@ -71,6 +77,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	maxFile := fs.String("max-file-bytes", env("MAX_FILE_BYTES", strconv.FormatInt(skill.DefaultLimits.MaxFileBytes, 10)), "maximum bytes per file")
 	maxTotal := fs.String("max-total-bytes", env("MAX_TOTAL_BYTES", strconv.FormatInt(skill.DefaultLimits.MaxTotalBytes, 10)), "maximum bytes per skill")
 	cacheAge := fs.String("cache-max-age", env("CACHE_MAX_AGE", "720h"), "evict cached indexed content older than this")
+	verify := fs.String("verify-interval", env("VERIFY_INTERVAL", "1h"), "re-verify indexed sources after this long (0 = every read)")
+	gcGrace := fs.String("artifact-gc-grace", env("ARTIFACT_GC_GRACE", "24h"), "minimum age of unreferenced artifacts before deletion")
 	cacheBytes := fs.String("cache-max-bytes", env("CACHE_MAX_BYTES", strconv.Itoa(1<<30)), "cache capacity in bytes")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -114,6 +122,14 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		MaxTotalBytes: parseInt("max-total-bytes", *maxTotal)}
 	c.CacheMaxAge = parseDur("cache-max-age", *cacheAge)
 	c.CacheMaxBytes = parseInt("cache-max-bytes", *cacheBytes)
+	if v, perr := time.ParseDuration(*verify); perr != nil || v < 0 {
+		if err == nil {
+			err = errors.New("verify-interval: invalid duration")
+		}
+	} else {
+		c.VerifyInterval = v
+	}
+	c.ArtifactGCGrace = parseDur("artifact-gc-grace", *gcGrace)
 	if err != nil {
 		return Config{}, err
 	}
@@ -138,6 +154,12 @@ func (c *Config) Validate() error {
 		return errors.New("REGISTRY_PUBLIC_URL must be an absolute http(s) URL without credentials, query or fragment")
 	}
 	c.PublicURL = strings.TrimRight(c.PublicURL, "/")
+	// With a base path the server only answers under that prefix, so the
+	// public URL must end with it (a proxy may add its own prefix in front).
+	// Without a base path any public path is allowed (proxy strips it).
+	if c.BasePath != "" && !strings.HasSuffix(strings.TrimRight(u.Path, "/"), c.BasePath) {
+		return errors.New("REGISTRY_PUBLIC_URL path must end with REGISTRY_BASE_PATH (e.g. https://host" + c.BasePath + ")")
+	}
 	if c.AdminToken != "" && len(c.AdminToken) < 32 {
 		return errors.New("REGISTRY_ADMIN_TOKEN must be at least 32 characters")
 	}

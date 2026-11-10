@@ -291,13 +291,13 @@ func (s *Server) createNamespace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &registry.Error{Status: 422, Code: "display_name_too_long", Msg: "display_name is too long"})
 		return
 	}
-	ns, err := s.Svc.Store.CreateNamespace(r.Context(), model.Namespace{Name: req.Name, Kind: req.Kind, GitHubID: req.GitHubID, DisplayName: req.DisplayName})
+	ns, err := s.Svc.Store.CreateNamespace(r.Context(), model.Namespace{Name: req.Name, Kind: req.Kind, GitHubID: req.GitHubID, DisplayName: req.DisplayName},
+		model.AuditEvent{Actor: principal(r).Subject, Action: "namespace.create", Namespace: req.Name,
+			Details: map[string]any{"kind": req.Kind, "github_id": req.GitHubID}})
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.Svc.Store.AppendAudit(r.Context(), model.AuditEvent{Actor: principal(r).Subject, Action: "namespace.create", Namespace: ns.Name,
-		Details: map[string]any{"kind": ns.Kind, "github_id": ns.GitHubID}})
 	writeJSON(w, http.StatusCreated, map[string]any{"name": ns.Name, "kind": ns.Kind, "github_id": ns.GitHubID,
 		"display_name": ns.DisplayName, "created_at": ns.CreatedAt})
 }
@@ -320,12 +320,11 @@ func (s *Server) setRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ns := r.PathValue("ns")
-	if err := s.Svc.Store.SetRole(r.Context(), ns, req.Subject, req.Role); err != nil {
+	if err := s.Svc.Store.SetRole(r.Context(), ns, req.Subject, req.Role, model.AuditEvent{Actor: principal(r).Subject,
+		Action: "namespace.role", Namespace: ns, Target: req.Subject, Details: map[string]any{"role": req.Role}}); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.Svc.Store.AppendAudit(r.Context(), model.AuditEvent{Actor: principal(r).Subject, Action: "namespace.role", Namespace: ns,
-		Target: req.Subject, Details: map[string]any{"role": req.Role}})
 	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "subject": req.Subject, "role": req.Role})
 }
 
@@ -368,26 +367,25 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		exp := time.Now().UTC().Add(time.Duration(req.ExpiresInHours) * time.Hour)
 		t.ExpiresAt = &exp
 	}
-	if err := s.Svc.Store.CreateToken(r.Context(), t, req.Roles); err != nil {
+	if err := s.Svc.Store.CreateToken(r.Context(), t, req.Roles, model.AuditEvent{Actor: principal(r).Subject, Action: "token.create",
+		Target: "token:" + id, Details: map[string]any{"name": req.Name, "scopes": req.Scopes, "roles": req.Roles}}); err != nil {
 		if errors.Is(err, model.ErrNotFound) {
 			err = &registry.Error{Status: 422, Code: "namespace_not_found", Msg: "a role references an unknown namespace"}
 		}
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.Svc.Store.AppendAudit(r.Context(), model.AuditEvent{Actor: principal(r).Subject, Action: "token.create", Target: "token:" + id,
-		Details: map[string]any{"name": req.Name, "scopes": req.Scopes, "roles": req.Roles}})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "subject": "token:" + id, "token": plain, "scopes": req.Scopes,
 		"roles": req.Roles, "expires_at": t.ExpiresAt})
 }
 
 func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.Svc.Store.RevokeToken(r.Context(), id, time.Now().UTC()); err != nil {
+	if err := s.Svc.Store.RevokeToken(r.Context(), id, time.Now().UTC(),
+		model.AuditEvent{Actor: principal(r).Subject, Action: "token.revoke", Target: "token:" + id}); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.Svc.Store.AppendAudit(r.Context(), model.AuditEvent{Actor: principal(r).Subject, Action: "token.revoke", Target: "token:" + id})
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "revoked": true})
 }
 
@@ -410,12 +408,11 @@ func (s *Server) setAlias(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if err := s.Svc.Store.SetAlias(r.Context(), sk.ID, req.Alias); err != nil {
+	if err := s.Svc.Store.SetAlias(r.Context(), sk.ID, req.Alias, model.AuditEvent{Actor: principal(r).Subject, Action: "skill.alias",
+		Namespace: sk.Namespace, Target: sk.Name, Details: map[string]any{"alias": req.Alias}}); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.Svc.Store.AppendAudit(r.Context(), model.AuditEvent{Actor: principal(r).Subject, Action: "skill.alias", Namespace: sk.Namespace,
-		Target: sk.Name, Details: map[string]any{"alias": req.Alias}})
 	writeJSON(w, http.StatusOK, map[string]any{"namespace": sk.Namespace, "name": sk.Name, "global_alias": nullable(req.Alias)})
 }
 
@@ -434,12 +431,11 @@ func (s *Server) approveLicense(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &registry.Error{Status: 422, Code: "not_custom", Msg: "only custom licenses need approval"})
 		return
 	}
-	if err := s.Svc.Store.ApproveLicense(r.Context(), v.ID); err != nil {
+	if err := s.Svc.Store.ApproveLicense(r.Context(), v.ID, model.AuditEvent{Actor: principal(r).Subject, Action: "license.approve",
+		Namespace: sk.Namespace, Target: sk.Name + "@" + v.Version, Details: map[string]any{"license": v.LicenseID}}); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.Svc.Store.AppendAudit(r.Context(), model.AuditEvent{Actor: principal(r).Subject, Action: "license.approve", Namespace: sk.Namespace,
-		Target: sk.Name + "@" + v.Version, Details: map[string]any{"license": v.LicenseID}})
 	v.LicenseApproved = true
 	writeJSON(w, http.StatusOK, s.versionJSON(sk, v))
 }

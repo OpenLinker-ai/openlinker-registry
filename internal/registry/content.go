@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"time"
 	"unicode/utf16"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/archive"
@@ -53,10 +54,12 @@ func (s *Service) checkServable(sk model.Skill, v model.Version, fullText bool) 
 }
 
 // Materialize returns the version's files and artifact bytes. Hosted bytes
-// come from the permanent store; indexed bytes come from the evictable cache
-// or are re-read from the source and re-verified (commit, tree SHA, git blob
-// SHA-1 and artifact digest). Verification failures update the check result
-// and return no content.
+// come from the permanent store. Indexed content is served from the evictable
+// cache only while the last successful source verification is younger than
+// Cfg.VerifyInterval; otherwise the source is re-read and re-verified
+// (commit, tree SHA, git blob SHA-1 and artifact digest) before anything is
+// served, even when the bytes are cached. Verification failures update the
+// check result and return no content.
 func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Version, fullText bool) ([]skill.File, []byte, error) {
 	if err := s.checkServable(sk, v, fullText); err != nil {
 		return nil, nil, err
@@ -69,11 +72,13 @@ func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Versi
 		files, err := archive.FilesFromArtifact(v.ArtifactType, data)
 		return files, data, err
 	}
-	if data, err := s.Blobs.Get(ctx, blobstore.Cache, v.ArtifactDigest); err == nil {
-		files, err := archive.FilesFromArtifact(v.ArtifactType, data)
-		return files, data, err
-	} else if !errors.Is(err, blobstore.ErrNotFound) {
-		return nil, nil, err
+	if s.recentlyVerified(v) {
+		if data, err := s.Blobs.Get(ctx, blobstore.Cache, v.ArtifactDigest); err == nil {
+			files, err := archive.FilesFromArtifact(v.ArtifactType, data)
+			return files, data, err
+		} else if !errors.Is(err, blobstore.ErrNotFound) {
+			return nil, nil, err
+		}
 	}
 	l := v.Locator
 	if l == nil || l.Kind != "github" || s.GitHub == nil {
@@ -98,6 +103,48 @@ func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Versi
 	_, _ = s.Blobs.Put(ctx, blobstore.Cache, data)
 	_ = s.Store.SetVersionCheck(ctx, v.ID, model.CheckOK, s.Now())
 	return snap.Files, data, nil
+}
+
+// recentlyVerified reports whether v's source was verified successfully
+// within the configured interval.
+func (s *Service) recentlyVerified(v model.Version) bool {
+	if v.CheckResult != model.CheckOK || v.CheckedAt == nil || s.Cfg.VerifyInterval <= 0 {
+		return false
+	}
+	return s.Now().Sub(*v.CheckedAt) < s.Cfg.VerifyInterval
+}
+
+// GCArtifacts deletes permanent artifacts that no hosted version references
+// and that were not written or refreshed since before. Publishing refreshes a
+// blob's modification time before committing the version row, and deletion
+// re-checks the time right before removing, so a blob being published within
+// the grace period is never collected. It returns the number removed.
+func (s *Service) GCArtifacts(ctx context.Context, before time.Time) (int, error) {
+	old, err := s.Blobs.Older(ctx, blobstore.Artifacts, before)
+	if err != nil || len(old) == 0 {
+		return 0, err
+	}
+	removed := 0
+	for start := 0; start < len(old); start += 500 {
+		batch := old[start:min(start+500, len(old))]
+		refs, err := s.Store.ReferencedArtifacts(ctx, batch)
+		if err != nil {
+			return removed, err
+		}
+		for _, d := range batch {
+			if refs[d] {
+				continue
+			}
+			ok, err := s.Blobs.DeleteIfOlder(ctx, blobstore.Artifacts, d, before)
+			if err != nil {
+				return removed, err
+			}
+			if ok {
+				removed++
+			}
+		}
+	}
+	return removed, nil
 }
 
 func (s *Service) markCheck(ctx context.Context, v model.Version, result string) error {
@@ -226,21 +273,14 @@ func (s *Service) SetStatus(ctx context.Context, actor string, sk model.Skill, s
 	if sk.Status == model.StatusYanked && status != model.StatusYanked {
 		return model.Skill{}, fail(http.StatusConflict, "skill_yanked", "a yanked skill cannot change status")
 	}
-	out, err := s.Store.SetSkillStatus(ctx, sk.ID, status, reason)
-	if err != nil {
-		return model.Skill{}, err
-	}
-	s.audit(ctx, actor, "skill."+status, sk.Namespace, sk.Name, map[string]any{"reason": reason})
-	return out, nil
+	return s.Store.SetSkillStatus(ctx, sk.ID, status, reason,
+		auditEvent(actor, "skill."+status, sk.Namespace, sk.Name, map[string]any{"reason": reason}))
 }
 
 // YankVersion yanks one version; later downloads return 410.
 func (s *Service) YankVersion(ctx context.Context, actor string, sk model.Skill, v model.Version, reason string) error {
-	if err := s.Store.YankVersion(ctx, v.ID, reason, s.Now()); err != nil {
-		return err
-	}
-	s.audit(ctx, actor, "version.yank", sk.Namespace, sk.Name+"@"+v.Version, map[string]any{"reason": reason})
-	return nil
+	return s.Store.YankVersion(ctx, v.ID, reason, s.Now(),
+		auditEvent(actor, "version.yank", sk.Namespace, sk.Name+"@"+v.Version, map[string]any{"reason": reason}))
 }
 
 // UpdateSettings changes visibility/listed with the license rule for public
@@ -263,10 +303,6 @@ func (s *Service) UpdateSettings(ctx context.Context, actor string, sk model.Ski
 			}
 		}
 	}
-	out, err := s.Store.UpdateSkill(ctx, sk.ID, p)
-	if err != nil {
-		return model.Skill{}, err
-	}
 	details := map[string]any{}
 	if p.Visibility != nil {
 		details["visibility"] = *p.Visibility
@@ -274,6 +310,5 @@ func (s *Service) UpdateSettings(ctx context.Context, actor string, sk model.Ski
 	if p.Listed != nil {
 		details["listed"] = *p.Listed
 	}
-	s.audit(ctx, actor, "skill.update", sk.Namespace, sk.Name, details)
-	return out, nil
+	return s.Store.UpdateSkill(ctx, sk.ID, p, auditEvent(actor, "skill.update", sk.Namespace, sk.Name, details))
 }

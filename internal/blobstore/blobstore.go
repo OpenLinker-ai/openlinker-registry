@@ -37,13 +37,20 @@ var ErrCorrupt = errors.New("blob digest mismatch")
 
 // Store is a content-addressed blob store. Digests are "sha256:<hex>".
 type Store interface {
-	// Put stores data and returns its digest. Storing existing content is a no-op.
+	// Put stores data and returns its digest. Storing existing content only
+	// refreshes its modification time, which garbage collection uses as a
+	// grace period so a blob being (re)published is never collected.
 	Put(ctx context.Context, area Area, data []byte) (string, error)
 	// Get returns the bytes for digest after verifying them.
 	Get(ctx context.Context, area Area, digest string) ([]byte, error)
 	// Evict removes cache entries older than maxAge, then the oldest entries
 	// until the cache is at most maxBytes. It never touches Artifacts.
 	Evict(ctx context.Context, maxAge time.Duration, maxBytes int64) (int, error)
+	// Older lists digests in area last written or refreshed before t.
+	Older(ctx context.Context, area Area, t time.Time) ([]string, error)
+	// DeleteIfOlder removes a blob only if it was not written or refreshed
+	// since t (re-checked immediately before removal); missing is not an error.
+	DeleteIfOlder(ctx context.Context, area Area, digest string, t time.Time) (bool, error)
 }
 
 var digestRe = regexp.MustCompile(`^sha256:([0-9a-f]{64})$`)
@@ -81,16 +88,20 @@ func (l *Local) Put(_ context.Context, area Area, data []byte) (string, error) {
 		return "", err
 	}
 	if _, err := os.Stat(p); err == nil {
-		if area == Cache {
-			now := time.Now()
-			_ = os.Chtimes(p, now, now)
+		now := time.Now()
+		if err := os.Chtimes(p, now, now); err != nil {
+			return "", err
 		}
 		return digest, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(filepath.Join(l.dir, string(area), "tmp"), "put-*")
+	tmpDir := filepath.Join(l.dir, string(area), "tmp")
+	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(tmpDir, "put-*")
 	if err != nil {
 		return "", err
 	}
@@ -183,6 +194,52 @@ func (l *Local) Evict(_ context.Context, maxAge time.Duration, maxBytes int64) (
 		}
 	}
 	return removed, nil
+}
+
+// Older implements Store.
+func (l *Local) Older(_ context.Context, area Area, t time.Time) ([]string, error) {
+	if area != Artifacts && area != Cache {
+		return nil, fmt.Errorf("invalid area")
+	}
+	var out []string
+	root := filepath.Join(l.dir, string(area), "sha256")
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		digest := "sha256:" + d.Name()
+		if digestRe.MatchString(digest) && info.ModTime().Before(t) {
+			out = append(out, digest)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// DeleteIfOlder implements Store.
+func (l *Local) DeleteIfOlder(_ context.Context, area Area, digest string, t time.Time) (bool, error) {
+	p, err := l.path(area, digest)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.ModTime().Before(t) {
+		return false, nil
+	}
+	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	return true, nil
 }
 
 // IsDigest reports whether s is a well-formed sha256 digest reference.

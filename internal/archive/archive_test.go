@@ -229,3 +229,81 @@ func isASCII(s string) bool {
 	}
 	return true
 }
+
+func TestExtractStreamLimits(t *testing.T) {
+	lim := skill.Limits{MaxFiles: 2, MaxFileBytes: 1000, MaxTotalBytes: 2000}
+	tarWith := func(hdrs ...*tar.Header) []byte {
+		var b bytes.Buffer
+		tw := tar.NewWriter(&b)
+		for _, h := range hdrs {
+			body := []byte(md)
+			if h.Name != "SKILL.md" {
+				body = []byte("x")
+			}
+			h.Size, h.Typeflag = int64(len(body)), tar.TypeReg
+			if err := tw.WriteHeader(h); err != nil {
+				t.Fatal(err)
+			}
+			tw.Write(body)
+		}
+		tw.Close()
+		return b.Bytes()
+	}
+	gz := func(b []byte) []byte {
+		var out bytes.Buffer
+		zw := gzip.NewWriter(&out)
+		zw.Write(b)
+		zw.Close()
+		return out.Bytes()
+	}
+	ok := tarWith(&tar.Header{Name: "SKILL.md"})
+	if _, err := Extract(ok, FormatTar, lim); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	// PAX metadata is invisible to the entry loop; it must still count.
+	huge := tarWith(&tar.Header{Name: "SKILL.md", PAXRecords: map[string]string{"comment": strings.Repeat("p", 512<<10)}})
+	if _, err := Extract(gz(huge), FormatTarGz, lim); code(err) != "archive_too_large" {
+		t.Fatalf("PAX inflation: got %v", err)
+	}
+	many := map[string]string{}
+	for i := range 100 {
+		many["comment"+strings.Repeat("x", i)] = "v"
+	}
+	if _, err := Extract(tarWith(&tar.Header{Name: "SKILL.md", PAXRecords: many}), FormatTar, lim); code(err) != "archive_metadata" {
+		t.Fatalf("PAX record count: got %v", err)
+	}
+	// Non-zero data after the end-of-archive marker.
+	if _, err := Extract(append(bytes.Clone(ok), bytes.Repeat([]byte("junk"), 200)...), FormatTar, lim); code(err) != "archive_trailing_data" {
+		t.Fatalf("tar trailing data: got %v", err)
+	}
+	// Bytes after the gzip member.
+	if _, err := Extract(append(gz(ok), 'x'), FormatTarGz, lim); code(err) != "archive_trailing_data" {
+		t.Fatalf("gzip trailing data: got %v", err)
+	}
+	// A second gzip member is also trailing data.
+	if _, err := Extract(append(gz(ok), gz([]byte("more"))...), FormatTarGz, lim); code(err) != "archive_trailing_data" {
+		t.Fatalf("gzip second member: got %v", err)
+	}
+	// Corrupted CRC-32 trailer.
+	bad := gz(ok)
+	bad[len(bad)-8] ^= 0xff
+	if _, err := Extract(bad, FormatTarGz, lim); err == nil {
+		t.Fatal("gzip checksum mismatch accepted")
+	}
+	// Truncated gzip stream.
+	g := gz(ok)
+	if _, err := Extract(g[:len(g)-4], FormatTarGz, lim); err == nil {
+		t.Fatal("truncated gzip accepted")
+	}
+}
+
+func code(err error) string {
+	var ae *Error
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	if err != nil {
+		return "other: " + err.Error()
+	}
+	return ""
+}

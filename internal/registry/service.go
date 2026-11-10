@@ -11,6 +11,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/archive"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/blobstore"
@@ -76,6 +77,9 @@ type Config struct {
 	// PublicURL is the external URL of the registry root, e.g.
 	// https://openlinker.ai/registry. Used for well-known artifact URLs.
 	PublicURL string
+	// VerifyInterval bounds how long cached indexed content is served
+	// without re-verifying the source. Zero re-verifies on every read.
+	VerifyInterval time.Duration
 }
 
 // Service implements the use cases.
@@ -117,10 +121,10 @@ func (s *Service) checkVisibility(v string) error {
 	return nil
 }
 
-func (s *Service) audit(ctx context.Context, actor, action, ns, target string, details map[string]any) {
-	// Audit failures must not be silent, but publishing already succeeded;
-	// the API layer logs returned errors. Here we best-effort append.
-	_ = s.Store.AppendAudit(ctx, model.AuditEvent{Actor: actor, Action: action, Namespace: ns, Target: target, Details: details})
+// auditEvent builds the audit row that the store persists atomically with
+// the mutation it describes.
+func auditEvent(actor, action, ns, target string, details map[string]any) model.AuditEvent {
+	return model.AuditEvent{Actor: actor, Action: action, Namespace: ns, Target: target, Details: details}
 }
 
 // built is a validated version ready to persist.
@@ -208,31 +212,50 @@ func (s *Service) validateTarget(ctx context.Context, o *PublishOptions, mode st
 	}
 }
 
-func hasLicenseFile(files []skill.File) bool {
+// maxLicenseText bounds stored license text.
+const maxLicenseText = 64 << 10
+
+// licenseFileText returns the trimmed text of the first root license file
+// (LICENSE, LICENSE.md, LICENSE.txt, LICENCE, COPYING), or "".
+func licenseFileText(files []skill.File) string {
 	for _, f := range files {
 		switch strings.ToUpper(f.Path) {
 		case "LICENSE", "LICENSE.MD", "LICENSE.TXT", "LICENCE", "COPYING":
-			return true
+			if t := strings.TrimSpace(string(f.Data)); t != "" && utf8.ValidString(t) {
+				return t
+			}
 		}
 	}
-	return false
+	return ""
 }
 
 // hostedLicense applies the hosted license rules of design §6: public hosting
 // needs an SPDX license or custom with text; unknown is internal/private only.
-func hostedLicense(o PublishOptions, fm skill.Frontmatter, files []skill.File) (skill.License, error) {
+// The returned text is the custom license text that is stored and exposed:
+// license_text if given, otherwise the non-empty root LICENSE file.
+func hostedLicense(o PublishOptions, fm skill.Frontmatter, files []skill.File) (skill.License, string, error) {
 	declared := o.License
 	if declared == "" {
 		declared = fm.License
 	}
 	lic := skill.ClassifyLicense(declared)
-	if lic.Kind == skill.LicenseCustom && strings.TrimSpace(o.LicenseText) == "" && !hasLicenseFile(files) {
-		return lic, fail(http.StatusUnprocessableEntity, "license_text_required", "a custom license needs license_text or a LICENSE file in the skill")
+	text := ""
+	if lic.Kind == skill.LicenseCustom {
+		text = strings.TrimSpace(o.LicenseText)
+		if text == "" {
+			text = licenseFileText(files)
+		}
+		if text == "" {
+			return lic, "", fail(http.StatusUnprocessableEntity, "license_text_required", "a custom license needs non-empty license_text or a non-empty LICENSE file in the skill")
+		}
+		if len(text) > maxLicenseText || !utf8.ValidString(text) {
+			return lic, "", fail(http.StatusUnprocessableEntity, "license_text_invalid", "license text must be UTF-8 and at most 64 KiB")
+		}
 	}
 	if lic.Kind == skill.LicenseUnknown && o.Visibility == model.VisibilityPublic {
-		return lic, fail(http.StatusUnprocessableEntity, "license_required", "public hosted skills must declare a license (SPDX id or custom with text)")
+		return lic, "", fail(http.StatusUnprocessableEntity, "license_required", "public hosted skills must declare a license (SPDX id or custom with text)")
 	}
-	return lic, nil
+	return lic, text, nil
 }
 
 func (s *Service) publishHosted(ctx context.Context, o PublishOptions, files []skill.File, artifactType string, artifact []byte, src model.Source) (model.Skill, model.Version, error) {
@@ -246,14 +269,17 @@ func (s *Service) publishHosted(ctx context.Context, o PublishOptions, files []s
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
-	lic, err := hostedLicense(o, fm, files)
+	lic, licText, err := hostedLicense(o, fm, files)
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
-	b, err := s.build(files, artifactType, artifact, lic, strings.TrimSpace(o.LicenseText))
+	b, err := s.build(files, artifactType, artifact, lic, licText)
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
+	// The blob is written (or its mtime refreshed) before the version row is
+	// committed. If the publish fails, the blob may be orphaned; GCArtifacts
+	// removes unreferenced blobs once they are older than the grace period.
 	if _, err := s.Blobs.Put(ctx, blobstore.Artifacts, artifact); err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
@@ -263,14 +289,10 @@ func (s *Service) publishHosted(ctx context.Context, o PublishOptions, files []s
 	if o.Listed != nil {
 		listed = *o.Listed
 	}
-	sk, ver, err := s.Store.PublishVersion(ctx, model.PublishInput{Namespace: o.Namespace, Name: o.Name, Mode: skill.ModeHosted,
-		Visibility: o.Visibility, Listed: listed, Version: v})
-	if err != nil {
-		return model.Skill{}, model.Version{}, err
-	}
-	s.audit(ctx, o.Actor, "skill.publish", o.Namespace, o.Name+"@"+o.Version,
-		map[string]any{"digest": ver.ArtifactDigest, "artifact_type": ver.ArtifactType, "source": src.Kind})
-	return sk, ver, nil
+	return s.Store.PublishVersion(ctx, model.PublishInput{Namespace: o.Namespace, Name: o.Name, Mode: skill.ModeHosted,
+		Visibility: o.Visibility, Listed: listed, Version: v},
+		auditEvent(o.Actor, "skill.publish", o.Namespace, o.Name+"@"+o.Version,
+			map[string]any{"digest": v.ArtifactDigest, "artifact_type": v.ArtifactType, "source": src.Kind}))
 }
 
 // Upload formats accepted by PublishUpload.
@@ -516,7 +538,14 @@ func (s *Service) IndexGitHub(ctx context.Context, actor, namespace string, req 
 		return model.Skill{}, model.Version{}, err
 	}
 	lic := skill.ClassifyLicense(fm.License)
-	b, err := s.build(snap.Files, typ, artifact, lic, "")
+	licText := ""
+	if lic.Kind == skill.LicenseCustom {
+		// Kept for reviewers; exposed only after approval.
+		if licText = licenseFileText(snap.Files); len(licText) > maxLicenseText {
+			licText = ""
+		}
+	}
+	b, err := s.build(snap.Files, typ, artifact, lic, licText)
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
@@ -533,12 +562,8 @@ func (s *Service) IndexGitHub(ctx context.Context, actor, namespace string, req 
 	if o.Listed != nil {
 		listed = *o.Listed
 	}
-	sk, ver, err := s.Store.PublishVersion(ctx, model.PublishInput{Namespace: namespace, Name: o.Name, Mode: skill.ModeIndexed,
-		SourceKey: r.SourceKey(), Visibility: o.Visibility, Listed: listed, Version: v})
-	if err != nil {
-		return model.Skill{}, model.Version{}, err
-	}
-	s.audit(ctx, actor, "skill.index", namespace, o.Name+"@"+o.Version,
-		map[string]any{"digest": ver.ArtifactDigest, "commit": snap.Commit, "tree_sha": snap.TreeSHA, "source_key": r.SourceKey()})
-	return sk, ver, nil
+	return s.Store.PublishVersion(ctx, model.PublishInput{Namespace: namespace, Name: o.Name, Mode: skill.ModeIndexed,
+		SourceKey: r.SourceKey(), Visibility: o.Visibility, Listed: listed, Version: v},
+		auditEvent(actor, "skill.index", namespace, o.Name+"@"+o.Version,
+			map[string]any{"digest": v.ArtifactDigest, "commit": snap.Commit, "tree_sha": snap.TreeSHA, "source_key": r.SourceKey()}))
 }

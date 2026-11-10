@@ -7,9 +7,11 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/api"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
@@ -53,6 +56,7 @@ type Env struct {
 	Store   store.Store
 	BlobDir string
 	Base    string
+	Svc     *registry.Service
 }
 
 // Options tweak the environment.
@@ -87,12 +91,12 @@ func NewEnv(t *testing.T, st store.Store, o Options) *Env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := registry.New(st, blobs, gh, registry.Config{Mode: o.Mode, AllowPublic: true, PublicURL: PublicURL})
+	svc := registry.New(st, blobs, gh, registry.Config{Mode: o.Mode, AllowPublic: true, PublicURL: PublicURL, VerifyInterval: time.Hour})
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, AdminToken), BasePath: "/registry",
 		AllowAnonRead: o.AllowAnonRead, MaxUploadBytes: 4 << 20, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(hs.Close)
-	return &Env{T: t, Srv: hs, Fake: f, Store: st, BlobDir: dir, Base: hs.URL + "/registry"}
+	return &Env{T: t, Srv: hs, Fake: f, Store: st, BlobDir: dir, Base: hs.URL + "/registry", Svc: svc}
 }
 
 // Resp is a decoded response.
@@ -330,6 +334,13 @@ func runPublic(t *testing.T, e *Env) {
 	if errCode(r) != "source_already_indexed" {
 		t.Fatalf("got %s", errCode(r))
 	}
+	// A conflict from another namespace must not reveal which entry holds
+	// the source.
+	r = e.Expect(e.Do("POST", "/v1/skills/io.github.other/indexes", outsider, "", map[string]any{"url": ghURL, "commit": commit,
+		"expected_tree_sha": tree, "name": "copy"}), 409, "duplicate source elsewhere")
+	if strings.Contains(string(r.Body), "acme") || strings.Contains(string(r.Body), "demo") {
+		t.Fatalf("conflict leaks the existing entry: %s", r.Body)
+	}
 
 	// Indexed read: cache hit, then regenerate after eviction with identical bytes.
 	first := e.Expect(e.Do("GET", "/v1/skills/io.github.acme/demo/versions/1/archive.tar.gz", "", "", nil), 200, "indexed archive").Body
@@ -349,6 +360,17 @@ func runPublic(t *testing.T, e *Env) {
 	again := e.Expect(e.Do("GET", "/v1/skills/io.github.acme/demo/versions/1/archive.tar.gz", "", "", nil), 200, "regenerated").Body
 	if !bytes.Equal(first, again) || e.Fake.RawHits.Load() == hits {
 		t.Fatal("regenerated archive must refetch and be byte-identical")
+	}
+	// Cached content is only trusted within the verification interval: the
+	// source changes while bytes are cached, a read inside the interval is
+	// served from cache, and the first read after it re-verifies and fails.
+	e.Fake.Tamper(C1, "skills/demo/SKILL.md", md("demo", "Tampered", "MIT"))
+	e.Expect(e.Do("GET", "/v1/skills/io.github.acme/demo/versions/1/artifact", "", "", nil), 200, "within verify interval")
+	realNow := e.Svc.Now
+	e.Svc.Now = func() time.Time { return realNow().Add(2 * time.Hour) }
+	r = e.Expect(e.Do("GET", "/v1/skills/io.github.acme/demo/versions/1/artifact", "", "", nil), 409, "cached but stale verification")
+	if errCode(r) != "source_changed" {
+		t.Fatalf("got %s", errCode(r))
 	}
 	// Source changed: tampered raw bytes after eviction.
 	evict()
@@ -476,7 +498,13 @@ func runPublic(t *testing.T, e *Env) {
 	if got := keys(wk("/.well-known/agent-skills/index.json")); got != "hello-world" {
 		t.Fatalf("site index = %s", got)
 	}
-	e.Expect(e.Do("GET", "/ns/io.github.nobody/.well-known/agent-skills/index.json", "", "", nil), 404, "unknown ns index")
+	// Unknown namespaces and namespaces without public entries look the same.
+	for _, n := range []string{"io.github.nobody", "io.github.other"} {
+		r := e.Expect(e.Do("GET", "/ns/"+n+"/.well-known/agent-skills/index.json", "", "", nil), 200, "empty ns index "+n)
+		if string(r.Body) != `{"$schema":"`+registry.DiscoverySchema+`","skills":[]}`+"\n" {
+			t.Fatalf("%s index = %s", n, r.Body)
+		}
+	}
 
 	// --- status changes ---
 	e.Expect(e.Do("PATCH", "/v1/skills/io.github.acme/hello", pub, "", map[string]any{"listed": false}), 403, "publisher cannot patch")
@@ -503,6 +531,62 @@ func runPublic(t *testing.T, e *Env) {
 	e.Expect(e.Do("GET", "/v1/skills", r.JSON["token"].(string), "", nil), 200, "tmp works")
 	e.Expect(e.Do("POST", "/v1/admin/tokens/"+r.JSON["id"].(string)+"/revoke", AdminToken, "", nil), 200, "revoke")
 	e.Expect(e.Do("GET", "/v1/skills", r.JSON["token"].(string), "", nil), 401, "revoked")
+
+	// Cache headers: shared caching only for anonymous reads of public content.
+	r = e.Expect(e.Do("GET", "/v1/skills/io.github.acme/custom/versions/1/files/LICENSE", "", "", nil), 200, "anon public file")
+	if r.Header.Get("Cache-Control") != "public, max-age=60" || !strings.Contains(r.Header.Get("Vary"), "Authorization") {
+		t.Fatalf("anonymous public caching headers: %v", r.Header)
+	}
+	r = e.Expect(e.Do("GET", "/v1/skills/io.github.acme/custom/versions/1/files/LICENSE", reader, "", nil), 200, "auth public file")
+	if r.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("authenticated response must not be shared-cacheable: %v", r.Header.Get("Cache-Control"))
+	}
+	r = e.Expect(e.Do("GET", "/v1/skills/io.github.acme/nolicense/versions/1/artifact", reader, "", nil), 200, "internal artifact")
+	if r.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatal("internal artifact must not be cacheable")
+	}
+	r = e.Expect(e.Do("GET", "/.well-known/agent-skills/index.json", "", "", nil), 200, "index headers")
+	if r.Header.Get("Cache-Control") != "public, max-age=60" || !strings.Contains(r.Header.Get("Vary"), "Authorization") {
+		t.Fatalf("index cache headers: %v", r.Header)
+	}
+
+	// Custom licenses need non-empty text, which is kept and exposed.
+	tarOf := func(files map[string]string) []byte {
+		var b bytes.Buffer
+		tw := tar.NewWriter(&b)
+		for _, n := range []string{"SKILL.md", "LICENSE"} {
+			tw.WriteHeader(&tar.Header{Name: n, Mode: 0o644, Size: int64(len(files[n])), Typeflag: tar.TypeReg})
+			tw.Write([]byte(files[n]))
+		}
+		tw.Close()
+		return b.Bytes()
+	}
+	cmd := string(md("lic", "Custom licensed", "custom"))
+	r = e.Expect(up("lic", "version=1", pub, "application/x-tar", tarOf(map[string]string{"SKILL.md": cmd, "LICENSE": "  \n"})), 422, "empty LICENSE")
+	if errCode(r) != "license_text_required" {
+		t.Fatalf("got %s", errCode(r))
+	}
+	r = e.Expect(up("lic", "version=1", pub, "application/x-tar", tarOf(map[string]string{"SKILL.md": cmd, "LICENSE": "Use freely, keep this notice.\n"})), 201, "custom LICENSE")
+	if r.JSON["license"].(map[string]any)["text"] != "Use freely, keep this notice." {
+		t.Fatalf("license text not exposed: %v", r.JSON["license"])
+	}
+
+	// Failed publishes can leave orphan artifacts; GC removes only those.
+	orphan := sha(md("hello", "Changed", "MIT"))
+	if _, err := e.Svc.Blobs.Get(context.Background(), blobstore.Artifacts, orphan); err != nil {
+		t.Fatalf("expected the conflicting publish to leave an orphan blob: %v", err)
+	}
+	n, err := e.Svc.GCArtifacts(context.Background(), time.Now().Add(time.Hour))
+	if err != nil || n < 1 {
+		t.Fatalf("gc removed %d: %v", n, err)
+	}
+	if _, err := e.Svc.Blobs.Get(context.Background(), blobstore.Artifacts, orphan); !errors.Is(err, blobstore.ErrNotFound) {
+		t.Fatalf("orphan survived gc: %v", err)
+	}
+	e.Expect(e.Do("GET", "/v1/skills/io.github.acme/hello/versions/1.0.0/artifact", "", "", nil), 200, "referenced artifact kept")
+	if n, _ := e.Svc.GCArtifacts(context.Background(), time.Now().Add(-time.Hour)); n != 0 {
+		t.Fatal("gc must respect the grace period")
+	}
 
 	// Audit never contains token plaintext.
 	audit := e.Expect(e.Do("GET", "/v1/admin/audit?limit=1000", AdminToken, "", nil), 200, "audit")
