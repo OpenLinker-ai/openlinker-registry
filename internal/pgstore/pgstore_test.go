@@ -17,6 +17,7 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/pgstore"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/store/storetest"
 )
 
 // DSNEnv names the variable that enables Postgres integration tests.
@@ -73,6 +74,38 @@ func TestEndToEndPostgres(t *testing.T) {
 		t.Skip(DSNEnv + " is not set; skipping Postgres integration tests")
 	}
 	apitest.Run(t, func(t *testing.T) store.Store { return newStore(t) })
+}
+
+func TestStoreConformancePostgres(t *testing.T) {
+	if os.Getenv(DSNEnv) == "" {
+		t.Skip(DSNEnv + " is not set; skipping Postgres integration tests")
+	}
+	storetest.Run(t, func(t *testing.T) store.Store { return newStore(t) })
+}
+
+// TestYankTerminalTrigger proves the schema rejects leaving the yanked state
+// even for statements that bypass the store.
+func TestYankTerminalTrigger(t *testing.T) {
+	st, schema := newStoreSchema(t)
+	ctx := context.Background()
+	if _, err := st.CreateNamespace(ctx, model.Namespace{Name: "com.example", Kind: "domain"}, model.AuditEvent{Actor: "t", Action: "ns"}); err != nil {
+		t.Fatal(err)
+	}
+	v := model.Version{Version: "1", FrontmatterName: "x", FrontmatterDescription: "y", LicenseKind: skill.LicenseSPDX,
+		Files: []skill.ManifestEntry{}, ArtifactDigest: "sha256:" + strings.Repeat("b", 64), ArtifactType: "skill-md",
+		Source: &model.Source{Kind: "upload"}, CreatedBy: "t"}
+	sk, _, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "com.example", Name: "x", Mode: skill.ModeHosted,
+		Visibility: model.VisibilityPublic, Listed: true, Version: v}, model.AuditEvent{Actor: "t", Action: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetSkillStatus(ctx, sk.ID, model.StatusYanked, "r", model.AuditEvent{Actor: "t", Action: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	conn := connSchema(t, schema)
+	if _, err := conn.Exec(ctx, `UPDATE skills SET status = 'deprecated' WHERE id = $1`, sk.ID); err == nil {
+		t.Fatal("raw un-yank must be rejected by the schema")
+	}
 }
 
 func TestImmutabilityAndAppendOnly(t *testing.T) {

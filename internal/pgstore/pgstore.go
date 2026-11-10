@@ -332,6 +332,11 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		if k.Status == model.StatusYanked {
 			return conflict("skill_yanked", "skill is yanked")
 		}
+		// Checked under the skill row lock, so a concurrent visibility
+		// change cannot interleave with this publish.
+		if in.Mode == "hosted" && k.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
+			return &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
+		}
 		v := in.Version
 		files, _ := json.Marshal(v.Files)
 		src, loc := jsonOrNil(v.Source), jsonOrNil(v.Locator)
@@ -434,6 +439,21 @@ func (s *Store) GetVersion(ctx context.Context, skillID int64, version string) (
 func (s *Store) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
 	var out model.Skill
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		var mode string
+		if err := tx.QueryRow(ctx, `SELECT mode FROM skills WHERE id = $1 FOR UPDATE`, skillID).Scan(&mode); err != nil {
+			return notFound(err)
+		}
+		// Publishes lock the same row, so this sees every committed version.
+		if p.Visibility != nil && *p.Visibility == model.VisibilityPublic && mode == "hosted" {
+			var unknown bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skill_versions WHERE skill_id = $1
+				AND yanked_at IS NULL AND license_kind = 'unknown')`, skillID).Scan(&unknown); err != nil {
+				return err
+			}
+			if unknown {
+				return &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
+			}
+		}
 		if err := rowsOrNotFound(tx.Exec(ctx, `UPDATE skills SET visibility = COALESCE($2, visibility), listed = COALESCE($3, listed),
 			updated_at = now() WHERE id = $1`, skillID, p.Visibility, p.Listed)); err != nil {
 			return err
@@ -449,11 +469,23 @@ func (s *Store) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPat
 func (s *Store) SetSkillStatus(ctx context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error) {
 	var out model.Skill
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
-		if err := rowsOrNotFound(tx.Exec(ctx, `UPDATE skills SET status = $2, status_reason = $3, updated_at = now() WHERE id = $1`,
-			skillID, status, reason)); err != nil {
+		// The yanked state is terminal: the condition is evaluated on the
+		// current row, never on a caller's earlier snapshot.
+		tag, err := tx.Exec(ctx, `UPDATE skills SET status = $2, status_reason = $3, updated_at = now()
+			WHERE id = $1 AND (status <> 'yanked' OR $2 = 'yanked')`, skillID, status, reason)
+		if err != nil {
 			return err
 		}
-		var err error
+		if tag.RowsAffected() == 0 {
+			var exists bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skills WHERE id = $1)`, skillID).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				return model.ErrNotFound
+			}
+			return model.ErrSkillYanked()
+		}
 		out, err = s.getSkillByID(ctx, tx, skillID)
 		return err
 	})

@@ -52,6 +52,10 @@ func AsError(err error) *Error {
 	if errors.As(err, &ge) {
 		return &Error{Status: ge.Status, Code: ge.Code, Msg: ge.Msg}
 	}
+	var pe *model.PolicyError
+	if errors.As(err, &pe) {
+		return &Error{Status: http.StatusUnprocessableEntity, Code: pe.Code, Msg: pe.Msg}
+	}
 	var ce *model.ConflictError
 	if errors.As(err, &ce) {
 		return &Error{Status: http.StatusConflict, Code: ce.Code, Msg: ce.Msg}

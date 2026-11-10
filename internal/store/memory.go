@@ -188,6 +188,9 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 		if s.Status == model.StatusYanked {
 			return model.Skill{}, model.Version{}, conflict("skill_yanked", "skill is yanked")
 		}
+		if in.Mode == "hosted" && s.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
+			return model.Skill{}, model.Version{}, &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
+		}
 		for _, v := range m.versions {
 			if v.SkillID == s.ID && v.Version == in.Version.Version {
 				return model.Skill{}, model.Version{}, conflict("version_exists", "version already exists and is immutable")
@@ -200,6 +203,9 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 					return model.Skill{}, model.Version{}, conflict("source_already_indexed", "this source is already indexed on this registry")
 				}
 			}
+		}
+		if in.Mode == "hosted" && in.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
+			return model.Skill{}, model.Version{}, &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
 		}
 		s = model.Skill{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Visibility: in.Visibility, Listed: in.Listed,
 			Status: model.StatusActive, Mode: in.Mode, SourceKey: in.SourceKey, CreatedAt: now}
@@ -261,6 +267,13 @@ func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatc
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
 	}
+	if p.Visibility != nil && *p.Visibility == model.VisibilityPublic && s.Mode == "hosted" {
+		for _, v := range m.versions {
+			if v.SkillID == skillID && v.YankedAt == nil && v.LicenseKind == "unknown" {
+				return model.Skill{}, &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
+			}
+		}
+	}
 	if p.Visibility != nil {
 		s.Visibility = *p.Visibility
 	}
@@ -280,6 +293,9 @@ func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason
 	s, ok := m.skills[skillID]
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
+	}
+	if s.Status == model.StatusYanked && status != model.StatusYanked {
+		return model.Skill{}, model.ErrSkillYanked()
 	}
 	s.Status, s.StatusReason, s.UpdatedAt = status, reason, time.Now().UTC()
 	m.skills[skillID] = s

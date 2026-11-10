@@ -124,6 +124,19 @@ func TestPublishWaitsForInFlightGC(t *testing.T) {
 	<-gcHolding
 	pubErr := make(chan error, 1)
 	go func() { pubErr <- publishGC(svc, "1") }()
+	// Handshake: wait until the publish has registered on the digest lock
+	// (GC holds one reference, the waiting publish the second). The
+	// reference is taken immediately before blocking on the lock.
+	waitLockRefs(t, &svc.locks, digest, 2)
+	// While GC holds the lock the publish must stay blocked: it cannot have
+	// written the blob or finished.
+	select {
+	case <-putAfterGC:
+		t.Fatal("publish wrote the blob while GC held the digest")
+	case err := <-pubErr:
+		t.Fatalf("publish finished while GC held the digest: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	close(releaseGC)
 	if n := <-gcRes; n != 1 {
 		t.Fatalf("gc removed %d, want the orphan removed", n)
@@ -135,6 +148,27 @@ func TestPublishWaitsForInFlightGC(t *testing.T) {
 		t.Fatal("publish wrote the blob while GC held the digest")
 	}
 	assertServable(t, svc)
+}
+
+// waitLockRefs waits until digest's lock entry has n holders or waiters.
+func waitLockRefs(t *testing.T, d *digestLocks, digest string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		d.mu.Lock()
+		refs := 0
+		if l := d.m[digest]; l != nil {
+			refs = l.refs
+		}
+		d.mu.Unlock()
+		if refs >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("digest lock has %d holders/waiters, want %d", refs, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // deleteRecorder notes when GC has actually removed a blob.
