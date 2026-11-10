@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOWORK: "off"
+      REGISTRY_TEST_DATABASE_URL: postgres://registry:registry@localhost:5432/registry_test?sslmode=disable
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: registry_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U registry -d registry_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: go test (with Postgres)
+        run: go test -count=1 -race ./...
+      - name: build
+        run: go build ./cmd/openlinker-registry
