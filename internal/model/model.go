@@ -20,6 +20,23 @@ type ConflictError struct{ Code, Msg string }
 func (e *ConflictError) Error() string { return e.Msg }
 func (e *ConflictError) Unwrap() error { return ErrConflict }
 
+// PolicyError is a request rejected by a rule the store enforces atomically
+// with the mutation (for example the license rule for public hosted skills).
+type PolicyError struct{ Code, Msg string }
+
+func (e *PolicyError) Error() string { return e.Msg }
+
+// Policy codes and messages shared by all store implementations.
+const (
+	CodeLicenseRequired = "license_required"
+	MsgLicenseRequired  = "public hosted skills need a license on every non-yanked version"
+)
+
+// ErrSkillYanked is returned when a yanked skill would change status.
+func ErrSkillYanked() error {
+	return &ConflictError{Code: "skill_yanked", Msg: "a yanked skill cannot change status"}
+}
+
 // Visibility levels.
 const (
 	VisibilityPublic   = "public"
