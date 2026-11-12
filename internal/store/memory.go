@@ -21,6 +21,7 @@ type Memory struct {
 	skills    map[int64]model.Skill
 	versions  map[int64]model.Version
 	audit     []model.AuditEvent
+	locks     keyLocks
 	upstreams map[int64]model.Upstream
 	mcp       map[int64]model.MCPServer
 	mcpVers   map[int64]model.MCPVersion
@@ -553,4 +554,44 @@ func (m *Memory) ListMirroredSkills(_ context.Context, upstreamID int64, afterNS
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// keyLocks is a set of named locks.
+type keyLocks struct {
+	mu sync.Mutex
+	m  map[string]*keyLock
+}
+
+type keyLock struct {
+	held chan struct{}
+	refs int
+}
+
+// LockMirror implements Store.
+func (m *Memory) LockMirror(ctx context.Context, key string) (func(), error) {
+	m.locks.mu.Lock()
+	if m.locks.m == nil {
+		m.locks.m = map[string]*keyLock{}
+	}
+	l := m.locks.m[key]
+	if l == nil {
+		l = &keyLock{held: make(chan struct{}, 1)}
+		m.locks.m[key] = l
+	}
+	l.refs++
+	m.locks.mu.Unlock()
+	drop := func() {
+		m.locks.mu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(m.locks.m, key)
+		}
+		m.locks.mu.Unlock()
+	}
+	select {
+	case l.held <- struct{}{}:
+		return func() { <-l.held; drop() }, nil
+	case <-ctx.Done():
+		drop()
+		return nil, ctx.Err()
+	}
 }

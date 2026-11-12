@@ -29,7 +29,13 @@ var migrationFS embed.FS
 const migrationLockID = 0x6f6c726567 // "olreg"
 
 // Store is the Postgres store.
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool *pgxpool.Pool
+	// lockSlots bounds how many mirror locks are held at once. Each holds a
+	// pooled connection for as long as the lock; leaving half of the pool
+	// free keeps the holders' own queries from waiting on each other.
+	lockSlots chan struct{}
+}
 
 var _ store.Store = (*Store)(nil)
 
@@ -48,7 +54,7 @@ func OpenConfig(ctx context.Context, cfg *pgxpool.Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect database: %w", err)
 	}
-	return &Store{pool: pool}, nil
+	return &Store{pool: pool, lockSlots: make(chan struct{}, max(1, int(pool.Config().MaxConns)/2))}, nil
 }
 
 // Close releases the pool.
@@ -814,4 +820,40 @@ func (s *Store) ListMirroredSkills(ctx context.Context, upstreamID int64, afterN
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.Skill, error) { return scanSkill(row) })
+}
+
+// mirrorLockSeed keeps mirror locks apart from other advisory locks.
+const mirrorLockSeed = 0x6f6c726d // "olrm"
+
+// LockMirror implements store.Store with a session-level advisory lock, so
+// it excludes every registry process using this database. The lock lives on
+// a dedicated pooled connection until release; if the connection is lost the
+// database releases the lock itself.
+func (s *Store) LockMirror(ctx context.Context, key string) (func(), error) {
+	select {
+	case s.lockSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		<-s.lockSlots
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, $2))`, key, int64(mirrorLockSeed)); err != nil {
+		// The session may or may not hold the lock now; closing it settles that.
+		_ = conn.Conn().Close(context.WithoutCancel(ctx))
+		conn.Release()
+		<-s.lockSlots
+		return nil, err
+	}
+	return func() {
+		done, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(done, `SELECT pg_advisory_unlock(hashtextextended($1, $2))`, key, int64(mirrorLockSeed)); err != nil {
+			_ = conn.Conn().Close(done)
+		}
+		conn.Release()
+		<-s.lockSlots
+	}, nil
 }

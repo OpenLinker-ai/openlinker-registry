@@ -195,7 +195,7 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 		}
 		for _, doc := range docs {
 			seen[doc.Name], seen[doc.Name+"@"+doc.Version] = true, true
-			res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest)
+			res, err := s.mirrorListedMCP(ctx, u, c, doc, u.LatestOnly && !doc.IsLatest)
 			switch {
 			case err == nil:
 				stats.add("mcp_" + res)
@@ -261,38 +261,77 @@ func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstrea
 			if covered {
 				continue
 			}
-			docs, err := c.ListMCPVersions(ctx, srv.Name)
-			var ue *upstream.Error
-			switch {
-			case errors.Is(err, upstream.ErrNotFound):
-				if err := s.withdrawMCP(ctx, u, srv, stats); err != nil {
-					return err
-				}
-				continue
-			case errors.As(err, &ue):
-				stats.add("mcp_skipped")
-				continue
-			case err != nil:
+			if err := s.refreshMCPServer(ctx, u, c, srv, stats); err != nil {
 				return err
-			}
-			for _, doc := range docs {
-				res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest)
-				switch {
-				case err == nil:
-					stats.add("mcp_" + res)
-				case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
-					return err
-				case errors.Is(err, model.ErrConflict):
-					stats.add("mcp_conflicts")
-				default:
-					stats.add("mcp_skipped")
-				}
 			}
 		}
 		if len(servers) < 200 {
 			return nil
 		}
 	}
+}
+
+// refreshMCPServer reads every version of one mirrored server from the
+// upstream, under the server's mirror lock, and applies them; a server the
+// upstream no longer serves is withdrawn.
+func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *upstream.Client, srv model.MCPServer, stats syncStats) error {
+	release, err := s.Store.LockMirror(ctx, "mcp:"+srv.Name)
+	if err != nil {
+		return err
+	}
+	defer release()
+	docs, err := c.ListMCPVersions(ctx, srv.Name)
+	var ue *upstream.Error
+	switch {
+	case errors.Is(err, upstream.ErrNotFound):
+		return s.withdrawMCP(ctx, u, srv, stats)
+	case errors.As(err, &ue):
+		stats.add("mcp_skipped")
+		return nil
+	case err != nil:
+		return err
+	}
+	for _, doc := range docs {
+		res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest, true)
+		switch {
+		case err == nil:
+			stats.add("mcp_" + res)
+		case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
+			return err
+		case errors.Is(err, model.ErrConflict):
+			stats.add("mcp_conflicts")
+		default:
+			stats.add("mcp_skipped")
+		}
+	}
+	return nil
+}
+
+// mirrorListedMCP applies a document that came with a listing page. Such a
+// document was read some time ago, and a forwarded read may have applied a
+// newer one since. So it is only allowed to add a version or to narrow who
+// sees the server; if it would do anything else, the version is read again
+// under the server's mirror lock and that answer is applied.
+func (s *Service) mirrorListedMCP(ctx context.Context, u model.Upstream, c *upstream.Client, doc upstream.MCPDoc, onlyExisting bool) (string, error) {
+	res, err := s.mirrorMCP(ctx, u, doc, onlyExisting, false)
+	if err != nil || res != model.MirrorStale {
+		return res, err
+	}
+	release, err := s.Store.LockMirror(ctx, "mcp:"+doc.Name)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	fresh, err := c.GetMCP(ctx, doc.Name, doc.Version)
+	if err != nil {
+		// Gone or unreadable right now: nothing was widened, and the
+		// reconciliation of this or the next run settles it.
+		if isUpstreamError(err) {
+			return "", fail(http.StatusBadGateway, "upstream_changed", "the upstream entry changed while it was being read")
+		}
+		return "", err
+	}
+	return s.mirrorMCP(ctx, u, fresh, onlyExisting, true)
 }
 
 // syncSkills mirrors the skills of another openlinker-registry: metadata
@@ -350,13 +389,21 @@ func (s *Service) syncSkills(ctx context.Context, u model.Upstream, c *upstream.
 
 // refreshSkill reads one skill from the upstream and brings the local mirror
 // up to date; a skill the upstream no longer serves to this instance is
-// withdrawn. Only failures of this instance or of the transport are
+// withdrawn. It is the only way a mirrored skill is written. Only failures of this instance or of the transport are
 // returned: a rejected or malformed entry is counted and skipped, so it
 // cannot keep the rest of a sync from running.
 func (s *Service) refreshSkill(ctx context.Context, u model.Upstream, c *upstream.Client, ns, name string, stats syncStats) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	// Reading and applying happen under the skill's mirror lock, so a sync
+	// and a forwarded read (in any registry process) cannot apply their
+	// answers in the wrong order.
+	release, err := s.Store.LockMirror(ctx, "skill:"+ns+"/"+name)
+	if err != nil {
+		return err
+	}
+	defer release()
 	detail, err := c.GetSkill(ctx, ns, name)
 	var ue *upstream.Error
 	switch {

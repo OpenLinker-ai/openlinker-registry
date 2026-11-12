@@ -65,6 +65,11 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 			"packages":[{"registryType":"mcpb","identifier":"https://downloads.example/tool.mcpb?api_key=` + secret + `","transport":{"type":"stdio"}}]}`,
 		"url in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-mirrors":["https://u:` + secret + `@mirror.example/w"],
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		// A remote URL may be a template; it is still a URL.
+		"template url": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{base}/mcp?api_key=` + secret + `","variables":{"base":{"default":"https://mcp.example.com"}}}]}`,
+		"template in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-alt":"{base}/mcp?access_token=` + secret + `",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 		"encoded query name": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?access%5Ftoken=` + secret + `"}]}`,
 	}

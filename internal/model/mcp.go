@@ -94,6 +94,12 @@ type MCPMirrorInput struct {
 	Visibility string
 	Listed     bool
 	Version    MCPVersion
+	// Fresh says the document was read from the upstream just now, under
+	// the entry's mirror lock. A document that is not fresh (it came with a
+	// listing page read some time ago) may be older than what a fresh read
+	// has applied since, so it may only add a version or narrow who sees
+	// the server; anything else is left alone and reported as MirrorStale.
+	Fresh bool
 }
 
 // Mirror upsert outcomes.
@@ -101,7 +107,28 @@ const (
 	MirrorCreated   = "created"
 	MirrorUpdated   = "updated"
 	MirrorUnchanged = "unchanged"
+	// MirrorStale: the document was not fresh and would have changed the
+	// state of an existing version or widened who sees the server. What it
+	// could safely do was done; the caller reads the entry again.
+	MirrorStale = "stale"
 )
+
+// NarrowerVisibility returns the more restrictive of two visibilities.
+func NarrowerVisibility(a, b string) string {
+	rank := func(v string) int {
+		switch v {
+		case VisibilityPublic:
+			return 3
+		case VisibilityInternal:
+			return 2
+		}
+		return 1
+	}
+	if rank(a) <= rank(b) {
+		return a
+	}
+	return b
+}
 
 // MCPPatch updates mutable server settings.
 type MCPPatch struct {

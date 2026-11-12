@@ -64,19 +64,21 @@ func timeOrNil(t time.Time) *time.Time {
 // write and IsLatest decision of a server happens under this lock. nsID is
 // the namespace of the returned server, which the caller must compare with
 // its own along with the exact name and mode.
-func lockMCPServer(ctx context.Context, tx pgx.Tx, create model.MCPServer, createNS int64) (srv model.MCPServer, nsID int64, err error) {
+func lockMCPServer(ctx context.Context, tx pgx.Tx, create model.MCPServer, createNS int64) (srv model.MCPServer, nsID int64, created bool, err error) {
 	sel := `SELECT ` + mcpServerCols + `, m.namespace_id` + mcpServerFrom + `WHERE lower(m.name) = lower($1) FOR UPDATE OF m`
 	dest := append(mcpServerDest(&srv), &nsID)
 	err = tx.QueryRow(ctx, sel, create.Name).Scan(dest...)
 	if errors.Is(err, pgx.ErrNoRows) {
-		if _, err = tx.Exec(ctx, `INSERT INTO mcp_servers (namespace_id, name, mode, visibility, listed, created_by)
+		tag, ierr := tx.Exec(ctx, `INSERT INTO mcp_servers (namespace_id, name, mode, visibility, listed, created_by)
 			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (lower(name)) DO NOTHING`,
-			createNS, create.Name, create.Mode, create.Visibility, create.Listed, create.CreatedBy); err != nil {
-			return srv, 0, err
+			createNS, create.Name, create.Mode, create.Visibility, create.Listed, create.CreatedBy)
+		if ierr != nil {
+			return srv, 0, false, ierr
 		}
+		created = tag.RowsAffected() == 1
 		err = tx.QueryRow(ctx, sel, create.Name).Scan(dest...)
 	}
-	return srv, nsID, err
+	return srv, nsID, created, err
 }
 
 // clearMCPLatest drops IsLatest from every version of the server except
@@ -104,7 +106,7 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 		}
 		var srvNS int64
 		var err error
-		srv, srvNS, err = lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
+		srv, srvNS, _, err = lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
 			Listed: in.Listed, CreatedBy: in.Version.CreatedBy}, nsID)
 		if err != nil {
 			return err
@@ -159,7 +161,7 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 		message = ""
 	}
 	latest := v.IsLatest && status != model.MCPStatusDeleted
-	outcome := model.MirrorUnchanged
+	outcome, stale := model.MirrorUnchanged, false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		visibility, err := mirrorVisibility(ctx, tx, in.UpstreamID, in.Visibility)
 		if err != nil {
@@ -171,13 +173,20 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 		if err != nil {
 			return err
 		}
-		srv, srvNS, err := lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: model.MCPModeMirrored,
+		srv, srvNS, created, err := lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: model.MCPModeMirrored,
 			Visibility: in.Visibility, Listed: in.Listed, CreatedBy: v.CreatedBy}, ns.ID)
 		if err != nil {
 			return err
 		}
 		if srv.Name != in.Name || srv.Mode != model.MCPModeMirrored || srvNS != ns.ID {
 			return errServerName()
+		}
+		// A document that is not fresh may only narrow who sees an existing
+		// server; a widening is withheld and reported.
+		if !created && !in.Fresh {
+			vis, listed := model.NarrowerVisibility(srv.Visibility, in.Visibility), srv.Listed && in.Listed
+			stale = vis != in.Visibility || listed != in.Listed
+			in.Visibility, in.Listed = vis, listed
 		}
 		var cur model.MCPVersion
 		err = tx.QueryRow(ctx, `SELECT id, digest, status, status_message, is_latest FROM mcp_server_versions
@@ -199,7 +208,12 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 				return err
 			}
 		}
-		if !missing && cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest {
+		same := !missing && cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest
+		if !missing && !same && !in.Fresh {
+			// Nor may it change the state of a version that is already here.
+			stale, same = true, true
+		}
+		if same {
 			if !settings {
 				return nil
 			}
@@ -237,6 +251,9 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 	})
 	if err != nil {
 		return "", err
+	}
+	if stale {
+		return model.MirrorStale, nil
 	}
 	return outcome, nil
 }

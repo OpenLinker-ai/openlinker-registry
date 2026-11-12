@@ -37,6 +37,23 @@ func TestThrottleRetry(t *testing.T) {
 		t.Fatalf("sync read: %+v %v after %d calls", items, err, calls.Load())
 	}
 
+	// Retry-After may be an HTTP date; it is waited for like a number of
+	// seconds, not hammered at once per second until a retry count runs out.
+	var dated atomic.Int64
+	until := time.Now().Add(1500 * time.Millisecond)
+	d := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		dated.Add(1)
+		if time.Now().Before(until) {
+			w.Header().Set("Retry-After", until.Add(time.Second).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writeJSON(w, `{"skills":[]}`)
+	})
+	if _, _, err := newClient(d.URL).ListSkills(upstream.WithThrottleRetry(ctx), "", 0); err != nil || dated.Load() != 2 {
+		t.Fatalf("dated Retry-After: %v after %d calls, want one wait and two calls", err, dated.Load())
+	}
+
 	// The wait ends with the context: a throttled run does not outlive its
 	// deadline.
 	always := newFake(t, func(w http.ResponseWriter, r *http.Request) {

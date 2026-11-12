@@ -442,6 +442,76 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a listing cannot undo a fresher read", func(t *testing.T) {
+		// A listing page is read some time before it is applied. If the
+		// upstream restricted a server in between and a forwarded read
+		// already applied that, the page (which still says "public") must
+		// not make the server public again. Widening needs a fresh read.
+		listVisibility, readVisibility, listStatus, readStatus := "public", "public", "active", "active"
+		entry := func(visibility, status string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": "com.race/server", "description": "d", "version": "1.0.0",
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": status != "deleted"},
+					metaEntry: map[string]any{"visibility": visibility, "listed": true}}}
+		}
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[]}`))
+			case "/v0.1/servers":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry(listVisibility, listStatus)}})
+			case "/v0.1/servers/com.race%2Fserver/versions/1.0.0", "/v0.1/servers/com.race%2Fserver/versions/latest":
+				_ = enc.Encode(entry(readVisibility, readStatus))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "race", "kind": "openlinker-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		anonymous := func() int { return e.Do("GET", "/v0.1/servers/com.race%2Fserver/versions/1.0.0", "", "", nil).Status }
+		e.sync("race")
+		if anonymous() != 200 {
+			t.Fatal("public server must be mirrored as public")
+		}
+		// The upstream restricts the server; the mirror follows.
+		listVisibility, readVisibility = "internal", "internal"
+		e.sync("race")
+		if anonymous() != 404 {
+			t.Fatal("restriction did not arrive")
+		}
+		// A stale page still says public, while the upstream says internal.
+		listVisibility = "public"
+		if s := e.sync("race"); s["last_status"] != "ok" || anonymous() != 404 {
+			t.Fatalf("a stale listing page made a restricted server public again: %v", s)
+		}
+		// The same for status: a stale page must not revive a deleted version.
+		listVisibility, readStatus, listStatus = "internal", "deleted", "deleted"
+		e.sync("race")
+		reader := e.token([]string{"skills:read"}, nil)
+		status := func() any {
+			r := e.Do("GET", "/v0.1/servers/com.race%2Fserver/versions/1.0.0", reader, "", nil)
+			return official(r.JSON)["status"]
+		}
+		if status() != "deleted" {
+			t.Fatal("deletion did not arrive")
+		}
+		listStatus = "active"
+		e.sync("race")
+		if status() != "deleted" {
+			t.Fatal("a stale listing page revived a deleted version")
+		}
+		// When the upstream really widens again, a fresh read confirms it.
+		listVisibility, readVisibility, listStatus, readStatus = "public", "public", "active", "active"
+		e.sync("race")
+		if anonymous() != 200 || status() != "active" {
+			t.Fatalf("a real widening must arrive: anonymous %d, status %v", anonymous(), status())
+		}
+	})
+
 	t.Run("watermark", func(t *testing.T) {
 		// One entry the mirror rejects claims an update far in the future;
 		// one good entry was updated in the past. The watermark may only
@@ -527,6 +597,15 @@ func runLimitsAndFormats(t *testing.T, newStore func(t *testing.T) store.Store) 
 	}
 	guarded.Expect(guarded.Do("GET", "/v1/skills", valid, "", nil), 429, "credentialed request from a blocked address")
 	guarded.Expect(guarded.Do("GET", "/v1/skills", "", "", nil), 200, "anonymous request")
+	// A forged page session is a guessed token: it draws on the same budget.
+	pages := NewEnv(t, newStore(t), Options{Mode: "private", UI: true, AuthFailuresPerMinute: 3})
+	member := pages.token([]string{"skills:read"}, nil)
+	pages.Headers = map[string]string{"Cookie": "olr_session=olr_aaaaaaaaaaaaaaaa_" + strings.Repeat("d", 43)}
+	for range 3 {
+		pages.Expect(pages.Do("GET", "/ui/", "", "", nil), 303, "forged session")
+	}
+	pages.Headers = nil
+	pages.Expect(pages.Do("GET", "/v1/skills", member, "", nil), 429, "address blocked after forged sessions")
 	// Successful authentications never count.
 	calm := NewEnv(t, newStore(t), Options{AuthFailuresPerMinute: 3})
 	good := calm.token([]string{"skills:read"}, nil)

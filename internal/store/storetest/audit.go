@@ -290,6 +290,93 @@ var mirrorTests = []testCase{
 			t.Fatalf("cursor of a current run = %q", got)
 		}
 	}},
+	{"a listing document only adds or narrows", func(t *testing.T, st store.Store) {
+		// A document that came with a listing page may be older than what a
+		// fresh read applied meanwhile. It may add a version and narrow who
+		// sees the server; it may not undo anything.
+		up := newUpstream(t, st, "up")
+		fresh := mirrorInput(up, "org.mirror/srv", "1.0.0")
+		fresh.Visibility, fresh.Listed = model.VisibilityInternal, false
+		fresh.Version.Status, fresh.Version.StatusMessage = model.MCPStatusDeleted, "gone"
+		mirrorMCP(t, st, fresh, model.MirrorCreated)
+
+		// The listing still says: public, listed, active.
+		listed := mirrorInput(up, "org.mirror/srv", "1.0.0")
+		listed.Fresh, listed.Version.IsLatest = false, true
+		events := auditCount(t, st, "test")
+		mirrorMCP(t, st, listed, model.MirrorStale)
+		srv := mcpServer(t, st, "org.mirror/srv")
+		if v := mcpVersion(t, st, srv.ID, "1.0.0"); srv.Visibility != model.VisibilityInternal || srv.Listed ||
+			v.Status != model.MCPStatusDeleted || v.IsLatest {
+			t.Fatalf("a stale document undid a fresher state: %+v %+v", srv, v)
+		}
+		if n := auditCount(t, st, "test"); n != events {
+			t.Fatalf("a refused document wrote %d audit events", n-events)
+		}
+		// It may add a version, without widening the server.
+		next := mirrorInput(up, "org.mirror/srv", "2.0.0")
+		next.Fresh = false
+		mirrorMCP(t, st, next, model.MirrorStale)
+		if got := mcpServer(t, st, "org.mirror/srv"); got.Visibility != model.VisibilityInternal || got.Listed {
+			t.Fatalf("adding a version widened the server: %+v", got)
+		}
+		if v := mcpVersion(t, st, srv.ID, "2.0.0"); v.Status != model.MCPStatusActive {
+			t.Fatalf("new version = %+v", v)
+		}
+		// It may narrow.
+		narrow := mirrorInput(up, "org.mirror/other", "1.0.0")
+		mirrorMCP(t, st, narrow, model.MirrorCreated)
+		narrow.Fresh, narrow.Visibility, narrow.Listed = false, model.VisibilityInternal, false
+		mirrorMCP(t, st, narrow, model.MirrorUpdated)
+		if got := mcpServer(t, st, "org.mirror/other"); got.Visibility != model.VisibilityInternal || got.Listed {
+			t.Fatalf("narrowing by a listing document: %+v", got)
+		}
+		// A fresh document does all of it.
+		fresh = mirrorInput(up, "org.mirror/srv", "1.0.0")
+		mirrorMCP(t, st, fresh, model.MirrorUpdated)
+		if got := mcpServer(t, st, "org.mirror/srv"); got.Visibility != model.VisibilityPublic || !got.Listed {
+			t.Fatalf("fresh document: %+v", got)
+		}
+	}},
+	{"mirror locks exclude each other by key", func(t *testing.T, st store.Store) {
+		ctx := context.Background()
+		release, err := st.LockMirror(ctx, "skill:org.a/x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		other, err := st.LockMirror(ctx, "skill:org.a/y")
+		if err != nil {
+			t.Fatalf("another key must not wait: %v", err)
+		}
+		other()
+		short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		if _, err := st.LockMirror(short, "skill:org.a/x"); err == nil {
+			t.Fatal("the same key was locked twice")
+		}
+		cancel()
+		got := make(chan error, 1)
+		go func() {
+			again, err := st.LockMirror(ctx, "skill:org.a/x")
+			if err == nil {
+				again()
+			}
+			got <- err
+		}()
+		select {
+		case err := <-got:
+			t.Fatalf("a waiter got the lock while it was held: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+		release()
+		select {
+		case err := <-got:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the waiter never got the lock after release")
+		}
+	}},
 	{"mirrored namespaces have no members", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		up := newUpstream(t, st, "up")
@@ -358,19 +445,20 @@ var mirrorTests = []testCase{
 		// and patches that change nothing keep the cursor.
 		yes, no, allow, sameAllow, deny := true, false, []string{"org.*"}, []string{"org.*"}, []string{"org.x"}
 		prio, public := 5, model.VisibilityPublic
-		for name, tc := range map[string]struct {
+		for _, tc := range []struct {
+			name  string
 			patch model.UpstreamPatch
 			reset bool
 		}{
-			"allow list":      {model.UpstreamPatch{NamespaceAllow: &allow}, true},
-			"same allow list": {model.UpstreamPatch{NamespaceAllow: &sameAllow}, false},
-			"deny list":       {model.UpstreamPatch{NamespaceDeny: &deny}, true},
-			"latest only on":  {model.UpstreamPatch{LatestOnly: &yes}, true},
-			"latest only off": {model.UpstreamPatch{LatestOnly: &no}, true},
-			"same visibility": {model.UpstreamPatch{Visibility: &public}, false},
-			"priority":        {model.UpstreamPatch{Priority: &prio, ProxyOnMiss: &yes}, false},
+			{"allow list", model.UpstreamPatch{NamespaceAllow: &allow}, true},
+			{"same allow list", model.UpstreamPatch{NamespaceAllow: &sameAllow}, false},
+			{"deny list", model.UpstreamPatch{NamespaceDeny: &deny}, true},
+			{"latest only on", model.UpstreamPatch{LatestOnly: &yes}, true},
+			{"latest only off", model.UpstreamPatch{LatestOnly: &no}, true},
+			{"same visibility", model.UpstreamPatch{Visibility: &public}, false},
+			{"priority", model.UpstreamPatch{Priority: &prio, ProxyOnMiss: &yes}, false},
 		} {
-			_ = name
+			name := tc.name
 			setCursor()
 			if _, err := st.UpdateUpstream(ctx, "up", tc.patch, audit); err != nil {
 				t.Fatal(err)

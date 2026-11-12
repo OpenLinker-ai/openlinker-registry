@@ -76,6 +76,13 @@ type Store interface {
 	// ListMirroredMCP is ListMirroredSkills for MCP servers, in name order.
 	ListMirroredMCP(ctx context.Context, upstreamID int64, afterName string, limit int) ([]model.MCPServer, error)
 
+	// LockMirror takes the mirror lock of one entry (key names it, for
+	// example "skill:<namespace>/<name>") and returns the function that
+	// releases it. Reading an entry from its upstream and applying what was
+	// read happens under this lock, in every registry process, so an older
+	// answer can never be applied after a newer one.
+	LockMirror(ctx context.Context, key string) (release func(), err error)
+
 	// --- MCP servers ---
 
 	// PublishMCPVersion creates the server if needed and appends an immutable

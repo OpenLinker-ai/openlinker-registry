@@ -126,12 +126,18 @@ func (s *Store) UpdateUpstream(ctx context.Context, name string, p model.Upstrea
 			WHERE visibility = 'public' AND `+inUpstream, out.ID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET updated_at = now() WHERE server_id IN
-			(SELECT id FROM mcp_servers WHERE visibility = 'public' AND `+inUpstream+`)`, out.ID); err != nil {
+		// Servers before their versions: the order every other writer takes
+		// these rows in.
+		rows, err := tx.Query(ctx, `UPDATE mcp_servers SET visibility = 'internal', updated_at = now()
+			WHERE visibility = 'public' AND `+inUpstream+` RETURNING id`, out.ID)
+		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE mcp_servers SET visibility = 'internal', updated_at = now()
-			WHERE visibility = 'public' AND `+inUpstream, out.ID)
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil || len(ids) == 0 {
+			return err
+		}
+		_, err = tx.Exec(ctx, `UPDATE mcp_server_versions SET updated_at = now() WHERE server_id = ANY($1)`, ids)
 		return err
 	})
 	if err != nil {

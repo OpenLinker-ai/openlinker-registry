@@ -157,7 +157,7 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, max int64) 
 	if c.HTTP == nil {
 		return nil, invalidArg("upstream client has no HTTP client")
 	}
-	for attempt := 0; ; attempt++ {
+	for {
 		body, hdr, err := c.send(ctx, u, accept, max)
 		var se *safehttp.Error
 		if err == nil {
@@ -171,7 +171,7 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, max int64) 
 			// Both ErrNotFound (errors.Is) and the *safehttp.Error
 			// (errors.As) stay reachable.
 			return nil, fmt.Errorf("%w (%w)", ErrNotFound, err)
-		case se.Status == http.StatusTooManyRequests && throttleRetry(ctx) && attempt < maxThrottleRetries:
+		case se.Status == http.StatusTooManyRequests && throttleRetry(ctx):
 			if werr := waitRetry(ctx, hdr.Get("Retry-After")); werr != nil {
 				return nil, err
 			}
@@ -212,14 +212,13 @@ func (c *Client) send(ctx context.Context, u *url.URL, accept string, max int64)
 // Interactive reads do not wait: they report the failure.
 type throttleRetryKey struct{}
 
-const (
-	maxThrottleRetries = 20
-	maxRetryWait       = time.Minute
-)
+// maxRetryWait bounds one wait; a longer restriction is simply met again.
+const maxRetryWait = time.Minute
 
 // WithThrottleRetry returns a context under which requests answered
 // "429 Too Many Requests" are retried after the upstream's Retry-After (at
-// most a minute per wait), until the context ends.
+// most a minute per wait), for as long as the context lasts: the caller's
+// deadline, not a retry count, decides when to give up.
 func WithThrottleRetry(ctx context.Context) context.Context {
 	return context.WithValue(ctx, throttleRetryKey{}, true)
 }
@@ -229,16 +228,18 @@ func throttleRetry(ctx context.Context) bool {
 	return on
 }
 
-// waitRetry sleeps for the Retry-After of a 429 (seconds; one second when
-// absent or unreadable), or returns the context's error.
+// waitRetry sleeps for the Retry-After of a 429, or returns the context's
+// error. Retry-After is a number of seconds or an HTTP date; one second is
+// used when it is absent or unreadable.
 func waitRetry(ctx context.Context, retryAfter string) error {
 	wait := time.Second
-	if n, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && n >= 0 {
-		wait = min(time.Duration(n)*time.Second, maxRetryWait)
+	retryAfter = strings.TrimSpace(retryAfter)
+	if n, err := strconv.Atoi(retryAfter); err == nil && n >= 0 {
+		wait = time.Duration(n) * time.Second
+	} else if at, err := http.ParseTime(retryAfter); err == nil {
+		wait = time.Until(at)
 	}
-	if wait <= 0 {
-		wait = 100 * time.Millisecond
-	}
+	wait = min(max(wait, 100*time.Millisecond), maxRetryWait)
 	t := time.NewTimer(wait)
 	defer t.Stop()
 	select {

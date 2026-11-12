@@ -242,6 +242,13 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
 - **Use the right kind.** Another openlinker-registry must be configured as
   `openlinker-registry`; as `mcp-registry` its sync is refused, because that
   kind follows the official change feed, which carries no visibility.
+- **Order.** Reading an entry from its upstream and applying the answer
+  happen under a per-entry lock shared by all registry processes, so a sync
+  and a forwarded read cannot apply their answers in the wrong order. An
+  entry that arrives with a listing page, which was read some time earlier,
+  may add a version or narrow who sees a server; anything else (a wider
+  visibility, a changed status) is confirmed by reading the entry again
+  under the lock.
 - **Mirrored entries are read-only here**, for administrators too: they
   follow their upstream, and nobody can be given a role in a mirrored
   namespace. Writes made by a sync obey the upstream's settings as they are

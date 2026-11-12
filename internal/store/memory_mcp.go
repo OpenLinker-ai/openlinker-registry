@@ -177,6 +177,14 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, a
 	latest := in.Version.IsLatest && status != model.MCPStatusDeleted
 	in.Visibility = m.mirrorVisibility(in.UpstreamID, in.Visibility)
 
+	// A document that is not fresh may only narrow who sees an existing
+	// server; a widening is withheld and reported.
+	stale := false
+	if found && !in.Fresh {
+		vis, listed := model.NarrowerVisibility(s.Visibility, in.Visibility), s.Listed && in.Listed
+		stale = vis != in.Visibility || listed != in.Listed
+		in.Visibility, in.Listed = vis, listed
+	}
 	// The upstream's visibility and listing apply to an existing server too,
 	// together with the version.
 	settings := found && (s.Visibility != in.Visibility || s.Listed != in.Listed)
@@ -185,17 +193,28 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, a
 		m.mcp[s.ID] = s
 		m.touchMCPVersions(s.ID, now)
 	}
+	result := func(outcome string) string {
+		if stale {
+			return model.MirrorStale
+		}
+		return outcome
+	}
 	if cur, exists := m.findMCPVersion(s.ID, in.Version.Version); found && exists {
 		if cur.Digest != in.Version.Digest {
 			return "", conflict("digest_mismatch", "the stored version has a different server.json")
 		}
-		if cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest {
+		same := cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest
+		if !same && !in.Fresh {
+			// Nor may it change the state of a version that is already here.
+			stale, same = true, true
+		}
+		if same {
 			if !settings {
-				return model.MirrorUnchanged, nil
+				return result(model.MirrorUnchanged), nil
 			}
 			applySettings()
 			m.appendAudit(audit)
-			return model.MirrorUpdated, nil
+			return result(model.MirrorUpdated), nil
 		}
 		if settings {
 			applySettings()
@@ -234,7 +253,7 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, a
 	s.UpdatedAt = now
 	m.mcp[s.ID] = s
 	m.appendAudit(audit)
-	return model.MirrorCreated, nil
+	return result(model.MirrorCreated), nil
 }
 
 // GetMCPServer implements Store.

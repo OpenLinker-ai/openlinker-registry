@@ -57,7 +57,7 @@ func mirrorInput(up model.Upstream, name, version string) model.MCPMirrorInput {
 	ns, _, _ := strings.Cut(name, "/")
 	doc := serverJSON(name, version, "", "")
 	return model.MCPMirrorInput{UpstreamID: up.ID, Namespace: strings.ToLower(ns), Name: name, Visibility: up.Visibility, Listed: true,
-		Version: model.MCPVersion{Version: version, ServerJSON: doc, Digest: digestOf(doc), Status: model.MCPStatusActive,
+		Fresh: true, Version: model.MCPVersion{Version: version, ServerJSON: doc, Digest: digestOf(doc), Status: model.MCPStatusActive,
 			CreatedBy: "upstream:" + up.Name}}
 }
 

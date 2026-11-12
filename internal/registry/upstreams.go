@@ -401,32 +401,50 @@ func (s *Service) forwardMCP(ctx context.Context, viewer model.Viewer, name, ver
 	}
 	unavailable := false
 	for _, u := range targets {
-		doc, err := s.client(u).GetMCP(ctx, name, version)
-		if errors.Is(err, upstream.ErrNotFound) {
-			continue
-		}
-		if err != nil {
+		found, err := s.forwardMCPTo(ctx, u, name, version)
+		switch {
+		case err == nil && found:
+			return nil
+		case err == nil:
+		case isStoreFailure(err) && !isUpstreamError(err):
+			return err
+		case isUpstreamError(err):
 			unavailable = true
 			s.Log.Warn("upstream read failed", "upstream", u.Name, "kind", "mcp", "err", err.Error())
-			continue
-		}
-		if doc.Name != name {
-			continue
-		}
-		if _, err := s.mirrorMCP(ctx, u, doc, false); err != nil {
-			if isStoreFailure(err) {
-				return err
-			}
+		default:
 			s.Log.Warn("upstream entry not mirrored", "upstream", u.Name, "name", name, "err", err.Error())
-			continue
 		}
-		return nil
 	}
 	if unavailable {
 		return errUpstreamUnavailable()
 	}
 	s.misses.add(key, s.Now())
 	return model.ErrNotFound
+}
+
+// forwardMCPTo reads name@version from one upstream and mirrors it, under
+// the server's mirror lock. found is false when the upstream does not have
+// it.
+func (s *Service) forwardMCPTo(ctx context.Context, u model.Upstream, name, version string) (found bool, err error) {
+	release, err := s.Store.LockMirror(ctx, "mcp:"+name)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	doc, err := s.client(u).GetMCP(ctx, name, version)
+	if errors.Is(err, upstream.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if doc.Name != name {
+		return false, nil
+	}
+	if _, err := s.mirrorMCP(ctx, u, doc, false, true); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // isStoreFailure separates infrastructure failures (which abort a sync or a
@@ -464,8 +482,9 @@ func clip(s string, max int) string {
 // the mirror never shows it more widely (see mirrorVisibility): visibility
 // and listing are written together with the version. With onlyExisting the
 // document is applied only to a version that is already mirrored; the
-// outcome is then "ignored" for anything else.
-func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.MCPDoc, onlyExisting bool) (string, error) {
+// outcome is then "ignored" for anything else. fresh says the document was
+// read just now under the server's mirror lock (see model.MCPMirrorInput).
+func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.MCPDoc, onlyExisting, fresh bool) (string, error) {
 	if u.Kind == model.UpstreamMCP && doc.Visibility != "" {
 		return "", errUpstreamKind
 	}
@@ -515,7 +534,7 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 		msg = ""
 	}
 	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: p.Namespace, Name: p.Name,
-		Visibility: visibility, Listed: listed, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
+		Visibility: visibility, Listed: listed, Fresh: fresh, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
 			Status: status, StatusMessage: msg, StatusChangedAt: doc.StatusChangedAt, PublishedAt: doc.PublishedAt,
 			IsLatest: doc.IsLatest && status != model.MCPStatusDeleted, CreatedBy: actor}},
 		auditEvent(actor, "mcp.mirror", p.Namespace, p.Name+"@"+p.Version, map[string]any{"digest": p.Digest, "status": status,

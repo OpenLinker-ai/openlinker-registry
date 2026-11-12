@@ -188,8 +188,17 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			// cookie. A stale cookie means "signed out", not an error.
 			if s.isUIPath(r) {
 				if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
-					if p, err := s.Auth.Authenticate(r.Context(), c.Value); err == nil {
-						r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, p))
+					// Guarded like a bearer token: a forged cookie is a
+					// guessed token.
+					addr := ratelimit.Key(s.Clients.From(r))
+					if over, _ := s.AuthFailLimit.Exhausted(addr); !over {
+						p, err := s.Auth.Authenticate(r.Context(), c.Value)
+						switch {
+						case err == nil:
+							r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, p))
+						case errors.Is(err, auth.ErrInvalidToken):
+							s.AuthFailLimit.Allow(addr)
+						}
 					}
 				}
 			}
