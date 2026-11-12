@@ -166,15 +166,11 @@ type Locator struct {
 	EntryType string `json:"entry_type,omitempty"`
 	// Registry: a version mirrored from an upstream registry. Upstream is
 	// the upstream name (also set for URL locators created by a sync);
-	// Namespace/Name/Version address the version there. Artifact and FullText
-	// record what the upstream itself serves, so this instance never
-	// redistributes more than its source does.
+	// Namespace/Name/Version address the version there.
 	Upstream  string `json:"upstream,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Version   string `json:"version,omitempty"`
-	Artifact  bool   `json:"artifact,omitempty"`
-	FullText  bool   `json:"full_text,omitempty"`
 }
 
 // Version is an immutable published or indexed version. Only the review,
@@ -199,12 +195,18 @@ type Version struct {
 	Source                 *Source
 	Locator                *Locator
 	IndexedBy              string
-	CheckResult            string
-	CheckedAt              *time.Time
-	YankedAt               *time.Time
-	YankReason             string
-	CreatedBy              string
-	CreatedAt              time.Time
+	// MirrorServed is set for a version mirrored from an upstream registry:
+	// whether that registry serves the version's content. This instance
+	// never redistributes more than its source does. Unlike the content it
+	// can change (the upstream approves a license), so it is not part of the
+	// immutable version.
+	MirrorServed *bool
+	CheckResult  string
+	CheckedAt    *time.Time
+	YankedAt     *time.Time
+	YankReason   string
+	CreatedBy    string
+	CreatedAt    time.Time
 }
 
 // SkillSummary is a list/search row.

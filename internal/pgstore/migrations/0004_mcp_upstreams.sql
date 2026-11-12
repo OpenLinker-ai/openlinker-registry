@@ -135,3 +135,9 @@ $$;
 CREATE TRIGGER mcp_server_versions_no_truncate_trg
     BEFORE TRUNCATE ON mcp_server_versions
     FOR EACH STATEMENT EXECUTE FUNCTION mcp_server_versions_no_truncate();
+
+-- For a skill version mirrored from an upstream registry: whether that
+-- registry serves the version's content. It is deliberately not among the
+-- immutable columns: the upstream may start serving it later (a license is
+-- approved there).
+ALTER TABLE skill_versions ADD COLUMN mirror_served BOOLEAN;

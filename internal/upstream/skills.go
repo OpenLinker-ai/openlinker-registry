@@ -28,6 +28,10 @@ type SkillVersionRef struct {
 	Version        string
 	Yanked         bool
 	ArtifactDigest string
+	// Servable and LicenseApproved are what the upstream says now; nil when
+	// it does not say (an older upstream).
+	Servable        *bool
+	LicenseApproved *bool
 }
 
 // SkillDetail is GET /v1/skills/{ns}/{name}.
@@ -65,9 +69,11 @@ type skillWire struct {
 	LatestVersion *string   `json:"latest_version"` // null without a usable version
 	UpdatedAt     time.Time `json:"updated_at"`
 	Versions      []struct {
-		Version        string `json:"version"`
-		Yanked         bool   `json:"yanked"`
-		ArtifactDigest string `json:"artifact_digest"`
+		Version         string `json:"version"`
+		Yanked          bool   `json:"yanked"`
+		ArtifactDigest  string `json:"artifact_digest"`
+		Servable        *bool  `json:"servable"`
+		LicenseApproved *bool  `json:"license_approved"`
 	} `json:"versions"`
 }
 
@@ -169,7 +175,8 @@ func (c *Client) GetSkill(ctx context.Context, ns, name string) (SkillDetail, er
 		if v.Version == "" {
 			return SkillDetail{}, wrapOp("skill get", badResponse("upstream returned a version without a name"))
 		}
-		d.Versions = append(d.Versions, SkillVersionRef{Version: v.Version, Yanked: v.Yanked, ArtifactDigest: v.ArtifactDigest})
+		d.Versions = append(d.Versions, SkillVersionRef{Version: v.Version, Yanked: v.Yanked, ArtifactDigest: v.ArtifactDigest,
+			Servable: v.Servable, LicenseApproved: v.LicenseApproved})
 	}
 	return d, nil
 }

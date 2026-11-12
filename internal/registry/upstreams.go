@@ -294,7 +294,8 @@ func (s *Service) client(u model.Upstream) *upstream.Client {
 	if s.clients.m == nil {
 		s.clients.m = map[string]*upstream.Client{}
 	}
-	c := &upstream.Client{HTTP: s.HTTP, BaseURL: u.BaseURL, Token: token, UserAgent: "openlinker-registry"}
+	// A page of 100 documents at the 64 KiB publication limit is 6.4 MiB.
+	c := &upstream.Client{HTTP: s.HTTP, BaseURL: u.BaseURL, Token: token, UserAgent: "openlinker-registry", MaxBody: 16 << 20}
 	s.clients.m[u.Name] = c
 	return c
 }

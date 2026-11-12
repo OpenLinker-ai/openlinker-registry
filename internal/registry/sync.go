@@ -183,13 +183,20 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 	// The watermark then stays where it is, so the next run reads the same
 	// changes again instead of moving past the one that was not applied.
 	pending := false
-	page := ""
+	page, pageSize := "", syncPageSize
 	for i := 0; ; i++ {
 		if i == maxSyncPages {
 			return "", fail(http.StatusBadGateway, "upstream_too_large", "the upstream listing exceeds the page limit of one sync")
 		}
-		docs, next, err := c.ListMCP(ctx, upstream.MCPListOptions{Cursor: page, Limit: syncPageSize, UpdatedSince: since,
+		docs, next, err := c.ListMCP(ctx, upstream.MCPListOptions{Cursor: page, Limit: pageSize, UpdatedSince: since,
 			LatestOnly: u.LatestOnly && full, IncludeDeleted: full})
+		if tooLarge(err) && pageSize > 1 {
+			// A page of large documents can exceed the response cap although
+			// each document is fine: ask for less and read the page again.
+			pageSize /= 2
+			i--
+			continue
+		}
 		if err != nil {
 			// A skill-only registry has no MCP API; that is not a failure.
 			if i == 0 && u.Kind == model.UpstreamRegistry && errors.Is(err, upstream.ErrNotFound) {
@@ -287,38 +294,91 @@ func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *ups
 		return err
 	}
 	defer release()
-	// The caller's copy was read before the lock was taken; a forwarded read
-	// may have changed the server since.
-	if srv, err = s.Store.GetMCPServer(ctx, srv.Name); errors.Is(err, model.ErrNotFound) {
-		return nil
-	} else if err != nil {
-		return err
+	_, err = s.refreshMCPServerLocked(ctx, u, c, srv.Name, stats)
+	var ue *upstream.Error
+	if errors.As(err, &ue) {
+		return nil // counted as skipped; the rest of the sync goes on
+	}
+	return err
+}
+
+// reconcileMissingMCP settles a version that a listing reported changed but
+// that the upstream does not serve by name any more. The caller holds the
+// server's mirror lock. The server's version list is applied; if it does not
+// contain the version either, the version is gone and is marked deleted.
+func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *upstream.Client, doc upstream.MCPDoc) (string, error) {
+	served, err := s.refreshMCPServerLocked(ctx, u, c, doc.Name, syncStats{})
+	if err != nil {
+		if isUpstreamError(err) {
+			return "", errUnconfirmed
+		}
+		return "", err
+	}
+	if served == nil || served[doc.Version] {
+		return model.MirrorUpdated, nil // withdrawn as a whole, or applied from the list
+	}
+	srv, err := s.Store.GetMCPServer(ctx, doc.Name)
+	if errors.Is(err, model.ErrNotFound) {
+		return "ignored", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	v, err := s.Store.GetMCPVersion(ctx, srv.ID, doc.Version)
+	if errors.Is(err, model.ErrNotFound) || (err == nil && v.Status == model.MCPStatusDeleted) {
+		return model.MirrorUnchanged, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	const reason = "no longer available from the upstream registry"
+	if _, err := s.Store.SetMCPStatus(ctx, srv.ID, doc.Version, model.MCPStatusDeleted, reason, s.Now(),
+		auditEvent("upstream:"+u.Name, "mcp.status", srv.Namespace, srv.Name+"@"+doc.Version, map[string]any{"status": model.MCPStatusDeleted})); err != nil {
+		return "", err
+	}
+	return model.MirrorUpdated, nil
+}
+
+// refreshMCPServerLocked is refreshMCPServer for a caller that holds the
+// mirror lock. It returns the versions the upstream serves, or nil when the
+// server is not mirrored here or was withdrawn.
+func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, c *upstream.Client, name string, stats syncStats) (map[string]bool, error) {
+	// Read under the lock: a forwarded read may have changed the server
+	// since the caller last looked.
+	srv, err := s.Store.GetMCPServer(ctx, name)
+	if errors.Is(err, model.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	docs, err := c.ListMCPVersions(ctx, srv.Name)
 	var ue *upstream.Error
 	switch {
 	case errors.Is(err, upstream.ErrNotFound):
-		return s.withdrawMCP(ctx, u, srv, stats)
+		return nil, s.withdrawMCP(ctx, u, srv, stats)
 	case errors.As(err, &ue):
 		stats.add("mcp_skipped")
-		return nil
+		return nil, err
 	case err != nil:
-		return err
+		return nil, err
 	}
+	served := map[string]bool{}
 	for _, doc := range docs {
+		served[doc.Version] = true
 		res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest, true)
 		switch {
 		case err == nil:
 			stats.add("mcp_" + res)
 		case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
-			return err
+			return nil, err
 		case errors.Is(err, model.ErrConflict):
 			stats.add("mcp_conflicts")
 		default:
 			stats.add("mcp_skipped")
 		}
 	}
-	return nil
+	return served, nil
 }
 
 // mirrorListedMCP applies a document that came with a listing page. Such a
@@ -339,9 +399,10 @@ func (s *Service) mirrorListedMCP(ctx context.Context, u model.Upstream, c *upst
 	fresh, err := c.GetMCP(ctx, doc.Name, doc.Version)
 	switch {
 	case errors.Is(err, upstream.ErrNotFound):
-		// The version is gone since the page was read; the upstream's
-		// listing or the reconciliation of a full run reports that.
-		return "", fail(http.StatusBadGateway, "upstream_changed", "the upstream entry changed while it was being read")
+		// The upstream no longer serves this version by name. Settle it now
+		// from the server's own version list, rather than leave a change
+		// unapplied that no later run would read again.
+		return s.reconcileMissingMCP(ctx, u, c, doc)
 	case err != nil && isUpstreamError(err):
 		// Unreadable right now. Nothing was changed here; the sync must
 		// come back to this entry.
@@ -350,6 +411,12 @@ func (s *Service) mirrorListedMCP(ctx context.Context, u model.Upstream, c *upst
 		return "", err
 	}
 	return s.mirrorMCP(ctx, u, fresh, onlyExisting, true)
+}
+
+// tooLarge reports whether an upstream response exceeded the size cap.
+func tooLarge(err error) bool {
+	var se *safehttp.Error
+	return errors.As(err, &se) && se.Code == safehttp.CodeTooLarge
 }
 
 // errUnconfirmed: a listing document needed a fresh read to be applied and
@@ -363,13 +430,18 @@ var errUnconfirmed = fail(http.StatusBadGateway, "upstream_unconfirmed", "the up
 // detail of every listed skill, and then of every skill mirrored earlier
 // that the listing no longer shows (yanked, unlisted or no longer shared).
 func (s *Service) syncSkills(ctx context.Context, u model.Upstream, c *upstream.Client, stats syncStats) error {
-	cursor := ""
+	cursor, pageSize := "", syncPageSize
 	listed := map[string]bool{}
 	for i := 0; ; i++ {
 		if i == maxSyncPages {
 			return fail(http.StatusBadGateway, "upstream_too_large", "the upstream listing exceeds the page limit of one sync")
 		}
-		items, next, err := c.ListSkills(ctx, cursor, syncPageSize)
+		items, next, err := c.ListSkills(ctx, cursor, pageSize)
+		if tooLarge(err) && pageSize > 1 {
+			pageSize /= 2
+			i--
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -622,10 +694,31 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			break
 		}
 	}
+	// What can change about a version after it was published: it is yanked,
+	// a license is approved, and with that the upstream starts serving it.
 	for _, ref := range d.Versions[fresh:] {
-		if v, ok := have[ref.Version]; ok && ref.Yanked && v.YankedAt == nil {
+		v, ok := have[ref.Version]
+		if !ok {
+			continue
+		}
+		target := d.Name + "@" + ref.Version
+		if ref.Yanked && v.YankedAt == nil {
 			if err := s.Store.YankVersion(ctx, v.ID, "yanked upstream", s.Now(),
-				auditEvent(actor, "version.yank", d.Namespace, d.Name+"@"+ref.Version, map[string]any{"reason": "yanked upstream"})); err != nil {
+				auditEvent(actor, "version.yank", d.Namespace, target, map[string]any{"reason": "yanked upstream"})); err != nil {
+				return err
+			}
+			changed = true
+		}
+		if ref.LicenseApproved != nil && *ref.LicenseApproved && !v.LicenseApproved {
+			if err := s.Store.ApproveLicense(ctx, v.ID, auditEvent(actor, "license.approve", d.Namespace, target,
+				map[string]any{"reason": "approved upstream"})); err != nil {
+				return err
+			}
+			changed = true
+		}
+		if ref.Servable != nil && (v.MirrorServed == nil || *v.MirrorServed != *ref.Servable) {
+			if err := s.Store.SetVersionMirrorServed(ctx, v.ID, *ref.Servable, auditEvent(actor, "version.served", d.Namespace, target,
+				map[string]any{"served": *ref.Servable})); err != nil {
 				return err
 			}
 			changed = true
@@ -770,14 +863,15 @@ func (s *Service) mirrorSkillVersion(ctx context.Context, u model.Upstream, sv u
 	if _, err := s.Store.EnsureUpstreamNamespace(ctx, sv.Namespace, u.ID, namespaceAudit(u, sv.Namespace)); err != nil {
 		return model.Skill{}, err
 	}
+	served := sv.AccessArtifact && sv.AccessFullText
 	v := model.Version{
 		Version: sv.Version, FrontmatterName: sv.FrontmatterName, FrontmatterDescription: sv.FrontmatterDescription,
 		LicenseKind: sv.LicenseKind, LicenseID: sv.LicenseID, LicenseApproved: sv.LicenseApproved,
 		CoreCompatible: sv.CoreCompatible, Files: files,
 		ArtifactDigest: sv.ArtifactDigest, ArtifactType: sv.ArtifactType, ArtifactSize: sv.ArtifactSize, ArchiveDigest: sv.ArchiveDigest,
-		Locator: &model.Locator{Kind: "registry", Upstream: u.Name, Namespace: sv.Namespace, Name: sv.Name, Version: sv.Version,
-			Artifact: sv.AccessArtifact, FullText: sv.AccessFullText},
-		IndexedBy: actor, CreatedBy: actor,
+		Locator:      &model.Locator{Kind: "registry", Upstream: u.Name, Namespace: sv.Namespace, Name: sv.Name, Version: sv.Version},
+		MirrorServed: &served,
+		IndexedBy:    actor, CreatedBy: actor,
 	}
 	if sv.AccessFullText {
 		v.LicenseText = sv.LicenseText

@@ -49,6 +49,9 @@ type Store interface {
 	YankVersion(ctx context.Context, versionID int64, reason string, at time.Time, audit model.AuditEvent) error
 	ApproveLicense(ctx context.Context, versionID int64, audit model.AuditEvent) error
 	SetVersionCheck(ctx context.Context, versionID int64, result string, at time.Time) error
+	// SetVersionMirrorServed records whether the upstream of a mirrored
+	// version serves its content (see model.Version.MirrorServed).
+	SetVersionMirrorServed(ctx context.Context, versionID int64, served bool, audit model.AuditEvent) error
 
 	Search(ctx context.Context, q model.SearchQuery) ([]model.SkillSummary, error)
 	// IndexCandidates returns public, listed, active skills with their latest

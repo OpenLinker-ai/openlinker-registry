@@ -442,12 +442,12 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		}
 		err = tx.QueryRow(ctx, `INSERT INTO skill_versions (skill_id, version, mode, frontmatter_name, frontmatter_description,
 			license_kind, license_id, license_text, license_approved, core_compatible, files, artifact_digest, artifact_type,
-			artifact_size, archive_digest, source, locator, indexed_by, check_result, checked_at, created_by)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NULLIF($19,''),$20,$21)
+			artifact_size, archive_digest, source, locator, indexed_by, check_result, checked_at, created_by, mirror_served)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NULLIF($19,''),$20,$21,$22)
 			RETURNING id, created_at`,
 			k.ID, v.Version, in.Mode, v.FrontmatterName, v.FrontmatterDescription, v.LicenseKind, v.LicenseID, v.LicenseText,
 			v.LicenseApproved, v.CoreCompatible, files, v.ArtifactDigest, v.ArtifactType, v.ArtifactSize, archive, src, loc,
-			v.IndexedBy, v.CheckResult, v.CheckedAt, v.CreatedBy).Scan(&v.ID, &v.CreatedAt)
+			v.IndexedBy, v.CheckResult, v.CheckedAt, v.CreatedBy, v.MirrorServed).Scan(&v.ID, &v.CreatedAt)
 		if _, ok := uniqueViolation(err); ok {
 			return conflict("version_exists", "version already exists and is immutable")
 		}
@@ -477,7 +477,7 @@ func jsonOrNil[T any](v *T) []byte {
 const versionCols = `id, skill_id, version, mode, frontmatter_name, frontmatter_description, license_kind, license_id,
 	license_text, license_approved, core_compatible, files, artifact_digest, artifact_type, artifact_size,
 	COALESCE(archive_digest, ''), source, locator, indexed_by, COALESCE(check_result, ''), checked_at, yanked_at,
-	yank_reason, created_by, created_at`
+	yank_reason, created_by, created_at, mirror_served`
 
 func scanVersion(row pgx.Row) (model.Version, error) {
 	var v model.Version
@@ -485,7 +485,7 @@ func scanVersion(row pgx.Row) (model.Version, error) {
 	err := row.Scan(&v.ID, &v.SkillID, &v.Version, &v.Mode, &v.FrontmatterName, &v.FrontmatterDescription, &v.LicenseKind,
 		&v.LicenseID, &v.LicenseText, &v.LicenseApproved, &v.CoreCompatible, &files, &v.ArtifactDigest, &v.ArtifactType,
 		&v.ArtifactSize, &v.ArchiveDigest, &src, &loc, &v.IndexedBy, &v.CheckResult, &v.CheckedAt, &v.YankedAt,
-		&v.YankReason, &v.CreatedBy, &v.CreatedAt)
+		&v.YankReason, &v.CreatedBy, &v.CreatedAt, &v.MirrorServed)
 	if err != nil {
 		return v, err
 	}
@@ -862,4 +862,9 @@ func (s *Store) LockMirror(ctx context.Context, key string) (func(), error) {
 		conn.Release()
 		<-s.lockSlots
 	}, nil
+}
+
+// SetVersionMirrorServed implements store.Store.
+func (s *Store) SetVersionMirrorServed(ctx context.Context, id int64, served bool, audit model.AuditEvent) error {
+	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET mirror_served = $2 WHERE id = $1`, id, served)
 }

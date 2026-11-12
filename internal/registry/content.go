@@ -22,11 +22,10 @@ import (
 // instance never redistributes more than its source does.
 func Access(v model.Version) skill.Access {
 	if l := v.Locator; l != nil && l.Kind == "registry" {
-		acc := skill.Access{FullText: l.FullText, Artifact: l.Artifact}
-		if !acc.FullText || !acc.Artifact {
-			acc.Reason = "upstream_withheld"
+		if v.MirrorServed != nil && *v.MirrorServed {
+			return skill.Access{FullText: true, Artifact: true}
 		}
-		return acc
+		return skill.Access{Reason: "upstream_withheld"}
 	}
 	return skill.ContentAccess(v.Mode, v.LicenseKind, v.LicenseApproved)
 }

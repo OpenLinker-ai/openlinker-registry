@@ -262,7 +262,8 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   against the recorded sha256 digest and file manifest, then cached. A
   mismatch is recorded as `source_changed` and nothing is served.
 - **A mirror serves no more than its source.** Whether artifact bytes and
-  file text may be served is taken from the upstream's own answer.
+  file text may be served is taken from the upstream's own answer, and
+  followed when it changes (the upstream approves a custom license).
 - **Ownership.** Mirrored entries keep their upstream namespace, which
   becomes read-only here and belongs to that one upstream. A namespace that
   exists locally is never forwarded or overwritten; conflicts are counted in

@@ -243,8 +243,11 @@ func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
 		if latest == "" && v.YankedAt == nil {
 			latest = v.Version
 		}
+		// "servable" and "license_approved" can change after publication; a
+		// mirror follows them from here without reading every version.
 		list = append(list, map[string]any{"version": v.Version, "created_at": v.CreatedAt, "artifact_digest": v.ArtifactDigest,
-			"yanked": v.YankedAt != nil, "core_compatible": v.CoreCompatible, "license_kind": v.LicenseKind})
+			"yanked": v.YankedAt != nil, "core_compatible": v.CoreCompatible, "license_kind": v.LicenseKind,
+			"license_approved": v.LicenseApproved, "servable": registry.Access(v).Artifact})
 	}
 	out := skillJSON(sk, latest)
 	out["versions"] = list

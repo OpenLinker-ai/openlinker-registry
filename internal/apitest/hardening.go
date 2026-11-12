@@ -576,6 +576,92 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a change the upstream no longer serves by name", func(t *testing.T) {
+		// An incremental listing reports a version deleted, but reading that
+		// version by name answers 404 (the registry stopped serving it). The
+		// deletion must be settled in this run: the watermark moves on.
+		now := time.Now().UTC().Truncate(time.Second)
+		t1, t2, t3 := now.Add(-3*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour)
+		entry := func(name, version, status string, updated time.Time) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": status != "deleted",
+					"updatedAt": updated.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
+		}
+		later := false
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				if !later {
+					_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "1.0.0", "active", t1),
+						entry("com.feed/a", "2.0.0", "active", t1), entry("com.feed/b", "1.0.0", "active", t1)}})
+					return
+				}
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "1.0.0", "deleted", t2), entry("com.feed/b", "1.0.0", "deprecated", t3)}})
+			case "/v0.1/servers/com.feed%2Fa/versions":
+				// The deleted version is no longer listed at all.
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "2.0.0", "active", t1)}})
+			case "/v0.1/servers/com.feed%2Fb/versions/1.0.0":
+				_ = enc.Encode(entry("com.feed/b", "1.0.0", "deprecated", t3))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		e.sync("feed")
+		later = true
+		s := e.sync("feed")
+		cursor, _ := time.Parse(time.RFC3339Nano, s["cursor"].(string))
+		if s["last_status"] != "ok" || stat(s, "mcp_pending") != 0 || !cursor.Equal(t3) {
+			t.Fatalf("sync: %v", s)
+		}
+		r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fa/versions/1.0.0", "", "", nil), 200, "deleted version")
+		if official(r.JSON)["status"] != "deleted" {
+			t.Fatalf("a deletion the upstream no longer serves by name was dropped: %s", r.Body)
+		}
+		if r = e.Do("GET", "/v0.1/servers/com.feed%2Fa/versions/latest", "", "", nil); v0Version(r.JSON) != "2.0.0" {
+			t.Fatalf("latest: %s", r.Body)
+		}
+	})
+
+	t.Run("a listing page larger than the response cap", func(t *testing.T) {
+		// Large documents make a full page exceed what one response may
+		// carry, although each document is fine. The sync asks for smaller
+		// pages instead of failing on the same page forever.
+		var sizes []string
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path != "/v0.1/servers" {
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				return
+			}
+			limit := r.URL.Query().Get("limit")
+			sizes = append(sizes, limit)
+			if limit != "25" {
+				// More than the client reads: 17 MiB.
+				_, _ = w.Write([]byte(`{"servers":[],"padding":"`))
+				_, _ = w.Write(bytes.Repeat([]byte("x"), 17<<20))
+				_, _ = w.Write([]byte(`"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{{"server": map[string]any{"name": "com.big/server",
+				"description": "d", "version": "1.0.0", "remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}}}})
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "big", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("big"); s["last_status"] != "ok" || stat(s, "mcp_created") != 1 || strings.Join(sizes, ",") != "100,50,25" {
+			t.Fatalf("sync of an upstream with oversized pages: %v (page sizes asked: %v)", s, sizes)
+		}
+	})
+
 	t.Run("watermark", func(t *testing.T) {
 		// One entry the mirror rejects claims an update far in the future;
 		// one good entry was updated in the past. The watermark may only
@@ -925,6 +1011,39 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			}
 		}
 		e.Expect(e.Do("GET", "/v1/skills/com.big/big", AdminToken, "", nil), 404, "a later version must not be recorded without the earlier one")
+	})
+
+	t.Run("a license approved upstream later", func(t *testing.T) {
+		// The upstream indexes a skill under a custom license, which it does
+		// not serve until a reviewer approves it. The mirror records the
+		// version while it is withheld; after the approval it must serve it
+		// too, although the version itself never changes.
+		up := NewEnv(t, newStore(t), Options{})
+		up.Expect(up.Do("POST", "/v1/admin/namespaces", AdminToken, "", map[string]any{"name": "io.github.acme", "kind": "github", "github_id": 1}), 201, "namespace")
+		pub := up.publisher("io.github.acme")
+		custom := "https://github.com/acme/skills/tree/main/skills/custom"
+		p := up.Expect(up.Do("POST", "/v1/skills/io.github.acme/indexes/preview", pub, "", map[string]any{"url": custom}), 200, "preview")
+		up.Expect(up.Do("POST", "/v1/skills/io.github.acme/indexes", pub, "", map[string]any{"url": custom, "commit": p.JSON["commit"],
+			"expected_tree_sha": p.JSON["tree_sha"], "version": "1"}), 201, "index")
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base, "visibility": "public"}), 201, "upstream")
+		down.sync("hub")
+		artifact := "/v1/skills/io.github.acme/custom/versions/1/artifact"
+		if r := down.Do("GET", artifact, "", "", nil); r.Status != 403 || errCode(r) != "upstream_withheld" {
+			t.Fatalf("content the upstream withholds: %d %s", r.Status, r.Body)
+		}
+		up.Expect(up.Do("POST", "/v1/admin/skills/io.github.acme/custom/versions/1/approve-license", AdminToken, "", nil), 200, "approve upstream")
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_updated") != 1 {
+			t.Fatalf("sync after the approval: %v", s)
+		}
+		down.Expect(down.Do("GET", artifact, "", "", nil), 200, "content after the upstream approved the license")
+		r := down.Expect(down.Do("GET", "/v1/skills/io.github.acme/custom/versions/1", "", "", nil), 200, "version")
+		if lic := r.JSON["license"].(map[string]any); lic["approved"] != true {
+			t.Fatalf("approval not reflected: %s", r.Body)
+		}
+		if s := down.sync("hub"); stat(s, "skills_unchanged") != 1 {
+			t.Fatalf("a further sync must change nothing: %v", s)
+		}
 	})
 
 	t.Run("a skill yanked upstream with unseen versions", func(t *testing.T) {
