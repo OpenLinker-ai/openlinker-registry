@@ -96,19 +96,39 @@ func (s *Store) UpdateUpstream(ctx context.Context, name string, p model.Upstrea
 	}
 	var out model.Upstream
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
-		// Every SET expression reads the row as it was, so the cursor is
-		// compared against the previous base URL. A cursor is only meaningful
-		// to the registry that issued it.
+		// Every SET expression reads the row as it was. A cursor describes
+		// one selection of one registry: any change to what is selected or
+		// how it is shown starts over.
 		var err error
 		out, err = scanUpstream(tx.QueryRow(ctx, `UPDATE upstreams SET
-			cursor = CASE WHEN $2::text IS NOT NULL AND $2 <> base_url THEN '' ELSE cursor END,
+			cursor = CASE WHEN ($2::text IS NOT NULL AND $2 <> base_url) OR ($5::text IS NOT NULL AND $5 <> visibility)
+				OR ($6::text[] IS NOT NULL AND $6 <> namespace_allow) OR ($7::text[] IS NOT NULL AND $7 <> namespace_deny)
+				OR ($10::boolean IS NOT NULL AND $10 <> latest_only) THEN '' ELSE cursor END,
 			base_url = COALESCE($2, base_url), enabled = COALESCE($3, enabled), priority = COALESCE($4, priority),
 			visibility = COALESCE($5, visibility), namespace_allow = COALESCE($6, namespace_allow),
 			namespace_deny = COALESCE($7, namespace_deny), sync_interval_seconds = COALESCE($8, sync_interval_seconds),
 			proxy_on_miss = COALESCE($9, proxy_on_miss), latest_only = COALESCE($10, latest_only), updated_at = now()
 			WHERE name = $1 RETURNING `+upstreamCols,
 			name, p.BaseURL, p.Enabled, p.Priority, p.Visibility, allow, deny, seconds, p.ProxyOnMiss, p.LatestOnly))
-		return notFound(err)
+		if err != nil {
+			return notFound(err)
+		}
+		if out.Visibility != model.VisibilityInternal {
+			return nil
+		}
+		// Lowering visibility takes effect at once for what is already here.
+		const inUpstream = `namespace_id IN (SELECT id FROM namespaces WHERE upstream_id = $1)`
+		if _, err := tx.Exec(ctx, `UPDATE skills SET visibility = 'internal', updated_at = now()
+			WHERE visibility = 'public' AND `+inUpstream, out.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET updated_at = now() WHERE server_id IN
+			(SELECT id FROM mcp_servers WHERE visibility = 'public' AND `+inUpstream+`)`, out.ID); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `UPDATE mcp_servers SET visibility = 'internal', updated_at = now()
+			WHERE visibility = 'public' AND `+inUpstream, out.ID)
+		return err
 	})
 	if err != nil {
 		return model.Upstream{}, err

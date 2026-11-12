@@ -72,6 +72,15 @@ func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version
 			return sk, v, rerr
 		}
 		if refreshed {
+			// The refresh applies what the upstream says now, which may be
+			// that the caller can no longer see the skill at all.
+			if sk, err = s.Svc.Store.GetSkill(r.Context(), sk.Namespace, sk.Name); errors.Is(err, model.ErrNotFound) ||
+				(err == nil && !principal(r).Viewer().CanSee(sk.Namespace, sk.Visibility)) {
+				return model.Skill{}, model.Version{}, errNotFound
+			}
+			if err != nil {
+				return sk, v, err
+			}
 			v, err = s.Svc.Store.GetVersion(r.Context(), sk.ID, version)
 		}
 	}

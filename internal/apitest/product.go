@@ -399,6 +399,18 @@ func runUpstreams(t *testing.T, newStore func(t *testing.T) store.Store) {
 	if r = down.Do("POST", "/v1/mcp/servers/com.acme/weather/status", admin, "", map[string]any{"status": "deleted"}); r.Status != 409 || errCode(r) != "mirrored_read_only" {
 		t.Fatalf("status change on a mirrored server: %d %s", r.Status, r.Body)
 	}
+	// A mirrored skill follows its upstream: even an administrator cannot
+	// yank or re-publish it here (a local yank would be final).
+	for what, r := range map[string]Resp{
+		"yank":         down.Do("POST", "/v1/skills/com.acme/hello/yank", admin, "", nil),
+		"deprecate":    down.Do("POST", "/v1/skills/com.acme/hello/deprecate", admin, "", nil),
+		"version yank": down.Do("POST", "/v1/skills/com.acme/hello/versions/1.0.0/yank", admin, "", nil),
+		"settings":     down.Do("PATCH", "/v1/skills/com.acme/hello", admin, "", map[string]any{"visibility": "public"}),
+	} {
+		if r.Status != 409 || errCode(r) != "mirrored_read_only" {
+			t.Fatalf("%s of a mirrored skill: %d %s", what, r.Status, r.Body)
+		}
+	}
 	down.Expect(down.Do("DELETE", "/v1/admin/upstreams/hub", admin, "", nil), 409, "upstream in use")
 
 	// --- sync ---

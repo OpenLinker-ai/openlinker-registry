@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,3 +71,233 @@ var auditTests = []testCase{{"mirror writes are audited", func(t *testing.T, st 
 		t.Fatalf("sync result audited %d times", n)
 	}
 }}}
+
+// Rules a mirror relies on to stay faithful to its upstream.
+var mirrorTests = []testCase{
+	{"skill versions keep the upstream order", func(t *testing.T, st store.Store) {
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID, audit); err != nil {
+			t.Fatal(err)
+		}
+		put := func(ver, expect string) error {
+			v := version(ver, "spdx")
+			v.Source, v.Locator = nil, &model.Locator{Kind: "registry", Upstream: "up"}
+			_, _, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "org.mirror", Name: "tool", Mode: "indexed",
+				SourceKey: "upstream:up:org.mirror/tool", Visibility: model.VisibilityPublic, Listed: true, UpstreamID: up.ID,
+				ExpectNewest: &expect, Version: v}, audit)
+			return err
+		}
+		if err := put("1", "0"); conflictCode(err) != "version_order" {
+			t.Fatalf("first version with a wrong expectation: %v", err)
+		}
+		if _, err := st.GetSkill(ctx, "org.mirror", "tool"); err == nil {
+			t.Fatal("a refused first version created the skill")
+		}
+		if err := put("1", ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := put("2", "1"); err != nil {
+			t.Fatal(err)
+		}
+		// A refresh that read the versions before "2" arrived must not add an
+		// older version behind it.
+		if err := put("0", "1"); conflictCode(err) != "version_order" {
+			t.Fatalf("stale refresh: %v", err)
+		}
+		if err := put("3", ""); conflictCode(err) != "version_order" {
+			t.Fatalf("refresh that saw no versions: %v", err)
+		}
+		sk, _ := st.GetSkill(ctx, "org.mirror", "tool")
+		vs, _ := st.ListVersions(ctx, sk.ID)
+		if len(vs) != 2 || vs[0].Version != "2" || vs[1].Version != "1" {
+			t.Fatalf("versions = %+v", vs)
+		}
+	}},
+	{"every mirrored entry can be enumerated", func(t *testing.T, st store.Store) {
+		ctx := context.Background()
+		up, other := newUpstream(t, st, "up"), newUpstream(t, st, "other")
+		for _, ns := range []string{"org.b", "org.a"} {
+			if _, err := st.EnsureUpstreamNamespace(ctx, ns, up.ID, audit); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.z", other.ID, audit); err != nil {
+			t.Fatal(err)
+		}
+		skillIn := func(ns, name string, upstreamID int64, source string) model.PublishInput {
+			v := version("1", "spdx")
+			v.Source, v.Locator = nil, &model.Locator{Kind: "registry"}
+			return model.PublishInput{Namespace: ns, Name: name, Mode: "indexed", SourceKey: source + ":" + ns + "/" + name,
+				Visibility: model.VisibilityPublic, Listed: true, UpstreamID: upstreamID, Version: v}
+		}
+		var ids = map[string]int64{}
+		for _, in := range []model.PublishInput{skillIn("org.b", "one", up.ID, "up"), skillIn("org.a", "two", up.ID, "up"),
+			skillIn("org.a", "one", up.ID, "up"), skillIn("org.z", "x", other.ID, "other")} {
+			sk, _, err := st.PublishVersion(ctx, in, audit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids[in.Namespace+"/"+in.Name] = sk.ID
+		}
+		if _, _, err := publish(st, "local", model.VisibilityPublic, "1", "spdx"); err != nil {
+			t.Fatal(err)
+		}
+		// Unlisted, private and yanked entries are exactly the ones a listing
+		// hides and a mirror must still reconcile.
+		private, unlisted := model.VisibilityPrivate, false
+		if _, err := st.UpdateSkill(ctx, ids["org.a/one"], model.SkillPatch{Visibility: &private, Listed: &unlisted}, audit); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SetSkillStatus(ctx, ids["org.b/one"], model.StatusYanked, "", audit); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		afterNS, afterName := "", ""
+		for {
+			page, err := st.ListMirroredSkills(ctx, up.ID, afterNS, afterName, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, sk := range page {
+				if sk.Upstream != "up" {
+					t.Fatalf("skill of another owner: %+v", sk)
+				}
+				got = append(got, sk.Namespace+"/"+sk.Name)
+				afterNS, afterName = sk.Namespace, sk.Name
+			}
+			if len(page) < 2 {
+				break
+			}
+		}
+		if want := "org.a/one,org.a/two,org.b/one"; strings.Join(got, ",") != want {
+			t.Fatalf("mirrored skills = %v, want %s", got, want)
+		}
+
+		for _, name := range []string{"org.b/Srv", "org.a/srv", "org.a/Hidden"} {
+			mirrorMCP(t, st, mirrorInput(up, name, "1.0.0"), model.MirrorCreated)
+		}
+		mirrorMCP(t, st, mirrorInput(other, "org.z/srv", "1.0.0"), model.MirrorCreated)
+		hidden := mcpServer(t, st, "org.a/Hidden")
+		if _, err := st.UpdateMCPServer(ctx, hidden.ID, model.MCPPatch{Visibility: &private, Listed: &unlisted}, audit); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SetMCPStatus(ctx, mcpServer(t, st, "org.b/Srv").ID, "", model.MCPStatusDeleted, "gone", time.Now(), audit); err != nil {
+			t.Fatal(err)
+		}
+		got, after := nil, ""
+		for {
+			page, err := st.ListMirroredMCP(ctx, up.ID, after, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, srv := range page {
+				got = append(got, srv.Name)
+				after = srv.Name
+			}
+			if len(page) < 2 {
+				break
+			}
+		}
+		if want := "org.a/Hidden,org.a/srv,org.b/Srv"; strings.Join(got, ",") != want {
+			t.Fatalf("mirrored servers = %v, want %s", got, want)
+		}
+	}},
+	{"changing who may see a server stamps its versions", func(t *testing.T, st store.Store) {
+		ctx := context.Background()
+		srv, v := publishMCP(t, st, mcpInput("com.example/server", "1.0.0"))
+		time.Sleep(2 * time.Millisecond)
+		internal := model.VisibilityInternal
+		if _, err := st.UpdateMCPServer(ctx, srv.ID, model.MCPPatch{Visibility: &internal}, audit); err != nil {
+			t.Fatal(err)
+		}
+		after := mcpVersion(t, st, srv.ID, "1.0.0")
+		if !after.UpdatedAt.After(v.UpdatedAt) {
+			t.Fatal("a visibility change must show up in the change feed of the server's versions")
+		}
+		// A patch that changes nothing does not.
+		if _, err := st.UpdateMCPServer(ctx, srv.ID, model.MCPPatch{Visibility: &internal}, audit); err != nil {
+			t.Fatal(err)
+		}
+		if again := mcpVersion(t, st, srv.ID, "1.0.0"); !sameTime(again.UpdatedAt, after.UpdatedAt) {
+			t.Fatal("a patch without a change stamped the versions")
+		}
+	}},
+	{"upstream policy changes", func(t *testing.T, st store.Store) {
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		mirrorMCP(t, st, mirrorInput(up, "org.mirror/srv", "1.0.0"), model.MirrorCreated)
+		v := version("1", "spdx")
+		v.Source, v.Locator = nil, &model.Locator{Kind: "registry"}
+		sk, _, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "org.mirror", Name: "tool", Mode: "indexed",
+			SourceKey: "upstream:up:org.mirror/tool", Visibility: model.VisibilityPublic, Listed: true, UpstreamID: up.ID, Version: v}, audit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local, _, err := publish(st, "local", model.VisibilityPublic, "1", "spdx")
+		if err != nil {
+			t.Fatal(err)
+		}
+		setCursor := func() {
+			t.Helper()
+			if ok, err := st.ClaimUpstreamSync(ctx, up.ID, time.Now(), time.Now().Add(-time.Hour)); err != nil || !ok {
+				t.Fatalf("claim: %v %v", ok, err)
+			}
+			if err := st.FinishUpstreamSync(ctx, up.ID, model.UpstreamSyncResult{At: time.Now(), Status: model.SyncOK, Cursor: "c"}, audit); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cursor := func() string {
+			t.Helper()
+			u, err := st.GetUpstream(ctx, "up")
+			if err != nil {
+				t.Fatal(err)
+			}
+			return u.Cursor
+		}
+		// A change to what is selected starts the sync over; other settings
+		// and patches that change nothing keep the cursor.
+		yes, no, allow, sameAllow, deny := true, false, []string{"org.*"}, []string{"org.*"}, []string{"org.x"}
+		prio, public := 5, model.VisibilityPublic
+		for name, tc := range map[string]struct {
+			patch model.UpstreamPatch
+			reset bool
+		}{
+			"allow list":      {model.UpstreamPatch{NamespaceAllow: &allow}, true},
+			"same allow list": {model.UpstreamPatch{NamespaceAllow: &sameAllow}, false},
+			"deny list":       {model.UpstreamPatch{NamespaceDeny: &deny}, true},
+			"latest only on":  {model.UpstreamPatch{LatestOnly: &yes}, true},
+			"latest only off": {model.UpstreamPatch{LatestOnly: &no}, true},
+			"same visibility": {model.UpstreamPatch{Visibility: &public}, false},
+			"priority":        {model.UpstreamPatch{Priority: &prio, ProxyOnMiss: &yes}, false},
+		} {
+			_ = name
+			setCursor()
+			if _, err := st.UpdateUpstream(ctx, "up", tc.patch, audit); err != nil {
+				t.Fatal(err)
+			}
+			if got := cursor(); (got == "") != tc.reset {
+				t.Errorf("%s: cursor %q, reset wanted %v", name, got, tc.reset)
+			}
+		}
+		// Lowering visibility applies to what is already mirrored, at once,
+		// and to nothing else.
+		setCursor()
+		internal := model.VisibilityInternal
+		if _, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{Visibility: &internal}, audit); err != nil {
+			t.Fatal(err)
+		}
+		if cursor() != "" {
+			t.Error("a visibility change must reset the cursor")
+		}
+		if got, _ := st.GetSkill(ctx, "org.mirror", "tool"); got.ID != sk.ID || got.Visibility != model.VisibilityInternal {
+			t.Errorf("mirrored skill after lowering visibility: %+v", got)
+		}
+		if got := mcpServer(t, st, "org.mirror/srv"); got.Visibility != model.VisibilityInternal {
+			t.Errorf("mirrored server after lowering visibility: %+v", got)
+		}
+		if got, _ := st.GetSkill(ctx, "com.example", "local"); got.ID != local.ID || got.Visibility != model.VisibilityPublic {
+			t.Errorf("a local skill was touched: %+v", got)
+		}
+	}},
+}

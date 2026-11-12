@@ -179,14 +179,27 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 			WHERE server_id = $1 AND version = $2`, srv.ID, v.Version).
 			Scan(&cur.ID, &cur.Digest, &cur.Status, &cur.StatusMessage, &cur.IsLatest)
 		missing := errors.Is(err, pgx.ErrNoRows)
-		switch {
-		case missing:
-		case err != nil:
+		if err != nil && !missing {
 			return err
-		case cur.Digest != v.Digest:
+		}
+		if !missing && cur.Digest != v.Digest {
 			return conflict("digest_mismatch", "the stored version has a different server.json")
-		case cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest:
-			return nil
+		}
+		// The upstream's visibility and listing apply to an existing server
+		// too, together with the version (a server created just above already
+		// has them).
+		settings := srv.Visibility != in.Visibility || srv.Listed != in.Listed
+		if settings {
+			if err := setMCPSettings(ctx, tx, srv.ID, &in.Visibility, &in.Listed); err != nil {
+				return err
+			}
+		}
+		if !missing && cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest {
+			if !settings {
+				return nil
+			}
+			outcome = model.MirrorUpdated
+			return insertAudit(ctx, tx, audit)
 		}
 		if latest {
 			if err := clearMCPLatest(ctx, tx, srv.ID, cur.ID, nil); err != nil {
@@ -317,8 +330,7 @@ func (s *Store) SetMCPStatus(ctx context.Context, serverID int64, version, statu
 func (s *Store) UpdateMCPServer(ctx context.Context, serverID int64, p model.MCPPatch, audit model.AuditEvent) (model.MCPServer, error) {
 	var out model.MCPServer
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
-		if err := rowsOrNotFound(tx.Exec(ctx, `UPDATE mcp_servers SET visibility = COALESCE($2, visibility),
-			listed = COALESCE($3, listed), updated_at = now() WHERE id = $1`, serverID, p.Visibility, p.Listed)); err != nil {
+		if err := setMCPSettings(ctx, tx, serverID, p.Visibility, p.Listed); err != nil {
 			return err
 		}
 		var err error
@@ -381,4 +393,38 @@ func (s *Store) SearchMCP(ctx context.Context, q model.MCPQuery) ([]model.MCPEnt
 		err := row.Scan(append(mcpServerDest(&e.Server), mcpVersionDest(&e.Version)...)...)
 		return e, err
 	})
+}
+
+// setMCPSettings changes visibility and listing of a server. When either
+// really changes, every version is stamped: who may see the server changes
+// what each version's listing entry says, and readers that sync
+// incrementally by updated_at must see it.
+func setMCPSettings(ctx context.Context, tx pgx.Tx, serverID int64, visibility *string, listed *bool) error {
+	var changed bool
+	err := tx.QueryRow(ctx, `UPDATE mcp_servers m SET visibility = COALESCE($2, m.visibility), listed = COALESCE($3, m.listed),
+		updated_at = now() FROM mcp_servers old WHERE m.id = $1 AND old.id = m.id
+		RETURNING (m.visibility, m.listed) IS DISTINCT FROM (old.visibility, old.listed)`, serverID, visibility, listed).Scan(&changed)
+	if err != nil {
+		return notFound(err)
+	}
+	if changed {
+		_, err = tx.Exec(ctx, `UPDATE mcp_server_versions SET updated_at = now() WHERE server_id = $1`, serverID)
+	}
+	return err
+}
+
+// ListMirroredMCP implements store.Store.
+func (s *Store) ListMirroredMCP(ctx context.Context, upstreamID int64, afterName string, limit int) ([]model.MCPServer, error) {
+	sql := `SELECT ` + mcpServerCols + mcpServerFrom + `WHERE n.upstream_id = $1 AND m.name COLLATE "C" > $2
+		ORDER BY m.name COLLATE "C"`
+	args := []any{upstreamID, afterName}
+	if limit > 0 {
+		sql += " LIMIT $3"
+		args = append(args, limit)
+	}
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPServer, error) { return scanMCPServer(row) })
 }

@@ -95,9 +95,14 @@ func (s *Service) runSync(ctx context.Context, u model.Upstream) model.UpstreamS
 	case model.UpstreamMCP:
 		cursor, err = s.syncMCP(ctx, u, c, stats)
 	case model.UpstreamRegistry:
-		if err = s.syncSkills(ctx, u, c, stats); err == nil {
-			cursor, err = s.syncMCP(ctx, u, c, stats)
+		// Skills and MCP servers are independent: a failure of one must not
+		// keep the other from being reconciled.
+		skillErr := s.syncSkills(ctx, u, c, stats)
+		var mcpErr error
+		if ctx.Err() == nil {
+			cursor, mcpErr = s.syncMCP(ctx, u, c, stats)
 		}
+		err = errors.Join(skillErr, mcpErr)
 	case model.UpstreamAgentSkills:
 		err = s.syncAgentSkills(ctx, u, c, stats)
 	}
@@ -130,44 +135,60 @@ func isUpstreamError(err error) bool {
 	return errors.As(err, &ue) || errors.As(err, &se) || errors.Is(err, upstream.ErrNotFound)
 }
 
+// errUpstreamKind is returned when an upstream configured as a plain MCP
+// registry turns out to be an openlinker-registry. Such an upstream states
+// per-entry visibility and withdraws entries without leaving a trace in the
+// official change feed; only the openlinker-registry kind reconciles that.
+var errUpstreamKind = fail(http.StatusConflict, "upstream_kind_mismatch",
+	"this upstream is an openlinker-registry; configure it with kind openlinker-registry")
+
 // syncMCP mirrors MCP servers through the official registry read API.
 //
-// The cursor is an RFC 3339 watermark: the newest updatedAt among the
-// entries this instance stored, never later than the start of the run. A
-// timestamp in the future, or one on an entry that was rejected, therefore
-// cannot move the watermark past updates that have not been seen yet. A run
-// re-reads a window before the watermark, and the watermark is only advanced
-// when the whole listing was read.
+// A full run lists everything (deleted versions included) and then looks up,
+// by name, every server mirrored earlier that the listing did not show:
+// servers the upstream deleted, unlisted or stopped sharing do not appear in
+// a listing, and must not stay here as they were.
 //
-// With LatestOnly the first (full) run asks for latest versions only. Later
-// runs read every change since the watermark, because a deletion is not a
-// "latest" version and would otherwise never arrive; a change to a version
-// that was not mirrored is ignored.
+// An openlinker-registry is always read in full: its entries change
+// visibility and listing, which the change feed does not report. The
+// official registry is read in full the first time and incrementally
+// afterwards. The cursor of incremental runs is an RFC 3339 watermark: the
+// newest updatedAt among the entries this instance stored, never later than
+// the start of the run, so a timestamp in the future or on a rejected entry
+// cannot move it past updates that have not been seen. Each run re-reads a
+// window before the watermark.
+//
+// With LatestOnly a full run asks for latest versions only. Incremental runs
+// read every change, because a deletion is not a "latest" version and would
+// otherwise never arrive; a change to a version that was not mirrored is
+// ignored.
 func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Client, stats syncStats) (string, error) {
 	start := s.Now()
 	var since *time.Time
 	var watermark time.Time
-	if t, err := time.Parse(time.RFC3339Nano, u.Cursor); err == nil {
+	if t, err := time.Parse(time.RFC3339Nano, u.Cursor); err == nil && u.Kind == model.UpstreamMCP {
 		watermark = t
 		from := t.Add(-syncOverlap)
 		since = &from
 	}
 	full := since == nil
+	seen := map[string]bool{}
 	page := ""
 	for i := 0; ; i++ {
 		if i == maxSyncPages {
 			return "", fail(http.StatusBadGateway, "upstream_too_large", "the upstream listing exceeds the page limit of one sync")
 		}
 		docs, next, err := c.ListMCP(ctx, upstream.MCPListOptions{Cursor: page, Limit: syncPageSize, UpdatedSince: since,
-			LatestOnly: u.LatestOnly && full})
+			LatestOnly: u.LatestOnly && full, IncludeDeleted: full})
 		if err != nil {
 			// A skill-only registry has no MCP API; that is not a failure.
 			if i == 0 && u.Kind == model.UpstreamRegistry && errors.Is(err, upstream.ErrNotFound) {
-				return u.Cursor, nil
+				return "", nil
 			}
 			return "", err
 		}
 		for _, doc := range docs {
+			seen[doc.Name] = true
 			res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest)
 			switch {
 			case err == nil:
@@ -175,7 +196,7 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 				if doc.UpdatedAt.After(watermark) && !doc.UpdatedAt.After(start) {
 					watermark = doc.UpdatedAt
 				}
-			case isStoreFailure(err):
+			case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
 				return "", err
 			case errors.Is(err, model.ErrConflict):
 				stats.add("mcp_conflicts")
@@ -188,17 +209,78 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 		}
 		page = next
 	}
+	if full {
+		if err := s.reconcileMCP(ctx, u, c, seen, stats); err != nil {
+			return "", err
+		}
+	}
+	if u.Kind != model.UpstreamMCP {
+		return "", nil
+	}
 	if watermark.IsZero() {
 		return u.Cursor, nil
 	}
 	return watermark.UTC().Format(time.RFC3339Nano), nil
 }
 
+// reconcileMCP looks up, by name, every mirrored server of the upstream that
+// a full listing did not show, and applies what the upstream says now: its
+// versions' current status, or that the server is gone.
+func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstream.Client, seen map[string]bool, stats syncStats) error {
+	after := ""
+	for {
+		servers, err := s.Store.ListMirroredMCP(ctx, u.ID, after, 200)
+		if err != nil {
+			return err
+		}
+		for _, srv := range servers {
+			after = srv.Name
+			if seen[srv.Name] {
+				continue
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			docs, err := c.ListMCPVersions(ctx, srv.Name)
+			var ue *upstream.Error
+			switch {
+			case errors.Is(err, upstream.ErrNotFound):
+				if err := s.withdrawMCP(ctx, u, srv, stats); err != nil {
+					return err
+				}
+				continue
+			case errors.As(err, &ue):
+				stats.add("mcp_skipped")
+				continue
+			case err != nil:
+				return err
+			}
+			for _, doc := range docs {
+				res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest)
+				switch {
+				case err == nil:
+					stats.add("mcp_" + res)
+				case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
+					return err
+				case errors.Is(err, model.ErrConflict):
+					stats.add("mcp_conflicts")
+				default:
+					stats.add("mcp_skipped")
+				}
+			}
+		}
+		if len(servers) < 200 {
+			return nil
+		}
+	}
+}
+
 // syncSkills mirrors the skills of another openlinker-registry: metadata
 // now, bytes on first read (see Materialize). The native API has no change
 // feed and its listing does not show every change (yanking an old version
 // changes neither the latest version nor the status), so each run reads the
-// detail of every listed skill.
+// detail of every listed skill, and then of every skill mirrored earlier
+// that the listing no longer shows (yanked, unlisted or no longer shared).
 func (s *Service) syncSkills(ctx context.Context, u model.Upstream, c *upstream.Client, stats syncStats) error {
 	cursor := ""
 	listed := map[string]bool{}
@@ -225,19 +307,45 @@ func (s *Service) syncSkills(ctx context.Context, u model.Upstream, c *upstream.
 		}
 		cursor = next
 	}
-	return s.syncDelisted(ctx, u, c, listed, stats)
+	afterNS, afterName := "", ""
+	for {
+		rows, err := s.Store.ListMirroredSkills(ctx, u.ID, afterNS, afterName, 200)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			afterNS, afterName = row.Namespace, row.Name
+			if listed[row.Namespace+"/"+row.Name] {
+				continue
+			}
+			if err := s.refreshSkill(ctx, u, c, row.Namespace, row.Name, stats); err != nil {
+				return err
+			}
+		}
+		if len(rows) < 200 {
+			return nil
+		}
+	}
 }
 
 // refreshSkill reads one skill from the upstream and brings the local mirror
-// up to date. A skill the upstream no longer serves is restricted here. Only
-// failures of this instance or of the transport are returned; a rejected
-// entry is counted.
+// up to date; a skill the upstream no longer serves to this instance is
+// withdrawn. Only failures of this instance or of the transport are
+// returned: a rejected or malformed entry is counted and skipped, so it
+// cannot keep the rest of a sync from running.
 func (s *Service) refreshSkill(ctx context.Context, u model.Upstream, c *upstream.Client, ns, name string, stats syncStats) error {
-	detail, err := c.GetSkill(ctx, ns, name)
-	if errors.Is(err, upstream.ErrNotFound) {
-		return s.restrictSkill(ctx, u, ns, name, "no longer available from the upstream registry", false, stats)
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	if err != nil {
+	detail, err := c.GetSkill(ctx, ns, name)
+	var ue *upstream.Error
+	switch {
+	case errors.Is(err, upstream.ErrNotFound):
+		return s.withdrawSkill(ctx, u, ns, name, stats)
+	case errors.As(err, &ue):
+		stats.add("skills_skipped")
+		return nil
+	case err != nil:
 		return err
 	}
 	err = s.mirrorSkill(ctx, u, c, detail, stats)
@@ -253,39 +361,15 @@ func (s *Service) refreshSkill(ctx context.Context, u model.Upstream, c *upstrea
 	return nil
 }
 
-// syncDelisted follows up on mirrored skills the upstream no longer lists (a
-// yanked or unlisted skill drops out of the listing): their current state is
-// read by name.
-func (s *Service) syncDelisted(ctx context.Context, u model.Upstream, c *upstream.Client, listed map[string]bool, stats syncStats) error {
-	q := model.SearchQuery{Viewer: model.Viewer{Admin: true}, Mode: skill.ModeIndexed, Limit: 200}
-	for {
-		rows, err := s.Store.Search(ctx, q)
-		if err != nil {
-			return err
-		}
-		for _, row := range rows {
-			if row.Upstream != u.Name || listed[row.Namespace+"/"+row.Name] {
-				continue
-			}
-			if err := s.refreshSkill(ctx, u, c, row.Namespace, row.Name, stats); err != nil {
-				return err
-			}
-		}
-		if len(rows) < q.Limit {
-			return nil
-		}
-		last := rows[len(rows)-1]
-		q.AfterNS, q.AfterName = last.Namespace, last.Name
-	}
-}
+// withdrawnReason is recorded on entries an upstream stopped sharing.
+const withdrawnReason = "no longer shared by the upstream registry"
 
-// restrictSkill withdraws a mirrored skill the upstream stopped serving to
-// this instance. It is deprecated rather than yanked, because yanking is
-// terminal and the upstream may only be hiding the entry for a while. When
-// hide is set (the upstream made it private) it also leaves listings and
-// anonymous reach, since this instance cannot reproduce the upstream's
-// access list.
-func (s *Service) restrictSkill(ctx context.Context, u model.Upstream, ns, name, reason string, hide bool, stats syncStats) error {
+// withdrawSkill takes a mirrored skill out of reach when the upstream no
+// longer serves it to this instance: it becomes private and unlisted (only
+// administrators still see it) and is marked deprecated. It is not yanked,
+// because yanking is terminal; if the upstream shares the skill again, the
+// next refresh restores it.
+func (s *Service) withdrawSkill(ctx context.Context, u model.Upstream, ns, name string, stats syncStats) error {
 	local, err := s.Store.GetSkill(ctx, ns, name)
 	if errors.Is(err, model.ErrNotFound) || (err == nil && local.Upstream != u.Name) {
 		return nil
@@ -294,21 +378,53 @@ func (s *Service) restrictSkill(ctx context.Context, u model.Upstream, ns, name,
 		return err
 	}
 	actor := "upstream:" + u.Name
+	changed := false
+	if local.Visibility != model.VisibilityPrivate || local.Listed {
+		private, unlisted := model.VisibilityPrivate, false
+		if _, err := s.Store.UpdateSkill(ctx, local.ID, model.SkillPatch{Visibility: &private, Listed: &unlisted},
+			auditEvent(actor, "skill.withdraw", ns, name, map[string]any{"reason": withdrawnReason})); err != nil {
+			return err
+		}
+		changed = true
+	}
 	if local.Status == model.StatusActive {
-		if _, err := s.Store.SetSkillStatus(ctx, local.ID, model.StatusDeprecated, reason,
-			auditEvent(actor, "skill.deprecated", ns, name, map[string]any{"reason": reason})); err != nil {
+		if _, err := s.Store.SetSkillStatus(ctx, local.ID, model.StatusDeprecated, withdrawnReason,
+			auditEvent(actor, "skill.deprecated", ns, name, map[string]any{"reason": withdrawnReason})); err != nil {
 			return err
 		}
-		stats.add("skills_updated")
+		changed = true
 	}
-	if hide && (local.Listed || local.Visibility == model.VisibilityPublic) {
-		internal, unlisted := model.VisibilityInternal, false
-		if _, err := s.Store.UpdateSkill(ctx, local.ID, model.SkillPatch{Visibility: &internal, Listed: &unlisted},
-			auditEvent(actor, "skill.update", ns, name, map[string]any{"visibility": internal, "listed": false, "reason": reason})); err != nil {
-			return err
+	if changed {
+		stats.add("skills_withdrawn")
+	}
+	return nil
+}
+
+// withdrawMCP is withdrawSkill for an MCP server. A server that is gone from
+// a registry with official semantics (where nothing is ever private) is
+// marked deleted instead, which is what that registry would have reported.
+func (s *Service) withdrawMCP(ctx context.Context, u model.Upstream, srv model.MCPServer, stats syncStats) error {
+	if srv.Upstream != u.Name {
+		return nil
+	}
+	actor := "upstream:" + u.Name
+	if u.Kind == model.UpstreamMCP {
+		n, err := s.Store.SetMCPStatus(ctx, srv.ID, "", model.MCPStatusDeleted, "no longer available from the upstream registry", s.Now(),
+			auditEvent(actor, "mcp.status", srv.Namespace, srv.Name, map[string]any{"status": model.MCPStatusDeleted}))
+		if err == nil && n > 0 {
+			stats.add("mcp_withdrawn")
 		}
-		stats.add("skills_updated")
+		return err
 	}
+	if srv.Visibility == model.VisibilityPrivate && !srv.Listed {
+		return nil
+	}
+	private, unlisted := model.VisibilityPrivate, false
+	if _, err := s.Store.UpdateMCPServer(ctx, srv.ID, model.MCPPatch{Visibility: &private, Listed: &unlisted},
+		auditEvent(actor, "mcp.withdraw", srv.Namespace, srv.Name, map[string]any{"reason": withdrawnReason})); err != nil {
+		return err
+	}
+	stats.add("mcp_withdrawn")
 	return nil
 }
 
@@ -327,16 +443,22 @@ func mirrorVisibility(u model.Upstream, source string) (visibility string, ok bo
 	return "", false
 }
 
-// maxMirrorVersions bounds how many versions of one skill a single refresh
-// records, newest first.
-const maxMirrorVersions = 100
+// maxSkillVersions is the most versions a mirrored skill may have upstream.
+// A skill is mirrored with all of its versions or not at all, so that no
+// version is ever silently missing.
+const maxSkillVersions = 1000
 
 // mirrorSkill brings one upstream skill up to date.
 //
-// Versions are recorded oldest first and only when they are newer than every
-// version already mirrored, so local order always matches the upstream's and
-// "latest" means the same on both sides. Yanks of mirrored versions, status,
-// visibility and listing are propagated.
+// Restrictions come first: visibility, listing and status are applied
+// before any new version is recorded, so nothing new is ever visible under
+// settings the upstream has already withdrawn.
+//
+// Versions are recorded oldest first and only when newer than every version
+// already mirrored; the store refuses a version when the newest local
+// version is not the one this refresh expects. Local order therefore always
+// matches the upstream's, whatever else runs concurrently, and "latest"
+// means the same on both sides.
 func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream.Client, d upstream.SkillDetail, stats syncStats) error {
 	if !skill.ValidNamespaceName(d.Namespace) || !skill.ValidSkillName(d.Name) {
 		return invalid("name_invalid", "upstream skill has an unusable name")
@@ -346,10 +468,13 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 	}
 	visibility, ok := mirrorVisibility(u, d.Visibility)
 	if !ok {
-		if err := s.restrictSkill(ctx, u, d.Namespace, d.Name, "no longer shared by the upstream registry", true, stats); err != nil {
+		if err := s.withdrawSkill(ctx, u, d.Namespace, d.Name, stats); err != nil {
 			return err
 		}
 		return fail(http.StatusForbidden, "upstream_private", "the upstream does not share this entry")
+	}
+	if len(d.Versions) > maxSkillVersions {
+		return invalid("too_many_versions", "upstream skill has too many versions to mirror")
 	}
 	actor := "upstream:" + u.Name
 	local, err := s.Store.GetSkill(ctx, d.Namespace, d.Name)
@@ -360,13 +485,23 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 	if exists && local.Upstream != u.Name {
 		return model.ErrNamespaceManaged()
 	}
+	changed := false
+	if exists {
+		if local, changed, err = s.applySkillSettings(ctx, actor, local, d, visibility); err != nil {
+			return err
+		}
+	}
 	have := map[string]model.Version{}
+	newest := ""
 	if exists {
 		versions, err := s.Store.ListVersions(ctx, local.ID)
 		if err != nil {
 			return err
 		}
-		for _, v := range versions {
+		for i, v := range versions {
+			if i == 0 {
+				newest = v.Version
+			}
 			have[v.Version] = v
 		}
 	}
@@ -379,7 +514,6 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			break
 		}
 	}
-	changed := false
 	for _, ref := range d.Versions[fresh:] {
 		if v, ok := have[ref.Version]; ok && ref.Yanked && v.YankedAt == nil {
 			if err := s.Store.YankVersion(ctx, v.ID, "yanked upstream", s.Now(),
@@ -389,56 +523,49 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			changed = true
 		}
 	}
-	for i := min(fresh, maxMirrorVersions) - 1; i >= 0; i-- {
+	created := false
+	for i := fresh - 1; i >= 0; i-- {
 		ref := d.Versions[i]
 		if !skill.ValidVersion(ref.Version) {
 			stats.add("skills_skipped")
 			continue
 		}
 		sv, err := c.GetSkillVersion(ctx, d.Namespace, d.Name, ref.Version)
-		if errors.Is(err, upstream.ErrNotFound) {
+		var ue *upstream.Error
+		if errors.Is(err, upstream.ErrNotFound) || errors.As(err, &ue) {
 			stats.add("skills_skipped")
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		sk, err := s.mirrorSkillVersion(ctx, u, sv, visibility, d.Listed)
+		sk, err := s.mirrorSkillVersion(ctx, u, sv, visibility, d.Listed, newest)
+		var ce *model.ConflictError
 		switch {
 		case err == nil:
-			local, exists, changed = sk, true, true
+			if !exists {
+				created = true
+			}
+			local, exists, changed, newest = sk, true, true, sv.Version
 			stats.add("skills_created")
 		case isStoreFailure(err):
 			return err
+		case errors.As(err, &ce) && (ce.Code == "namespace_upstream_managed" || ce.Code == "version_order"):
+			// Not ours to write, or another refresh of this skill is
+			// running: leave the rest to it.
+			return err
 		case errors.Is(err, model.ErrConflict):
-			var ce *model.ConflictError
-			if errors.As(err, &ce) && ce.Code == "namespace_upstream_managed" {
-				return err
-			}
 			stats.add("skills_conflicts")
 		default:
 			stats.add("skills_skipped")
 		}
 	}
-	if !exists {
-		return nil
-	}
-	if d.Status != local.Status && local.Status != model.StatusYanked &&
-		(d.Status == model.StatusActive || d.Status == model.StatusDeprecated || d.Status == model.StatusYanked) {
-		reason := clip(d.StatusReason, 500)
-		if _, err := s.Store.SetSkillStatus(ctx, local.ID, d.Status, reason,
-			auditEvent(actor, "skill."+d.Status, d.Namespace, d.Name, map[string]any{"reason": reason})); err != nil {
+	if created {
+		// A skill created just now took its visibility and listing from the
+		// first version; its status is still to be set.
+		if _, _, err = s.applySkillSettings(ctx, actor, local, d, visibility); err != nil {
 			return err
 		}
-		changed = true
-	}
-	if local.Visibility != visibility || local.Listed != d.Listed {
-		listed := d.Listed
-		if _, err := s.Store.UpdateSkill(ctx, local.ID, model.SkillPatch{Visibility: &visibility, Listed: &listed},
-			auditEvent(actor, "skill.update", d.Namespace, d.Name, map[string]any{"visibility": visibility, "listed": listed})); err != nil {
-			return err
-		}
-		changed = true
 	}
 	if changed {
 		stats.add("skills_updated")
@@ -446,6 +573,32 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 		stats.add("skills_unchanged")
 	}
 	return nil
+}
+
+// applySkillSettings makes visibility, listing and status of a mirrored
+// skill what the upstream says they are.
+func (s *Service) applySkillSettings(ctx context.Context, actor string, local model.Skill, d upstream.SkillDetail, visibility string) (model.Skill, bool, error) {
+	changed := false
+	if local.Visibility != visibility || local.Listed != d.Listed {
+		listed := d.Listed
+		out, err := s.Store.UpdateSkill(ctx, local.ID, model.SkillPatch{Visibility: &visibility, Listed: &listed},
+			auditEvent(actor, "skill.update", d.Namespace, d.Name, map[string]any{"visibility": visibility, "listed": listed}))
+		if err != nil {
+			return local, false, err
+		}
+		local, changed = out, true
+	}
+	if d.Status != local.Status && local.Status != model.StatusYanked &&
+		(d.Status == model.StatusActive || d.Status == model.StatusDeprecated || d.Status == model.StatusYanked) {
+		reason := clip(d.StatusReason, 500)
+		out, err := s.Store.SetSkillStatus(ctx, local.ID, d.Status, reason,
+			auditEvent(actor, "skill."+d.Status, d.Namespace, d.Name, map[string]any{"reason": reason}))
+		if err != nil {
+			return local, false, err
+		}
+		local, changed = out, true
+	}
+	return local, changed, nil
 }
 
 func hex64(s string) bool {
@@ -470,7 +623,7 @@ func boundedText(s string, max int) bool {
 // a registry locator. Every field comes from an untrusted peer and is
 // checked here; the bytes are verified against the recorded digest and file
 // manifest before they are ever served.
-func (s *Service) mirrorSkillVersion(ctx context.Context, u model.Upstream, sv upstream.SkillVersion, visibility string, listed bool) (model.Skill, error) {
+func (s *Service) mirrorSkillVersion(ctx context.Context, u model.Upstream, sv upstream.SkillVersion, visibility string, listed bool, newest string) (model.Skill, error) {
 	bad := func(what string) (model.Skill, error) {
 		return model.Skill{}, invalid("upstream_version_invalid", "upstream version has an invalid "+what)
 	}
@@ -517,7 +670,7 @@ func (s *Service) mirrorSkillVersion(ctx context.Context, u model.Upstream, sv u
 	}
 	sk, stored, err := s.Store.PublishVersion(ctx, model.PublishInput{Namespace: sv.Namespace, Name: sv.Name, Mode: skill.ModeIndexed,
 		SourceKey: "upstream:" + u.Name + ":" + sv.Namespace + "/" + sv.Name, Visibility: visibility, Listed: listed,
-		UpstreamID: u.ID, Version: v},
+		UpstreamID: u.ID, ExpectNewest: &newest, Version: v},
 		auditEvent(actor, "skill.mirror", sv.Namespace, sv.Name+"@"+sv.Version, map[string]any{"digest": sv.ArtifactDigest, "upstream": u.Name}))
 	if err != nil {
 		return model.Skill{}, err

@@ -213,19 +213,34 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   an anonymous caller never makes the registry reach out to an upstream whose
   entries are `internal`. Listings and search only show what is already here,
   so use a sync interval for a complete catalogue.
-- **Sync** (`sync_interval_seconds`, or `POST …/sync`): MCP servers are synced
-  incrementally with `updated_since` (the watermark is the newest update
-  stored, never later than the start of the run). Skills have no change feed,
-  so each run reads the detail of every listed skill. Status changes, yanks
-  of any version and deletions propagate. With `latest_only` the first run
-  takes latest versions only; later runs also apply deletions and status
-  changes to versions that are mirrored. One run per upstream is active at a
-  time, across replicas.
+- **Sync** (`sync_interval_seconds`, or `POST …/sync`). An
+  openlinker-registry is read in full on every run: its listing, then the
+  detail of every skill, then every entry mirrored earlier that the listing
+  no longer shows. The official MCP registry is read in full once and
+  incrementally afterwards with `updated_since` (the watermark is the newest
+  update stored, never later than the start of the run). Status changes,
+  yanks of any version and deletions propagate. With `latest_only` a full run
+  takes latest versions only; changes to versions that are mirrored still
+  arrive. A malformed entry is skipped, not fatal. One run per upstream is
+  active at a time, across replicas. Changing what an upstream selects (URL,
+  allow and deny lists, `latest_only`, `visibility`) starts the next sync
+  from scratch.
 - **A mirror never shows an entry more widely than its upstream does.** An
   openlinker-registry upstream states each entry's visibility and listing:
   `internal` entries stay `internal`, unlisted ones stay unlisted, `private`
-  ones are not mirrored, and later restrictions follow at the next sync.
-  `visibility` on the upstream is the widest a mirrored entry can be.
+  ones are not mirrored. Restrictions are applied before anything new is
+  recorded, on a forwarded read as well as at a sync. An entry the upstream
+  stops sharing is **withdrawn**: it becomes private and unlisted here (only
+  administrators still see it, cached bytes included) and comes back if the
+  upstream shares it again. `visibility` on the upstream is the widest a
+  mirrored entry can be; lowering it to `internal` applies at once to what
+  is already mirrored.
+- **Use the right kind.** Another openlinker-registry must be configured as
+  `openlinker-registry`; as `mcp-registry` its sync is refused, because that
+  kind follows the official change feed, which carries no visibility.
+- **Mirrored entries are read-only here**, for administrators too: they
+  follow their upstream. A skill is mirrored with all of its versions, in
+  the upstream's order (skills with more than 1000 versions are skipped).
 - **Bytes are pulled through and verified.** Mirroring a skill records its
   metadata; the artifact is fetched from the upstream on first read, checked
   against the recorded sha256 digest and file manifest, then cached. A
@@ -275,7 +290,9 @@ cookie, so downloads offered by the pages are served under `/ui/` as well. The p
   versions are not semantic. A document carrying a credential is rejected: a
   literal value on an input flagged `isSecret` or named like a credential
   (`Authorization`, `Cookie`, names ending in `token`, `secret`, `password`,
-  `api_key`, …), or a URL with userinfo. Use a `{variable}` placeholder.
+  `api_key`, …, as a header, environment variable, argument or variable
+  name), a URL with userinfo, or a URL query parameter named like a
+  credential. Use a `{variable}` placeholder.
 - **Names.** Skill names are slugs (`[a-z0-9]+(-[a-z0-9]+)*`, max 64).
   Namespaces are lowercase reverse-DNS: `io.github.<login>` (bound to the
   numeric GitHub id, which must be unique), `ai.openlinker.<handle>` (public

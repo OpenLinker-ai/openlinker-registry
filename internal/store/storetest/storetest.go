@@ -194,7 +194,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
-	for _, cases := range [][]testCase{namespaceTests, mcpTests, upstreamTests, auditTests} {
+	for _, cases := range [][]testCase{namespaceTests, mcpTests, upstreamTests, auditTests, mirrorTests} {
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) { c.run(t, setup(t)) })
 		}

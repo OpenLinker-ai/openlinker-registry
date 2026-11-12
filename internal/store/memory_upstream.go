@@ -132,11 +132,17 @@ func (m *Memory) UpdateUpstream(_ context.Context, name string, p model.Upstream
 	if !ok {
 		return model.Upstream{}, model.ErrNotFound
 	}
+	now := micro(time.Now())
+	// A cursor describes one selection of one registry: any change to what
+	// is selected or how it is shown starts over.
+	reset := (p.BaseURL != nil && *p.BaseURL != u.BaseURL) || (p.Visibility != nil && *p.Visibility != u.Visibility) ||
+		(p.NamespaceAllow != nil && !slices.Equal(*p.NamespaceAllow, u.NamespaceAllow)) ||
+		(p.NamespaceDeny != nil && !slices.Equal(*p.NamespaceDeny, u.NamespaceDeny)) ||
+		(p.LatestOnly != nil && *p.LatestOnly != u.LatestOnly)
+	if reset {
+		u.Cursor = ""
+	}
 	if p.BaseURL != nil {
-		// A cursor is only meaningful to the registry that issued it.
-		if *p.BaseURL != u.BaseURL {
-			u.Cursor = ""
-		}
 		u.BaseURL = *p.BaseURL
 	}
 	if p.Enabled != nil {
@@ -147,6 +153,9 @@ func (m *Memory) UpdateUpstream(_ context.Context, name string, p model.Upstream
 	}
 	if p.Visibility != nil {
 		u.Visibility = *p.Visibility
+		if u.Visibility == model.VisibilityInternal {
+			m.tightenUpstream(u.ID, now)
+		}
 	}
 	if p.NamespaceAllow != nil {
 		u.NamespaceAllow = slices.Clone(*p.NamespaceAllow)
@@ -163,7 +172,7 @@ func (m *Memory) UpdateUpstream(_ context.Context, name string, p model.Upstream
 	if p.LatestOnly != nil {
 		u.LatestOnly = *p.LatestOnly
 	}
-	u.UpdatedAt = micro(time.Now())
+	u.UpdatedAt = now
 	m.upstreams[u.ID] = u
 	m.appendAudit(audit)
 	return copyUpstream(u), nil
@@ -260,4 +269,22 @@ func (m *Memory) EnsureUpstreamNamespace(_ context.Context, name string, upstrea
 		m.appendAudit(audit)
 	}
 	return ns, nil
+}
+
+// tightenUpstream makes every public entry in the upstream's namespaces
+// internal.
+func (m *Memory) tightenUpstream(upstreamID int64, at time.Time) {
+	for id, s := range m.skills {
+		if s.Visibility == model.VisibilityPublic && m.ns[s.Namespace].UpstreamID == upstreamID {
+			s.Visibility, s.UpdatedAt = model.VisibilityInternal, at
+			m.skills[id] = s
+		}
+	}
+	for id, s := range m.mcp {
+		if s.Visibility == model.VisibilityPublic && m.ns[s.Namespace].UpstreamID == upstreamID {
+			s.Visibility, s.UpdatedAt = model.VisibilityInternal, at
+			m.mcp[id] = s
+			m.touchMCPVersions(id, at)
+		}
+	}
 }

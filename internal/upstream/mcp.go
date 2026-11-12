@@ -48,6 +48,9 @@ type MCPListOptions struct {
 	UpdatedSince *time.Time
 	LatestOnly   bool // version=latest
 	Search       string
+	// IncludeDeleted asks for deleted versions too, which a listing omits
+	// by default.
+	IncludeDeleted bool
 }
 
 // mcpGet requests an MCP path under the API prefix. Until a prefix has
@@ -183,6 +186,9 @@ func (c *Client) ListMCP(ctx context.Context, o MCPListOptions) (docs []MCPDoc, 
 	}
 	if o.UpdatedSince != nil {
 		q.Set("updated_since", o.UpdatedSince.UTC().Format(time.RFC3339))
+	}
+	if o.IncludeDeleted {
+		q.Set("include_deleted", "true")
 	}
 	if o.LatestOnly {
 		q.Set("version", "latest")

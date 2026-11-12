@@ -285,7 +285,12 @@ type PublishInput struct {
 	// publishing); otherwise the store rejects the publish with the
 	// ConflictError code namespace_upstream_managed.
 	UpstreamID int64
-	Version    Version
+	// ExpectNewest, when set, is the version that must currently be the
+	// newest of the skill ("" for none). A mirror uses it so that two
+	// concurrent refreshes cannot interleave and leave versions out of the
+	// upstream's order; a mismatch is ConflictError version_order.
+	ExpectNewest *string
+	Version      Version
 }
 
 // SkillPatch updates mutable skill settings.

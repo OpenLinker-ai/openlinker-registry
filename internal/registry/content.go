@@ -321,6 +321,11 @@ func (s *Service) WellKnown(ctx context.Context, namespace string) (Index, error
 
 // SetStatus deprecates or yanks a skill.
 func (s *Service) SetStatus(ctx context.Context, actor string, sk model.Skill, status, reason string) (model.Skill, error) {
+	// A mirrored skill follows its upstream; a local change (a yank is even
+	// terminal) would only be fought over by the next sync.
+	if sk.Upstream != "" {
+		return model.Skill{}, mirroredReadOnly()
+	}
 	if sk.Status == model.StatusYanked && status != model.StatusYanked {
 		return model.Skill{}, fail(http.StatusConflict, "skill_yanked", "a yanked skill cannot change status")
 	}
@@ -330,6 +335,9 @@ func (s *Service) SetStatus(ctx context.Context, actor string, sk model.Skill, s
 
 // YankVersion yanks one version; later downloads return 410.
 func (s *Service) YankVersion(ctx context.Context, actor string, sk model.Skill, v model.Version, reason string) error {
+	if sk.Upstream != "" {
+		return mirroredReadOnly()
+	}
 	return s.Store.YankVersion(ctx, v.ID, reason, s.Now(),
 		auditEvent(actor, "version.yank", sk.Namespace, sk.Name+"@"+v.Version, map[string]any{"reason": reason}))
 }
@@ -337,6 +345,9 @@ func (s *Service) YankVersion(ctx context.Context, actor string, sk model.Skill,
 // UpdateSettings changes visibility/listed with the license rule for public
 // hosted skills.
 func (s *Service) UpdateSettings(ctx context.Context, actor string, sk model.Skill, p model.SkillPatch) (model.Skill, error) {
+	if sk.Upstream != "" {
+		return model.Skill{}, mirroredReadOnly()
+	}
 	if p.Visibility != nil {
 		if err := s.checkVisibility(*p.Visibility); err != nil {
 			return model.Skill{}, err

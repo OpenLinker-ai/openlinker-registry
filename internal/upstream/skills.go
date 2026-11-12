@@ -132,13 +132,12 @@ func (c *Client) ListSkills(ctx context.Context, cursor string, limit int) (item
 	if err != nil {
 		return nil, "", wrapOp("skill list", err)
 	}
+	// One malformed entry is skipped, like in the MCP listings: it must not
+	// hide every other entry of the upstream from a sync.
 	for _, raw := range raws {
 		var w skillWire
-		if err := decode(raw, &w, "skill list"); err != nil {
-			return nil, "", wrapOp("skill list", err)
-		}
-		if w.Namespace == "" || w.Name == "" {
-			return nil, "", wrapOp("skill list", badResponse("upstream returned a skill without namespace or name"))
+		if err := decode(raw, &w, "skill list"); err != nil || w.Namespace == "" || w.Name == "" {
+			continue
 		}
 		items = append(items, w.summary())
 	}

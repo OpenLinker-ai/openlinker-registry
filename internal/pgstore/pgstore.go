@@ -386,6 +386,16 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		if in.Mode == "hosted" && k.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
 			return &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
 		}
+		if in.ExpectNewest != nil {
+			var newest string
+			if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT version FROM skill_versions WHERE skill_id = $1
+				ORDER BY id DESC LIMIT 1), '')`, k.ID).Scan(&newest); err != nil {
+				return err
+			}
+			if newest != *in.ExpectNewest {
+				return conflict("version_order", "the newest version is not the expected one")
+			}
+		}
 		v := in.Version
 		files, _ := json.Marshal(v.Files)
 		src, loc := jsonOrNil(v.Source), jsonOrNil(v.Locator)
@@ -749,4 +759,20 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]model.AuditEvent, e
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// ListMirroredSkills implements store.Store.
+func (s *Store) ListMirroredSkills(ctx context.Context, upstreamID int64, afterNS, afterName string, limit int) ([]model.Skill, error) {
+	sql := `SELECT ` + skillCols + skillFrom + `WHERE n.upstream_id = $1
+		AND (n.name COLLATE "C", s.name COLLATE "C") > ($2, $3) ORDER BY n.name COLLATE "C", s.name COLLATE "C"`
+	args := []any{upstreamID, afterNS, afterName}
+	if limit > 0 {
+		sql += " LIMIT $4"
+		args = append(args, limit)
+	}
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.Skill, error) { return scanSkill(row) })
 }

@@ -58,6 +58,14 @@ type Store interface {
 	// ListTokens returns every token (newest first). SecretHash is not set.
 	ListTokens(ctx context.Context) ([]model.Token, error)
 
+	// ListMirroredSkills pages through every skill in the namespaces of an
+	// upstream, in (namespace, name) byte order, whatever its listing,
+	// visibility or status: a mirror reconciles all of them, not only the
+	// ones a listing would show.
+	ListMirroredSkills(ctx context.Context, upstreamID int64, afterNS, afterName string, limit int) ([]model.Skill, error)
+	// ListMirroredMCP is ListMirroredSkills for MCP servers, in name order.
+	ListMirroredMCP(ctx context.Context, upstreamID int64, afterName string, limit int) ([]model.MCPServer, error)
+
 	// --- MCP servers ---
 
 	// PublishMCPVersion creates the server if needed and appends an immutable
@@ -69,6 +77,8 @@ type Store interface {
 	// UpsertMirroredMCP stores one mirrored version: it creates the
 	// upstream-managed namespace and the server when missing, inserts the
 	// version, or updates the status fields and IsLatest of an existing one.
+	// The input's visibility and listing are applied to an existing server
+	// in the same transaction (which counts as an update).
 	// It returns MirrorCreated, MirrorUpdated or MirrorUnchanged; the audit
 	// event is written atomically with a created or updated version and not
 	// at all for an unchanged one.
@@ -99,6 +109,12 @@ type Store interface {
 	GetUpstream(ctx context.Context, name string) (model.Upstream, error)
 	// ListUpstreams returns upstreams ordered by priority, then name.
 	ListUpstreams(ctx context.Context) ([]model.Upstream, error)
+	// UpdateUpstream changes settings. A change to what is selected or how
+	// it is shown (base URL, visibility, allow and deny lists, latest only)
+	// clears the sync cursor, so the next sync reads everything again.
+	// Lowering visibility to internal takes effect at once: every public
+	// entry in the upstream's namespaces becomes internal in the same
+	// transaction.
 	UpdateUpstream(ctx context.Context, name string, p model.UpstreamPatch, audit model.AuditEvent) (model.Upstream, error)
 	// DeleteUpstream removes an upstream that manages no namespace
 	// (ConflictError upstream_in_use otherwise).

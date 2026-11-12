@@ -48,3 +48,45 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 		t.Fatalf("path and query may contain @: %v", err)
 	}
 }
+
+func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
+	const secret = "live-secret-0123456789"
+	docs := map[string]string{
+		// In a variables object the key is the input's name.
+		"variable key": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://{tenant}.example.com/sse","variables":{"API_TOKEN":{"default":"` + secret + `"}}}]}`,
+		"nested variable key": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse","headers":[{"name":"X-Trace","value":"{t}",
+			"variables":{"t":{"variables":{"db_password":{"value":"` + secret + `"}}}}}]}]}`,
+		"query parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?region=eu&api_key=` + secret + `"}]}`,
+		"encoded query name": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?access%5Ftoken=` + secret + `"}]}`,
+	}
+	for name, doc := range docs {
+		if _, err := Parse([]byte(doc), Options{Strict: true}); err == nil || err.(*Error).Code != codeSecretValue {
+			t.Errorf("%s: strict must refuse the credential, got %v", name, err)
+		} else if strings.Contains(err.Error(), secret) {
+			t.Errorf("%s: the error repeats the credential", name)
+		}
+		p, err := Parse([]byte(doc), Options{})
+		if err != nil {
+			t.Errorf("%s: lenient: %v", name, err)
+			continue
+		}
+		if strings.Contains(string(p.Canonical), secret) {
+			t.Errorf("%s: lenient must remove the credential: %s", name, p.Canonical)
+		}
+		if _, err := Parse(p.Canonical, Options{Strict: true}); err != nil {
+			t.Errorf("%s: what lenient stores must pass strict: %v", name, err)
+		}
+	}
+	// Placeholders and ordinary parameters are untouched.
+	ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?api_key={key}&max_tokens=4096&region=eu",
+		"variables":{"key":{"description":"Your key","isSecret":true},"region":{"default":"eu"}}}]}`
+	p, err := Parse([]byte(ok), Options{Strict: true})
+	if err != nil || !strings.Contains(string(p.Canonical), "api_key={key}&max_tokens=4096&region=eu") {
+		t.Fatalf("placeholders and ordinary parameters must pass: %v", err)
+	}
+}

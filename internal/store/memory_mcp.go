@@ -176,21 +176,41 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, a
 	}
 	latest := in.Version.IsLatest && status != model.MCPStatusDeleted
 
+	// The upstream's visibility and listing apply to an existing server too,
+	// together with the version.
+	settings := found && (s.Visibility != in.Visibility || s.Listed != in.Listed)
+	applySettings := func() {
+		s.Visibility, s.Listed, s.UpdatedAt = in.Visibility, in.Listed, now
+		m.mcp[s.ID] = s
+		m.touchMCPVersions(s.ID, now)
+	}
 	if cur, exists := m.findMCPVersion(s.ID, in.Version.Version); found && exists {
 		if cur.Digest != in.Version.Digest {
 			return "", conflict("digest_mismatch", "the stored version has a different server.json")
 		}
 		if cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest {
-			return model.MirrorUnchanged, nil
+			if !settings {
+				return model.MirrorUnchanged, nil
+			}
+			applySettings()
+			m.appendAudit(audit)
+			return model.MirrorUpdated, nil
+		}
+		if settings {
+			applySettings()
 		}
 		if latest {
 			m.moveMCPLatest(s.ID, cur.ID, now)
 		}
+		cur = m.mcpVers[cur.ID]
 		cur.Status, cur.StatusMessage, cur.IsLatest = status, message, latest
 		cur.StatusChangedAt, cur.UpdatedAt = orNow(in.Version.StatusChangedAt), orNow(in.Version.UpdatedAt)
 		m.mcpVers[cur.ID] = cur
 		m.appendAudit(audit)
 		return model.MirrorUpdated, nil
+	}
+	if settings {
+		applySettings()
 	}
 
 	if createNS {
@@ -296,14 +316,19 @@ func (m *Memory) UpdateMCPServer(_ context.Context, serverID int64, p model.MCPP
 	if !ok {
 		return model.MCPServer{}, model.ErrNotFound
 	}
+	now := micro(time.Now())
+	changed := (p.Visibility != nil && *p.Visibility != s.Visibility) || (p.Listed != nil && *p.Listed != s.Listed)
 	if p.Visibility != nil {
 		s.Visibility = *p.Visibility
 	}
 	if p.Listed != nil {
 		s.Listed = *p.Listed
 	}
-	s.UpdatedAt = micro(time.Now())
+	s.UpdatedAt = now
 	m.mcp[serverID] = s
+	if changed {
+		m.touchMCPVersions(serverID, now)
+	}
 	m.appendAudit(audit)
 	return m.mcpOut(s), nil
 }
@@ -378,6 +403,36 @@ func (m *Memory) SearchMCP(_ context.Context, q model.MCPQuery) ([]model.MCPEntr
 	})
 	if q.Limit > 0 && len(out) > q.Limit {
 		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+// touchMCPVersions stamps every version of a server. A change to who may see
+// the server changes what each version's listing entry says, and readers
+// that sync incrementally by updated_at must see it.
+func (m *Memory) touchMCPVersions(serverID int64, at time.Time) {
+	for id, v := range m.mcpVers {
+		if v.ServerID == serverID {
+			v.UpdatedAt = at
+			m.mcpVers[id] = v
+		}
+	}
+}
+
+// ListMirroredMCP implements Store.
+func (m *Memory) ListMirroredMCP(_ context.Context, upstreamID int64, afterName string, limit int) ([]model.MCPServer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []model.MCPServer
+	for _, s := range m.mcp {
+		if upstreamID == 0 || m.ns[s.Namespace].UpstreamID != upstreamID || s.Name <= afterName {
+			continue
+		}
+		out = append(out, m.mcpOut(s))
+	}
+	slices.SortFunc(out, func(a, b model.MCPServer) int { return strings.Compare(a.Name, b.Name) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

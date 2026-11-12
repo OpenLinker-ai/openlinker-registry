@@ -26,6 +26,7 @@ func runHardening(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("forwarding serves only callers who could see the result", func(t *testing.T) { runForwardAudience(t, newStore) })
 	t.Run("hostile upstream data", func(t *testing.T) { runHostileUpstream(t, newStore) })
 	t.Run("mcp sync", func(t *testing.T) { runMCPSyncRules(t, newStore) })
+	t.Run("skill sync", func(t *testing.T) { runSkillSyncRules(t, newStore) })
 	t.Run("limits and error formats", func(t *testing.T) { runLimitsAndFormats(t, newStore) })
 }
 
@@ -110,31 +111,111 @@ func runMirrorVisibility(t *testing.T, newStore func(t *testing.T) store.Store) 
 		t.Errorf("discovery index: %s", got)
 	}
 
-	// The same holds when the upstream is configured by protocol only.
+	// An openlinker-registry configured as a plain MCP registry is refused:
+	// that kind cannot follow per-entry visibility.
 	plain := NewEnv(t, newStore(t), Options{Loopback: true, UpstreamTokens: map[string]string{"hub": owner}})
 	plain.Expect(plain.upstream(map[string]any{"name": "hub", "kind": "mcp-registry", "base_url": up.Base, "visibility": "public"}), 201, "upstream")
-	if s := plain.sync("hub"); s["last_status"] != "ok" {
-		t.Fatalf("sync: %v", s)
+	if s := plain.sync("hub"); s["last_status"] != "failed" || !strings.Contains(s["last_error"].(string), "openlinker-registry") {
+		t.Fatalf("sync of an openlinker-registry as mcp-registry: %v", s)
 	}
-	if got := names(plain.Do("GET", "/v0.1/servers", "", "", nil), "servers", "name"); got != "com.acme/open-mcp" {
-		t.Errorf("anonymous mcp listing through an mcp-registry upstream: %s", got)
+	if got := servers(plain.Do("GET", "/v0.1/servers?include_deleted=true", AdminToken, "", nil)); len(got) != 0 {
+		t.Fatalf("nothing may be mirrored through the wrong kind: %d entries", len(got))
 	}
-	plain.Expect(plain.Do("GET", "/v0.1/servers/com.acme%2Fsecret-mcp/versions/latest", AdminToken, "", nil), 404, "private entry through an mcp-registry upstream")
 
-	// Restrictions applied upstream later follow at the next sync.
+	// --- restrictions applied upstream later ---
+	artifact := func(name, version, token string) int {
+		return down.Do("GET", "/v1/skills/com.acme/"+name+"/versions/"+version+"/artifact", token, "", nil).Status
+	}
+	// Pull the bytes once so they are cached here.
+	if artifact("open", "1.0.0", "") != 200 || artifact("quiet", "1.0.0", "") != 200 {
+		t.Fatal("public mirrored content must be readable")
+	}
+
+	// 1. Without waiting for a sync: the upstream restricts a skill and a
+	// server and publishes a new version of each. Asking for the new version
+	// refreshes the entry, and the answer must follow the new restriction.
 	up.Expect(up.Do("PATCH", "/v1/skills/com.acme/open", owner, "", map[string]any{"visibility": "internal"}), 200, "restrict upstream skill")
-	up.Expect(up.Do("PATCH", "/v1/mcp/servers/com.acme/open-mcp", owner, "", map[string]any{"visibility": "private"}), 200, "hide upstream mcp")
+	up.Expect(up.Do("POST", "/v1/skills/com.acme/open/versions?version=2.0.0", owner, "text/markdown", md("open", "Skill open v2", "MIT")), 201, "new version")
+	if got := down.Do("GET", "/v1/skills/com.acme/open/versions/2.0.0", "", "", nil); got.Status != 404 {
+		t.Fatalf("a version published after the skill was restricted is shown to anonymous callers: %d %s", got.Status, got.Body)
+	}
+	if a, b := artifact("open", "2.0.0", ""), artifact("open", "1.0.0", ""); a != 404 || b != 404 {
+		t.Fatalf("restricted skill content to anonymous callers: v2 %d, v1 %d", a, b)
+	}
+	if a, b := skillStatus("open", ""), artifact("open", "2.0.0", reader); a != 404 || b != 200 {
+		t.Fatalf("restricted skill: anonymous %d, authenticated v2 artifact %d", a, b)
+	}
+	up.Expect(up.Do("PATCH", "/v1/mcp/servers/com.acme/open-mcp", owner, "", map[string]any{"visibility": "internal"}), 200, "restrict upstream mcp")
+	mcpPost("open-mcp-next", "")
+	up.Expect(up.Do("POST", "/v1/mcp/servers/com.acme", owner, "application/json", serverJSON("com.acme/open-mcp", "2.0.0", "https://open-mcp.acme.example/mcp")), 201, "new mcp version")
+	v2 := "/v0.1/servers/" + url.PathEscape("com.acme/open-mcp") + "/versions/2.0.0"
+	if a, b := down.Do("GET", v2, "", "", nil).Status, down.Do("GET", v2, reader, "", nil).Status; a != 404 || b != 200 {
+		t.Fatalf("new version of a restricted server: anonymous %d, authenticated %d", a, b)
+	}
+	if a := mcpStatus("open-mcp", ""); a != 404 {
+		t.Fatalf("restricted server is still public here: %d", a)
+	}
+
+	// 2. At the next sync. "quiet" is unlisted upstream, so no listing shows
+	// it: the mirror has to look at every entry it holds.
+	up.Expect(up.Do("PATCH", "/v1/skills/com.acme/quiet", owner, "", map[string]any{"visibility": "internal"}), 200, "restrict unlisted skill")
+	up.Expect(up.Do("PATCH", "/v1/skills/com.acme/staff", owner, "", map[string]any{"visibility": "private"}), 200, "make skill private")
+	up.Expect(up.Do("PATCH", "/v1/mcp/servers/com.acme/staff-mcp", owner, "", map[string]any{"listed": false}), 200, "unlist upstream mcp")
+	up.Expect(up.Do("PATCH", "/v1/mcp/servers/com.acme/quiet-mcp", owner, "", map[string]any{"visibility": "private"}), 200, "make unlisted mcp private")
 	if s = down.sync("hub"); s["last_status"] != "ok" {
 		t.Fatalf("second sync: %v", s)
 	}
-	if a, b := skillStatus("open", ""), skillStatus("open", reader); a != 404 || b != 200 {
-		t.Errorf("skill restricted upstream: anonymous %d, authenticated %d", a, b)
+	if a, b := skillStatus("quiet", ""), skillStatus("quiet", reader); a != 404 || b != 200 {
+		t.Errorf("unlisted skill restricted upstream: anonymous %d, authenticated %d", a, b)
 	}
-	if a := mcpStatus("open-mcp", ""); a != 404 {
-		t.Errorf("mcp server hidden upstream is still public here: %d", a)
+	if a := artifact("quiet", "1.0.0", ""); a != 404 {
+		t.Errorf("cached bytes of a restricted skill are still public: %d", a)
 	}
-	if got := names(down.Do("GET", "/v0.1/servers", reader, "", nil), "servers", "name"); strings.Contains(got, "open-mcp") {
-		t.Errorf("mcp server hidden upstream is still listed: %s", got)
+	// An entry the upstream made private is withdrawn: ordinary callers can
+	// read neither its metadata nor its cached content.
+	if a, b, c := skillStatus("staff", reader), artifact("staff", "1.0.0", reader), mcpStatus("quiet-mcp", reader); a != 404 || b != 404 || c != 404 {
+		t.Errorf("withdrawn entries: skill %d, artifact %d, mcp %d", a, b, c)
+	}
+	if got := names(down.Do("GET", "/v0.1/servers", reader, "", nil), "servers", "name"); strings.Contains(got, "staff-mcp") {
+		t.Errorf("a server unlisted upstream is still listed: %s", got)
+	}
+	if a := mcpStatus("staff-mcp", reader); a != 200 {
+		t.Errorf("an unlisted server stays readable by name: %d", a)
+	}
+	// Shared again upstream, it comes back.
+	up.Expect(up.Do("PATCH", "/v1/skills/com.acme/staff", owner, "", map[string]any{"visibility": "internal"}), 200, "share again")
+	if s = down.sync("hub"); s["last_status"] != "ok" {
+		t.Fatalf("third sync: %v", s)
+	}
+	if a, b := skillStatus("staff", reader), artifact("staff", "1.0.0", reader); a != 200 || b != 200 {
+		t.Errorf("a skill shared again must return: metadata %d, artifact %d", a, b)
+	}
+
+	// 3. A mirror that is not a member upstream sees a restricted entry
+	// simply disappear (404); it is withdrawn here as well.
+	outsider := up.token([]string{"skills:read"}, nil)
+	far := NewEnv(t, newStore(t), Options{Loopback: true, UpstreamTokens: map[string]string{"hub": outsider}})
+	far.Expect(far.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base, "visibility": "public"}), 201, "upstream")
+	mcpPost("temp-mcp", "")
+	post("temp", "")
+	if s := far.sync("hub"); s["last_status"] != "ok" {
+		t.Fatalf("outsider sync: %v", s)
+	}
+	farRead := func(path string) int { return far.Do("GET", path, "", "", nil).Status }
+	tempArtifact, tempMCP := "/v1/skills/com.acme/temp/versions/1.0.0/artifact", "/v0.1/servers/com.acme%2Ftemp-mcp/versions/latest"
+	if farRead(tempArtifact) != 200 || farRead(tempMCP) != 200 {
+		t.Fatal("outsider mirror must serve public entries")
+	}
+	up.Expect(up.Do("PATCH", "/v1/skills/com.acme/temp", owner, "", map[string]any{"visibility": "private"}), 200, "hide skill")
+	up.Expect(up.Do("PATCH", "/v1/mcp/servers/com.acme/temp-mcp", owner, "", map[string]any{"visibility": "private"}), 200, "hide mcp")
+	if s := far.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_withdrawn") != 1 || stat(s, "mcp_withdrawn") != 1 {
+		t.Fatalf("outsider sync after the upstream hid entries: %v", s)
+	}
+	farReader := far.token([]string{"skills:read"}, nil)
+	for _, path := range []string{"/v1/skills/com.acme/temp", tempArtifact, tempMCP} {
+		if a, b := farRead(path), far.Do("GET", path, farReader, "", nil).Status; a != 404 || b != 404 {
+			t.Errorf("%s after the upstream hid it: anonymous %d, authenticated %d", path, a, b)
+		}
 	}
 }
 
@@ -318,7 +399,7 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		up.Expect(up.publishMCP(pub, "com.acme", serverJSON("com.acme/multi", "2.0.0", "https://multi.acme.example/mcp")), 201, "publish")
 
 		down := NewEnv(t, newStore(t), Options{Loopback: true})
-		down.Expect(down.upstream(map[string]any{"name": "official", "kind": "mcp-registry", "base_url": up.Base, "latest_only": true, "visibility": "public"}), 201, "upstream")
+		down.Expect(down.upstream(map[string]any{"name": "official", "kind": "openlinker-registry", "base_url": up.Base, "latest_only": true, "visibility": "public"}), 201, "upstream")
 		if s := down.sync("official"); s["last_status"] != "ok" || stat(s, "mcp_created") != 2 {
 			t.Fatalf("first sync: %v", s)
 		}
@@ -466,4 +547,146 @@ func sparseEntry(t *testing.T, data []byte) *tar.Header {
 		t.Fatal(err)
 	}
 	return hdr
+}
+
+// runSkillSyncRules covers how skills of another registry are mirrored.
+func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
+	t.Run("all versions in upstream order", func(t *testing.T) {
+		// More versions than fit one page of anything: every one is
+		// mirrored, in the upstream's order, and each is addressable.
+		up := NewEnv(t, newStore(t), Options{})
+		up.namespace("com.acme", "domain")
+		pub := up.publisher("com.acme")
+		const n = 103
+		for i := 1; i <= n; i++ {
+			up.Expect(up.Do("POST", fmt.Sprintf("/v1/skills/com.acme/many/versions?version=v%d", i), pub, "text/markdown",
+				md("many", fmt.Sprintf("Revision %d", i), "MIT")), 201, "upstream version")
+		}
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		r := down.Expect(down.Do("GET", "/v1/skills/com.acme/many", "", "", nil), 200, "forwarded skill")
+		versions := r.JSON["versions"].([]any)
+		if r.JSON["latest_version"] != fmt.Sprintf("v%d", n) || len(versions) != n {
+			t.Fatalf("mirrored %d versions, latest %v", len(versions), r.JSON["latest_version"])
+		}
+		for i, item := range versions { // newest first, like upstream
+			if got, want := item.(map[string]any)["version"], fmt.Sprintf("v%d", n-i); got != want {
+				t.Fatalf("version %d is %v, want %s", i, got, want)
+			}
+		}
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/many/versions/v1/artifact", "", "", nil), 200, "oldest version")
+	})
+
+	t.Run("one bad entry does not stop a sync", func(t *testing.T) {
+		good := md("good", "Good skill", "MIT")
+		version := func(name string) map[string]any {
+			return map[string]any{"namespace": "com.mixed", "name": name, "version": "1", "mode": "hosted",
+				"frontmatter": map[string]any{"name": name, "description": "d"}, "license": map[string]any{"kind": "spdx", "id": "MIT"},
+				"core_compatible": true, "files": []map[string]any{{"path": "SKILL.md", "size": len(good), "sha256": strings.TrimPrefix(sha(good), "sha256:")}},
+				"artifact":       map[string]any{"type": "skill-md", "digest": sha(good), "size": len(good)},
+				"content_access": map[string]any{"full_text": true, "artifact": true}}
+		}
+		detail := func(name string) map[string]any {
+			return map[string]any{"namespace": "com.mixed", "name": name, "status": "active", "mode": "hosted", "visibility": "public",
+				"listed": true, "latest_version": "1", "versions": []map[string]any{{"version": "1", "yanked": false}}}
+		}
+		failSkills := false
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/v1/skills":
+				if failSkills {
+					w.WriteHeader(500)
+					return
+				}
+				// A malformed item, a skill with a malformed detail, a skill
+				// with a malformed version, and a good one.
+				_, _ = w.Write([]byte(`{"skills":[{"namespace":"com.mixed","name":"stamp","updated_at":"not a time"},` +
+					`{"namespace":"com.mixed","name":"baddetail"},{"namespace":"com.mixed","name":"badversion"},{"namespace":"com.mixed","name":"good"}]}`))
+			case "/v1/skills/com.mixed/baddetail":
+				_, _ = w.Write([]byte(`{"namespace":"com.mixed","name":"baddetail","versions":"none"}`))
+			case "/v1/skills/com.mixed/badversion":
+				_ = enc.Encode(detail("badversion"))
+			case "/v1/skills/com.mixed/badversion/versions/1":
+				_, _ = w.Write([]byte(`{"namespace":"com.mixed","name":"badversion","version":"1","files":"none"}`))
+			case "/v1/skills/com.mixed/good":
+				_ = enc.Encode(detail("good"))
+			case "/v1/skills/com.mixed/good/versions/1":
+				_ = enc.Encode(version("good"))
+			case "/v0.1/servers":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{{"server": map[string]any{"name": "com.mixed/server", "description": "d",
+					"version": "1.0.0", "remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+					"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true},
+						metaEntry: map[string]any{"visibility": "public", "listed": true}}}}})
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not found"}}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "mixed", "kind": "openlinker-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		s := e.sync("mixed")
+		if s["last_status"] != "ok" || stat(s, "skills_created") != 1 || stat(s, "mcp_created") != 1 || stat(s, "skills_skipped") < 2 {
+			t.Fatalf("sync with malformed entries: %v", s)
+		}
+		e.Expect(e.Do("GET", "/v1/skills/com.mixed/good", "", "", nil), 200, "the good skill")
+		// When the skill listing itself fails, MCP servers are still synced.
+		failSkills = true
+		fresh := NewEnv(t, newStore(t), Options{Loopback: true})
+		fresh.Expect(fresh.upstream(map[string]any{"name": "mixed", "kind": "openlinker-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		r := fresh.Expect(fresh.Do("POST", "/v1/admin/upstreams/mixed/sync?wait=true", AdminToken, "", nil), 200, "sync")
+		if s := r.JSON["sync"].(map[string]any); s["last_status"] != "failed" || stat(s, "mcp_created") != 1 {
+			t.Fatalf("a failed skill listing must not keep MCP servers from syncing: %v", s)
+		}
+	})
+
+	t.Run("official registry without a usable cursor", func(t *testing.T) {
+		// The upstream reports no timestamps, so there is never a cursor and
+		// every run is a full latest-only listing. A server whose only
+		// version is deleted, and one that is gone, drop out of that listing;
+		// the mirror must notice both.
+		entry := func(name, status string, latest bool) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": "1.0.0",
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": latest}}}
+		}
+		later := false
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch {
+			case r.URL.Path == "/v0.1/servers" && !later:
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/deleted", "active", true),
+					entry("com.feed/gone", "active", true), entry("com.feed/kept", "active", true)}})
+			case r.URL.Path == "/v0.1/servers":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/kept", "active", true)}})
+			case later && r.URL.EscapedPath() == "/v0.1/servers/com.feed%2Fdeleted/versions":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/deleted", "deleted", false)}})
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "latest_only": true, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_created") != 3 || s["cursor"] != nil {
+			t.Fatalf("first sync: %v", s)
+		}
+		later = true
+		if s := e.sync("feed"); s["last_status"] != "ok" {
+			t.Fatalf("second sync: %v", s)
+		}
+		if got := servers(e.Do("GET", "/v0.1/servers", "", "", nil)); len(got) != 1 || got[0]["server"].(map[string]any)["name"] != "com.feed/kept" {
+			t.Fatalf("servers deleted or gone upstream are still listed: %d", len(got))
+		}
+		for _, name := range []string{"deleted", "gone"} {
+			r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2F"+name+"/versions/1.0.0", "", "", nil), 200, name)
+			if official(r.JSON)["status"] != "deleted" {
+				t.Fatalf("%s: %s", name, r.Body)
+			}
+		}
+	})
 }

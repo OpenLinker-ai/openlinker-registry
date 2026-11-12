@@ -134,10 +134,6 @@ func TestListSkillsBadResponses(t *testing.T) {
 	for _, body := range []string{
 		`{"next_cursor":null}`,
 		`{"skills":{}}`,
-		`{"skills":[{"namespace":"io.github.alice"}]}`,
-		`{"skills":[{"name":"demo"}]}`,
-		`{"skills":[{"namespace":"io.github.alice","name":"demo","updated_at":"SECRET-BODY-MARKER"}]}`,
-		`{"skills":["SECRET-BODY-MARKER"]}`,
 		`{"skills":[],"next_cursor":"cur"}`, // does not advance
 		`[]`, `SECRET-BODY-MARKER`,
 	} {
@@ -147,6 +143,16 @@ func TestListSkillsBadResponses(t *testing.T) {
 			t.Errorf("%s: %v %q %v, want bad_response", body, items, next, err)
 		} else if strings.Contains(err.Error(), "SECRET-BODY-MARKER") {
 			t.Errorf("error echoes the body: %v", err)
+		}
+	}
+	// One malformed entry is skipped; it does not hide its neighbours.
+	const good = `{"namespace":"io.github.alice","name":"good"}`
+	for _, bad := range []string{`{"namespace":"io.github.alice"}`, `{"name":"demo"}`, `"SECRET-BODY-MARKER"`,
+		`{"namespace":"io.github.alice","name":"demo","updated_at":"SECRET-BODY-MARKER"}`} {
+		f := newFake(t, func(w http.ResponseWriter, r *http.Request) { writeJSON(w, `{"skills":[`+bad+`,`+good+`]}`) })
+		items, _, err := newClient(f.URL).ListSkills(ctx, "", 0)
+		if err != nil || len(items) != 1 || items[0].Name != "good" {
+			t.Errorf("%s: %+v %v, want only the good entry", bad, items, err)
 		}
 	}
 	// Empty and null lists are fine.

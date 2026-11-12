@@ -257,6 +257,17 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 		s = model.Skill{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Visibility: in.Visibility, Listed: in.Listed,
 			Status: model.StatusActive, Mode: in.Mode, SourceKey: in.SourceKey, CreatedAt: now}
 	}
+	if in.ExpectNewest != nil {
+		newest := ""
+		if ok {
+			if vs := m.versionsOf(s.ID); len(vs) > 0 {
+				newest = vs[0].Version
+			}
+		}
+		if newest != *in.ExpectNewest {
+			return model.Skill{}, model.Version{}, conflict("version_order", "the newest version is not the expected one")
+		}
+	}
 	v := in.Version
 	v.ID, v.SkillID, v.CreatedAt, v.Mode = m.id(), s.ID, now, in.Mode
 	v.Files = slices.Clone(v.Files)
@@ -504,6 +515,32 @@ func (m *Memory) ListAudit(_ context.Context, limit int) ([]model.AuditEvent, er
 	defer m.mu.Unlock()
 	out := slices.Clone(m.audit)
 	slices.Reverse(out)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListMirroredSkills implements Store.
+func (m *Memory) ListMirroredSkills(_ context.Context, upstreamID int64, afterNS, afterName string, limit int) ([]model.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []model.Skill
+	for _, s := range m.skills {
+		if upstreamID == 0 || m.ns[s.Namespace].UpstreamID != upstreamID {
+			continue
+		}
+		if s.Namespace < afterNS || (s.Namespace == afterNS && s.Name <= afterName) {
+			continue
+		}
+		out = append(out, m.withUpstream(s))
+	}
+	slices.SortFunc(out, func(a, b model.Skill) int {
+		if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}

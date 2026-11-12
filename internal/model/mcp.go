@@ -84,13 +84,15 @@ type MCPPublishInput struct {
 }
 
 // MCPMirrorInput upserts one version mirrored from an upstream. The namespace
-// row is created (kind "upstream") when missing.
+// row is created (kind "upstream") when missing. Visibility and Listed are
+// how widely the upstream allows the server to be shown; they are applied to
+// an existing server too, in the same transaction as the version.
 type MCPMirrorInput struct {
 	UpstreamID int64
 	Namespace  string
 	Name       string
-	Visibility string // used only when creating the server
-	Listed     bool   // used only when creating the server
+	Visibility string
+	Listed     bool
 	Version    MCPVersion
 }
 

@@ -13,6 +13,7 @@ package mcp
 import (
 	"fmt"
 	"maps"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -251,10 +252,14 @@ func stripRegistryMeta(root map[string]any) {
 // With redact set, literals are deleted in place (a literal value takes the
 // default with it) and "" is returned. Otherwise nothing is modified and the
 // path of the first literal, in key order, is returned.
-func scrubSecrets(v any, redact bool) (path string) {
+func scrubSecrets(v any, redact bool) (path string) { return scrubSecretsNamed(v, "", redact) }
+
+// scrubSecretsNamed is scrubSecrets for a value found under the given key of
+// a "variables" object ("" elsewhere): there the key is the input's name.
+func scrubSecretsNamed(v any, key string, redact bool) (path string) {
 	switch t := v.(type) {
 	case map[string]any:
-		if secret, _ := t["isSecret"].(bool); secret || credentialName(t["name"]) {
+		if secret, _ := t["isSecret"].(bool); secret || credentialName(t["name"]) || credentialName(key) {
 			valueLiteral, defaultLiteral := isLiteral(t["value"]), isLiteral(t["default"])
 			switch {
 			case redact && valueLiteral:
@@ -269,7 +274,18 @@ func scrubSecrets(v any, redact bool) (path string) {
 			}
 		}
 		for _, k := range slices.Sorted(maps.Keys(t)) {
-			if sub := scrubSecrets(t[k], redact); sub != "" {
+			var sub string
+			if vars, ok := t[k].(map[string]any); ok && k == "variables" {
+				for _, name := range slices.Sorted(maps.Keys(vars)) {
+					if inner := scrubSecretsNamed(vars[name], name, redact); inner != "" {
+						sub = name + "." + inner
+						break
+					}
+				}
+			} else {
+				sub = scrubSecretsNamed(t[k], "", redact)
+			}
+			if sub != "" {
 				if strings.HasPrefix(sub, "[") {
 					return k + sub
 				}
@@ -278,7 +294,7 @@ func scrubSecrets(v any, redact bool) (path string) {
 		}
 	case []any:
 		for i, e := range t {
-			if sub := scrubSecrets(e, redact); sub != "" {
+			if sub := scrubSecretsNamed(e, "", redact); sub != "" {
 				if strings.HasPrefix(sub, "[") {
 					return fmt.Sprintf("[%d]%s", i, sub)
 				}
@@ -323,19 +339,57 @@ var urlKeys = map[string]bool{"url": true, "src": true, "websiteUrl": true, "reg
 // the host are covered too.
 var userinfoRe = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@\s]*@`)
 
-// scrubURLCredentials enforces that no URL in the document embeds userinfo
-// ("https://user:password@host/"), which is how access tokens end up in
-// published metadata. With redact set the userinfo is removed in place and
-// "" is returned; otherwise the path of the first such URL is returned.
+// urlCredentials reports whether a URL carries credentials: userinfo, or a
+// query parameter named like a credential with a literal value
+// ("?api_key=live-secret"; "?api_key={key}" refers to a variable and is
+// fine). clean is the URL without them.
+func urlCredentials(raw string) (clean string, found bool) {
+	clean = raw
+	if userinfoRe.MatchString(clean) {
+		clean, found = userinfoRe.ReplaceAllString(clean, "$1"), true
+	}
+	head, rest, hasQuery := strings.Cut(clean, "?")
+	if !hasQuery {
+		return clean, found
+	}
+	query, fragment, hasFragment := strings.Cut(rest, "#")
+	var kept []string
+	for _, param := range strings.Split(query, "&") {
+		name, value, _ := strings.Cut(param, "=")
+		if decoded, err := url.QueryUnescape(name); err == nil {
+			name = decoded
+		}
+		if credentialName(name) && isLiteral(value) {
+			found = true
+			continue
+		}
+		kept = append(kept, param)
+	}
+	clean = head
+	if len(kept) > 0 {
+		clean += "?" + strings.Join(kept, "&")
+	}
+	if hasFragment {
+		clean += "#" + fragment
+	}
+	return clean, found
+}
+
+// scrubURLCredentials enforces that no URL in the document carries
+// credentials (see urlCredentials), which is how access tokens end up in
+// published metadata. With redact set they are removed in place and "" is
+// returned; otherwise the path of the first such URL is returned.
 func scrubURLCredentials(v any, redact bool) (path string) {
 	switch t := v.(type) {
 	case map[string]any:
 		for _, k := range slices.Sorted(maps.Keys(t)) {
-			if s, ok := t[k].(string); ok && urlKeys[k] && userinfoRe.MatchString(s) {
-				if !redact {
-					return k
+			if s, ok := t[k].(string); ok && urlKeys[k] {
+				if clean, found := urlCredentials(s); found {
+					if !redact {
+						return k
+					}
+					t[k] = clean
 				}
-				t[k] = userinfoRe.ReplaceAllString(s, "$1")
 				continue
 			}
 			if sub := scrubURLCredentials(t[k], redact); sub != "" {

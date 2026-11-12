@@ -461,10 +461,14 @@ func clip(s string, max int) string {
 // bytes are the canonical form, so the digest is this registry's own.
 //
 // An openlinker-registry upstream states how widely it shows each entry, and
-// the mirror never shows it more widely (see mirrorVisibility). With
-// onlyExisting the document is applied only to a version that is already
-// mirrored; the outcome is then "ignored" for anything else.
+// the mirror never shows it more widely (see mirrorVisibility): visibility
+// and listing are written together with the version. With onlyExisting the
+// document is applied only to a version that is already mirrored; the
+// outcome is then "ignored" for anything else.
 func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.MCPDoc, onlyExisting bool) (string, error) {
+	if u.Kind == model.UpstreamMCP && doc.Visibility != "" {
+		return "", errUpstreamKind
+	}
 	p, err := mcp.Parse(doc.Server, mcp.Options{})
 	if err != nil {
 		return "", err
@@ -476,19 +480,20 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 		return "", fail(http.StatusForbidden, "namespace_not_allowed", "namespace is not allowed for this upstream")
 	}
 	actor := "upstream:" + u.Name
-	visibility, listed, stated := u.Visibility, true, false
-	// The official registry states no visibility (everything it serves is
-	// public). An openlinker-registry always does, whichever kind it was
-	// configured as, and one that does not is not trusted to be public.
-	if u.Kind == model.UpstreamRegistry || doc.Visibility != "" {
+	visibility, listed := u.Visibility, true
+	if u.Kind == model.UpstreamRegistry {
 		var ok bool
 		if visibility, ok = mirrorVisibility(u, doc.Visibility); !ok {
-			if err := s.restrictMCP(ctx, u, p.Name); err != nil {
+			if srv, err := s.Store.GetMCPServer(ctx, p.Name); err == nil {
+				if err := s.withdrawMCP(ctx, u, srv, syncStats{}); err != nil {
+					return "", err
+				}
+			} else if !errors.Is(err, model.ErrNotFound) {
 				return "", err
 			}
 			return "", fail(http.StatusForbidden, "upstream_private", "the upstream does not share this entry")
 		}
-		listed, stated = !doc.Unlisted, true
+		listed = !doc.Unlisted
 	}
 	if onlyExisting {
 		srv, err := s.Store.GetMCPServer(ctx, p.Name)
@@ -509,54 +514,12 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 	if status == model.MCPStatusActive {
 		msg = ""
 	}
-	outcome, err := s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: p.Namespace, Name: p.Name,
+	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: p.Namespace, Name: p.Name,
 		Visibility: visibility, Listed: listed, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
 			Status: status, StatusMessage: msg, StatusChangedAt: doc.StatusChangedAt, PublishedAt: doc.PublishedAt,
 			IsLatest: doc.IsLatest && status != model.MCPStatusDeleted, CreatedBy: actor}},
-		auditEvent(actor, "mcp.mirror", p.Namespace, p.Name+"@"+p.Version, map[string]any{"digest": p.Digest, "status": status, "upstream": u.Name}))
-	if err != nil || !stated || outcome == model.MirrorCreated {
-		return outcome, err
-	}
-	// Visibility and listing are set when the server is created; follow later
-	// changes upstream.
-	srv, err := s.Store.GetMCPServer(ctx, p.Name)
-	if err != nil {
-		return "", err
-	}
-	if srv.Visibility != visibility || srv.Listed != listed {
-		if _, err := s.Store.UpdateMCPServer(ctx, srv.ID, model.MCPPatch{Visibility: &visibility, Listed: &listed},
-			auditEvent(actor, "mcp.update", srv.Namespace, srv.Name, map[string]any{"visibility": visibility, "listed": listed})); err != nil {
-			return "", err
-		}
-		if outcome == model.MirrorUnchanged {
-			outcome = model.MirrorUpdated
-		}
-	}
-	return outcome, nil
-}
-
-// restrictMCP withdraws a mirrored server the upstream stopped sharing: it
-// leaves listings and anonymous reach and its versions are marked deleted.
-func (s *Service) restrictMCP(ctx context.Context, u model.Upstream, name string) error {
-	srv, err := s.Store.GetMCPServer(ctx, name)
-	if errors.Is(err, model.ErrNotFound) || (err == nil && srv.Upstream != u.Name) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	actor := "upstream:" + u.Name
-	const reason = "no longer shared by the upstream registry"
-	if srv.Listed || srv.Visibility == model.VisibilityPublic {
-		internal, unlisted := model.VisibilityInternal, false
-		if _, err := s.Store.UpdateMCPServer(ctx, srv.ID, model.MCPPatch{Visibility: &internal, Listed: &unlisted},
-			auditEvent(actor, "mcp.update", srv.Namespace, srv.Name, map[string]any{"visibility": internal, "listed": false, "reason": reason})); err != nil {
-			return err
-		}
-	}
-	_, err = s.Store.SetMCPStatus(ctx, srv.ID, "", model.MCPStatusDeleted, reason, s.Now(),
-		auditEvent(actor, "mcp.status", srv.Namespace, srv.Name, map[string]any{"status": model.MCPStatusDeleted, "message": reason}))
-	return err
+		auditEvent(actor, "mcp.mirror", p.Namespace, p.Name+"@"+p.Version, map[string]any{"digest": p.Digest, "status": status,
+			"visibility": visibility, "upstream": u.Name}))
 }
 
 // ResolveSkill returns a skill, forwarding a local miss to the upstream

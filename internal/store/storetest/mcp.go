@@ -533,7 +533,7 @@ var mcpTests = []testCase{
 
 		// Status, message and latest are mutable; the rest never changes.
 		upd := in
-		upd.Visibility = model.VisibilityPublic // only used at creation
+		upd.Visibility = model.VisibilityPublic // applied to the existing server too
 		upd.Version.Status, upd.Version.StatusMessage = model.MCPStatusActive, "dropped for active"
 		upd.Version.StatusChangedAt, upd.Version.UpdatedAt = published.Add(3*time.Hour), published.Add(4*time.Hour)
 		upd.Version.PublishedAt, upd.Version.CreatedBy = published.Add(99*time.Hour), "someone else"
@@ -543,9 +543,23 @@ var mcpTests = []testCase{
 			!sameTime(v.UpdatedAt, published.Add(4*time.Hour)) || !sameTime(v.PublishedAt, published) || v.CreatedBy != "upstream:up" {
 			t.Fatalf("updated version = %+v", v)
 		}
-		if got := mcpServer(t, st, "org.mirror/Tool"); got.Visibility != model.VisibilityInternal {
-			t.Fatalf("update changed the server: %+v", got)
+		if got := mcpServer(t, st, "org.mirror/Tool"); got.Visibility != model.VisibilityPublic || !got.Listed {
+			t.Fatalf("the input's visibility must be applied with the version: %+v", got)
 		}
+		// Visibility and listing alone are a change, written with its audit
+		// event, even when the version itself is as it was.
+		hide := upd
+		hide.Visibility, hide.Listed = model.VisibilityInternal, false
+		events := auditCount(t, st, "test")
+		mirrorMCP(t, st, hide, model.MirrorUpdated)
+		if got := mcpServer(t, st, "org.mirror/Tool"); got.Visibility != model.VisibilityInternal || got.Listed {
+			t.Fatalf("restriction not applied: %+v", got)
+		}
+		if n := auditCount(t, st, "test"); n != events+1 {
+			t.Fatalf("a settings change must be audited once, got %d new events", n-events)
+		}
+		mirrorMCP(t, st, hide, model.MirrorUnchanged)
+		mirrorMCP(t, st, upd, model.MirrorUpdated)
 		mirrorMCP(t, st, upd, model.MirrorUnchanged)
 		flag := upd
 		flag.Version.IsLatest = false
