@@ -323,6 +323,31 @@ var mirrorTests = []testCase{
 		if v := mcpVersion(t, st, srv.ID, "2.0.0"); v.Status != model.MCPStatusActive {
 			t.Fatalf("new version = %+v", v)
 		}
+		// A version it adds does not take "latest" from one that is here: a
+		// fresh read may have recorded a newer version than the page knew.
+		newest := mirrorInput(up, "org.mirror/latest", "2.0.0")
+		newest.Version.IsLatest = true
+		mirrorMCP(t, st, newest, model.MirrorCreated)
+		old := mirrorInput(up, "org.mirror/latest", "1.0.0")
+		old.Fresh, old.Version.IsLatest = false, true // the page predates 2.0.0
+		mirrorMCP(t, st, old, model.MirrorStale)
+		latestSrv := mcpServer(t, st, "org.mirror/latest")
+		if got := mcpVersion(t, st, latestSrv.ID, "latest"); got.Version != "2.0.0" {
+			t.Fatalf("a stale page moved latest to %s", got.Version)
+		}
+		if got := mcpVersion(t, st, latestSrv.ID, "1.0.0"); got.IsLatest {
+			t.Fatalf("stale version = %+v", got)
+		}
+		// On a server without a latest version it may set one.
+		first := mirrorInput(up, "org.mirror/first", "1.0.0")
+		first.Version.IsLatest = false
+		mirrorMCP(t, st, first, model.MirrorCreated)
+		second := mirrorInput(up, "org.mirror/first", "2.0.0")
+		second.Fresh, second.Version.IsLatest = false, true
+		mirrorMCP(t, st, second, model.MirrorCreated)
+		if got := mcpVersion(t, st, mcpServer(t, st, "org.mirror/first").ID, "latest"); got.Version != "2.0.0" {
+			t.Fatalf("latest = %s", got.Version)
+		}
 		// It may narrow.
 		narrow := mirrorInput(up, "org.mirror/other", "1.0.0")
 		mirrorMCP(t, st, narrow, model.MirrorCreated)

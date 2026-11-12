@@ -50,6 +50,12 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 
 // OpenConfig connects with a prepared pool config.
 func OpenConfig(ctx context.Context, cfg *pgxpool.Config) (*Store, error) {
+	// A mirror lock keeps one connection for as long as it is held, and its
+	// holder needs another one to work with: a pool of one would wait on
+	// itself.
+	if cfg.MaxConns < 2 {
+		return nil, errors.New("the database pool needs at least 2 connections (pool_max_conns)")
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect database: %w", err)

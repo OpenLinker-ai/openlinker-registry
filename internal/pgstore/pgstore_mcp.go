@@ -220,6 +220,18 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 			outcome = model.MirrorUpdated
 			return insertAudit(ctx, tx, audit)
 		}
+		if missing && !created && !in.Fresh && latest {
+			// Nor may a version it adds take "latest" away from one that
+			// is already here: a fresh read may have recorded a newer one.
+			var taken bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM mcp_server_versions WHERE server_id = $1 AND is_latest)`,
+				srv.ID).Scan(&taken); err != nil {
+				return err
+			}
+			if taken {
+				stale, latest = true, false
+			}
+		}
 		if latest {
 			if err := clearMCPLatest(ctx, tx, srv.ID, cur.ID, nil); err != nil {
 				return err

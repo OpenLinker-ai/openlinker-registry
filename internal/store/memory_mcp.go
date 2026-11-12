@@ -232,6 +232,16 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, a
 	if settings {
 		applySettings()
 	}
+	if found && !in.Fresh && latest {
+		// Nor may a version it adds take "latest" away from one that is
+		// already here: a fresh read may have recorded a newer one.
+		for _, other := range m.mcpVers {
+			if other.ServerID == s.ID && other.IsLatest {
+				stale, latest = true, false
+				break
+			}
+		}
+	}
 
 	if createNS {
 		m.createUpstreamNS(ns)

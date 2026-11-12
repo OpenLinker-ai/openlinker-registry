@@ -100,7 +100,7 @@ Secrets are read from the environment only.
 |---|---|---|---|
 | `REGISTRY_LISTEN` | `-listen` | `:8080` | Listen address |
 | `REGISTRY_BASE_PATH` | `-base-path` | `""` | Path prefix such as `/registry` |
-| `REGISTRY_DATABASE_URL` | `-database-url` | required | PostgreSQL DSN |
+| `REGISTRY_DATABASE_URL` | `-database-url` | required | PostgreSQL DSN. The connection pool needs at least 2 connections (`pool_max_conns`, default 4 or the CPU count) |
 | `REGISTRY_STORAGE_DIR` | `-storage-dir` | `./data` | Local content-addressed blob store |
 | `REGISTRY_PUBLIC_URL` | `-public-url` | required | External URL of the registry root; used in discovery URLs. When a base path is set, its path must end with the base path |
 | `REGISTRY_MODE` | `-mode` | `private` | `public` or `private` |

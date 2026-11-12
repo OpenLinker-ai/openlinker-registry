@@ -280,6 +280,13 @@ func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *ups
 		return err
 	}
 	defer release()
+	// The caller's copy was read before the lock was taken; a forwarded read
+	// may have changed the server since.
+	if srv, err = s.Store.GetMCPServer(ctx, srv.Name); errors.Is(err, model.ErrNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	}
 	docs, err := c.ListMCPVersions(ctx, srv.Name)
 	var ue *upstream.Error
 	switch {

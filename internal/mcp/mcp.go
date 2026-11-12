@@ -344,9 +344,10 @@ var (
 func isURLValue(key, value string) bool { return urlKeys[key] || urlRe.MatchString(value) }
 
 // userinfoRe matches the scheme and userinfo of a URL ("https://user:pw@").
-// It works on text, not a parsed URL, so URL templates with {variables} in
-// the host are covered too.
-var userinfoRe = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@\s]*@`)
+// It works on text, not a parsed URL, so URL templates are covered too: with
+// {variables} in the host, and with the scheme itself a {variable}
+// ("{scheme}://user:pw@host").
+var userinfoRe = regexp.MustCompile(`^((?:[a-zA-Z][a-zA-Z0-9+.-]*|\{[a-zA-Z_][a-zA-Z0-9_]*\})://)[^/?#@\s]*@`)
 
 // urlCredentials reports whether a URL carries credentials: userinfo, or a
 // query parameter named like a credential with a literal value
