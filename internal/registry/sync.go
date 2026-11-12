@@ -709,6 +709,21 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			}
 			changed = true
 		}
+		// An upstream that predates these fields does not state them in the
+		// detail. A version it withheld may have become servable; only its
+		// own record tells.
+		if ref.Servable == nil && (v.MirrorServed == nil || !*v.MirrorServed) && v.YankedAt == nil && !ref.Yanked {
+			sv, err := c.GetSkillVersion(ctx, d.Namespace, d.Name, ref.Version)
+			var ue *upstream.Error
+			switch {
+			case err == nil:
+				served, approved := sv.AccessArtifact && sv.AccessFullText, sv.LicenseApproved
+				ref.Servable, ref.LicenseApproved = &served, &approved
+			case errors.Is(err, upstream.ErrNotFound) || errors.As(err, &ue):
+			default:
+				return err
+			}
+		}
 		if ref.LicenseApproved != nil && *ref.LicenseApproved && !v.LicenseApproved {
 			if err := s.Store.ApproveLicense(ctx, v.ID, auditEvent(actor, "license.approve", d.Namespace, target,
 				map[string]any{"reason": "approved upstream"})); err != nil {

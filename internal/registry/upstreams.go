@@ -432,8 +432,18 @@ func (s *Service) forwardMCPTo(ctx context.Context, u model.Upstream, name, vers
 		return false, err
 	}
 	defer release()
-	doc, err := s.client(u).GetMCP(ctx, name, version)
+	c := s.client(u)
+	doc, err := c.GetMCP(ctx, name, version)
 	if errors.Is(err, upstream.ErrNotFound) {
+		// The upstream does not have this version. If the server is
+		// mirrored here, that may be because the upstream stopped sharing
+		// the whole server: look, so that it does not stay readable here
+		// until a sync that may never be scheduled.
+		if srv, lerr := s.Store.GetMCPServer(ctx, name); lerr == nil && srv.Upstream == u.Name {
+			if _, rerr := s.refreshMCPServerLocked(ctx, u, c, name, syncStats{}); rerr != nil && !isUpstreamError(rerr) {
+				return false, rerr
+			}
+		}
 		return false, nil
 	}
 	if err != nil {

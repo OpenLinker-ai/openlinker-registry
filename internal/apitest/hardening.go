@@ -191,6 +191,23 @@ func runMirrorVisibility(t *testing.T, newStore func(t *testing.T) store.Store) 
 		t.Errorf("a skill shared again must return: metadata %d, artifact %d", a, b)
 	}
 
+	// 2b. A mirror that only forwards (no scheduled sync) learns about a
+	// withdrawal when a read is forwarded: asking for a version it does not
+	// have makes it look at the server.
+	lazy := NewEnv(t, newStore(t), Options{Loopback: true})
+	lazy.Expect(lazy.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+	mcpPost("fwd-mcp", "")
+	fwd := "/v0.1/servers/" + url.PathEscape("com.acme/fwd-mcp") + "/versions/"
+	lazy.Expect(lazy.Do("GET", fwd+"1.0.0", "", "", nil), 200, "forwarded server")
+	up.Expect(up.Do("PATCH", "/v1/mcp/servers/com.acme/fwd-mcp", owner, "", map[string]any{"visibility": "private"}), 200, "hide upstream")
+	lazy.Expect(lazy.Do("GET", fwd+"9.9.9", "", "", nil), 404, "version missing upstream")
+	if got := lazy.Do("GET", fwd+"1.0.0", "", "", nil).Status; got != 404 {
+		t.Errorf("a server the upstream stopped sharing is still readable on a forward-only mirror: %d", got)
+	}
+	if got := servers(lazy.Do("GET", "/v0.1/servers", "", "", nil)); len(got) != 0 {
+		t.Errorf("and still listed: %d entries", len(got))
+	}
+
 	// 3. A mirror that is not a member upstream sees a restricted entry
 	// simply disappear (404); it is withdrawn here as well.
 	outsider := up.token([]string{"skills:read"}, nil)
@@ -1044,6 +1061,52 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if s := down.sync("hub"); stat(s, "skills_unchanged") != 1 {
 			t.Fatalf("a further sync must change nothing: %v", s)
 		}
+	})
+
+	t.Run("a license approved on an older upstream", func(t *testing.T) {
+		// An upstream that predates the per-version "servable" field in the
+		// skill detail. The mirror reads the withheld version itself to see
+		// whether it is served now.
+		body := md("old", "Old upstream", "Proprietary")
+		approved := false
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[{"namespace":"com.old","name":"old"}]}`))
+			case "/v1/skills/com.old/old":
+				_ = enc.Encode(map[string]any{"namespace": "com.old", "name": "old", "status": "active", "mode": "indexed", "visibility": "public",
+					"listed": true, "latest_version": "1", "versions": []map[string]any{{"version": "1", "yanked": false}}})
+			case "/v1/skills/com.old/old/versions/1":
+				_ = enc.Encode(map[string]any{"namespace": "com.old", "name": "old", "version": "1", "mode": "indexed",
+					"frontmatter":     map[string]any{"name": "old", "description": "d"},
+					"license":         map[string]any{"kind": "custom", "id": "Proprietary", "approved": approved},
+					"core_compatible": true, "files": []map[string]any{{"path": "SKILL.md", "size": len(body), "sha256": strings.TrimPrefix(sha(body), "sha256:")}},
+					"artifact":       map[string]any{"type": "skill-md", "digest": sha(body), "size": len(body)},
+					"content_access": map[string]any{"full_text": approved, "artifact": approved}})
+			case "/v1/skills/com.old/old/versions/1/artifact":
+				if !approved {
+					w.WriteHeader(403)
+					return
+				}
+				_, _ = w.Write(body)
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not found"}}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "old", "kind": "openlinker-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		e.sync("old")
+		artifact := "/v1/skills/com.old/old/versions/1/artifact"
+		if r := e.Do("GET", artifact, "", "", nil); r.Status != 403 || errCode(r) != "upstream_withheld" {
+			t.Fatalf("withheld content: %d %s", r.Status, r.Body)
+		}
+		approved = true
+		e.sync("old")
+		e.Expect(e.Do("GET", artifact, "", "", nil), 200, "content after the older upstream approved the license")
 	})
 
 	t.Run("a skill yanked upstream with unseen versions", func(t *testing.T) {

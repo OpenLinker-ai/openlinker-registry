@@ -67,6 +67,15 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 		"user name with an at sign": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"packages":[{"registryType":"mcpb","identifier":"https://alice@example.org:` + secret + `@downloads.example/w.mcpb","transport":{"type":"stdio"}}]}`,
+		"scheme-relative": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"//user:` + secret + `@downloads.example/w.mcpb","transport":{"type":"stdio"}}]}`,
+		"scheme-relative in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-mirror":"//u:` + secret + `@mirror.example/w",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"compound scheme": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-db":"jdbc:postgresql://app:` + secret + `@db.example/w",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"fragment parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"websiteUrl":"https://example.com/app#access_token=` + secret + `&state=1",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 		"template scheme": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"{scheme}://user:` + secret + `@mcp.example.com/sse","variables":{"scheme":{"default":"https"}}}]}`,
 		// A remote URL may be a template; it is still a URL.
@@ -94,6 +103,14 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 		if _, err := Parse(p.Canonical, Options{Strict: true}); err != nil {
 			t.Errorf("%s: what lenient stores must pass strict: %v", name, err)
 		}
+	}
+	// Fragments and parameters that are not credentials survive unchanged.
+	plain := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"websiteUrl":"https://example.com/docs?lang=en#install",
+		"remotes":[{"type":"sse","url":"https://mcp.example.com/sse#"}]}`
+	if p, err := Parse([]byte(plain), Options{}); err != nil || !strings.Contains(string(p.Canonical), "docs?lang=en#install") ||
+		!strings.Contains(string(p.Canonical), `"https://mcp.example.com/sse#"`) {
+		t.Fatalf("ordinary URLs must not be rewritten: %v", err)
 	}
 	// Placeholders and ordinary parameters are untouched.
 	ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",

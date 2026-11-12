@@ -338,18 +338,21 @@ func credentialName(v any) bool {
 // or a template starting with a {variable}).
 var (
 	urlKeys = map[string]bool{"url": true, "src": true, "websiteUrl": true, "registryBaseUrl": true, "identifier": true}
-	urlRe   = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*://|\{[a-zA-Z_][a-zA-Z0-9_]*\})`)
+	urlRe   = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.:-]*://|//|\{[a-zA-Z_][a-zA-Z0-9_]*\})`)
 )
 
 func isURLValue(key, value string) bool { return urlKeys[key] || urlRe.MatchString(value) }
 
 // userinfoRe matches the scheme and userinfo of a URL ("https://user:pw@"),
 // through the last "@" of the authority: a user name may itself contain one
-// ("https://alice@example.org:pw@host"), and all of it must go.
+// ("https://alice@example.org:pw@host"), and all of it must go. What is
+// matched is the authority, the part after "//" at the start or after a
+// colon, so the scheme may be missing ("//user:pw@host"), a {variable}, or
+// compound ("jdbc:postgresql://user:pw@host").
 // It works on text, not a parsed URL, so URL templates are covered too: with
 // {variables} in the host, and with the scheme itself a {variable}
 // ("{scheme}://user:pw@host").
-var userinfoRe = regexp.MustCompile(`^((?:[a-zA-Z][a-zA-Z0-9+.-]*|\{[a-zA-Z_][a-zA-Z0-9_]*\})://)[^/?#\s]*@`)
+var userinfoRe = regexp.MustCompile(`((?:^|:)//)[^/?#\s]*@`)
 
 // urlCredentials reports whether a URL carries credentials: userinfo, or a
 // query parameter named like a credential with a literal value
@@ -360,31 +363,44 @@ func urlCredentials(raw string) (clean string, found bool) {
 	if userinfoRe.MatchString(clean) {
 		clean, found = userinfoRe.ReplaceAllString(clean, "$1"), true
 	}
-	head, rest, hasQuery := strings.Cut(clean, "?")
-	if !hasQuery {
-		return clean, found
+	// Parameters travel in the query and, for tokens handed to a client
+	// ("#access_token=..."), in the fragment.
+	base, fragment, hasFragment := strings.Cut(clean, "#")
+	path, query, hasQuery := strings.Cut(base, "?")
+	clean = path
+	if hasQuery {
+		kept, removed := scrubParams(query)
+		found = found || removed
+		if kept != "" {
+			clean += "?" + kept
+		}
 	}
-	query, fragment, hasFragment := strings.Cut(rest, "#")
-	var kept []string
-	for _, param := range strings.Split(query, "&") {
+	if hasFragment {
+		kept, removed := scrubParams(fragment)
+		found = found || removed
+		if kept != "" || !removed {
+			clean += "#" + kept
+		}
+	}
+	return clean, found
+}
+
+// scrubParams removes "name=value" parameters named like a credential with
+// a literal value from an "&"-separated list.
+func scrubParams(params string) (kept string, removed bool) {
+	var out []string
+	for _, param := range strings.Split(params, "&") {
 		name, value, _ := strings.Cut(param, "=")
 		if decoded, err := url.QueryUnescape(name); err == nil {
 			name = decoded
 		}
 		if credentialName(name) && isLiteral(value) {
-			found = true
+			removed = true
 			continue
 		}
-		kept = append(kept, param)
+		out = append(out, param)
 	}
-	clean = head
-	if len(kept) > 0 {
-		clean += "?" + strings.Join(kept, "&")
-	}
-	if hasFragment {
-		clean += "#" + fragment
-	}
-	return clean, found
+	return strings.Join(out, "&"), removed
 }
 
 // scrubURLCredentials enforces that no URL in the document carries
