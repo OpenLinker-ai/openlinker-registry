@@ -688,9 +688,13 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		// one good entry was updated in the past. The watermark may only
 		// follow what was stored.
 		past := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Second)
+		// The good entry carries credentials the way careless publishers
+		// write them; none of them may be stored.
 		entry := func(name, updated string) map[string]any {
 			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": "1.0.0",
-				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse?api_key={key}&token=LEAK-QUERY",
+					"variables": map[string]any{"key": map[string]any{"default": "LEAK-VARIABLE"}},
+					"headers":   []map[string]any{{"name": "Authorization", "value": "Bearer LEAK-HEADER"}}}}},
 				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true, "updatedAt": updated, "publishedAt": updated}}}
 		}
 		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -715,6 +719,12 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		cursor, _ := time.Parse(time.RFC3339Nano, s["cursor"].(string))
 		if !cursor.Equal(past) {
 			t.Fatalf("the watermark is %v; it must be the newest stored update, %v", cursor, past)
+		}
+		for _, path := range []string{"/v0.1/servers/com.good%2Fserver/versions/1.0.0", "/v0.1/servers", "/v1/mcp/servers/com.good/server/versions/1.0.0"} {
+			r := e.Expect(e.Do("GET", path, AdminToken, "", nil), 200, path)
+			if strings.Contains(string(r.Body), "LEAK-") {
+				t.Fatalf("%s serves a credential of the mirrored document: %s", path, r.Body)
+			}
 		}
 	})
 }

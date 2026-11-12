@@ -93,6 +93,12 @@ func runMCP(t *testing.T, e *Env) {
 	if r := e.Expect(e.publishMCP(pub, "com.acme", unflagged), 422, "unflagged credential"); errCode(r) != "secret_value" || strings.Contains(string(r.Body), "hunter2") {
 		t.Fatalf("unflagged credential: %s", r.Body)
 	}
+	// So is a literal behind a placeholder in a credential position.
+	indirect := map[string]any{"name": name, "description": "d", "version": "2.0.0", "remotes": []map[string]any{{"type": "sse",
+		"url": "https://x.example/sse?api_key={key}", "variables": map[string]any{"key": map[string]any{"default": "hunter2"}}}}}
+	if r := e.Expect(e.publishMCP(pub, "com.acme", indirect), 422, "credential behind a placeholder"); errCode(r) != "secret_value" || strings.Contains(string(r.Body), "hunter2") {
+		t.Fatalf("credential behind a placeholder: %s", r.Body)
+	}
 	if r := e.Expect(e.publishMCP(pub, "com.acme", serverJSON(name, "1.0.0", "https://changed.example/mcp")), 409, "republish"); errCode(r) != "version_exists" {
 		t.Fatalf("got %s", r.Body)
 	}

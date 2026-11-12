@@ -278,11 +278,14 @@ func scrubSecretsIn(v any, key string, inherited, redact bool) (path string) {
 				return "default"
 			}
 		}
+		// Variables this object substitutes into the credential positions of
+		// its URLs ("?api_key={key}", "https://{user}@host") are credentials.
+		refs := credentialRefs(t)
 		for _, k := range slices.Sorted(maps.Keys(t)) {
 			var sub string
 			if vars, ok := t[k].(map[string]any); ok && k == "variables" {
 				for _, name := range slices.Sorted(maps.Keys(vars)) {
-					if inner := scrubSecretsIn(vars[name], name, secret, redact); inner != "" {
+					if inner := scrubSecretsIn(vars[name], name, secret || refs[name], redact); inner != "" {
 						sub = name + "." + inner
 						break
 					}
@@ -308,6 +311,39 @@ func scrubSecretsIn(v any, key string, inherited, redact bool) (path string) {
 		}
 	}
 	return ""
+}
+
+// credentialRefs returns the variables an object's URL members refer to
+// from a credential position: the userinfo, or the value of a query or
+// fragment parameter named like a credential.
+func credentialRefs(t map[string]any) map[string]bool {
+	refs := map[string]bool{}
+	add := func(text string) {
+		for _, m := range placeholderRe.FindAllString(text, -1) {
+			refs[m[1:len(m)-1]] = true
+		}
+	}
+	for k, v := range t {
+		s, ok := v.(string)
+		if !ok || !isURLValue(k, s) {
+			continue
+		}
+		add(userinfoRe.FindString(s))
+		base, fragment, _ := strings.Cut(s, "#")
+		_, query, _ := strings.Cut(base, "?")
+		for _, params := range []string{query, fragment} {
+			for _, param := range strings.Split(params, "&") {
+				name, value, _ := strings.Cut(param, "=")
+				if decoded, err := url.QueryUnescape(name); err == nil {
+					name = decoded
+				}
+				if credentialName(name) {
+					add(value)
+				}
+			}
+		}
+	}
+	return refs
 }
 
 // credentialSuffixes end the names of inputs that hold credentials, after

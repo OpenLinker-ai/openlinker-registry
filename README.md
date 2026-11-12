@@ -308,8 +308,10 @@ cookie, so downloads offered by the pages are served under `/ui/` as well. The p
   literal value on an input flagged `isSecret` or named like a credential
   (`Authorization`, `Cookie`, names ending in `token`, `secret`, `password`,
   `api_key`, …, as a header, environment variable, argument or variable
-  name), a URL with userinfo, or a URL query parameter named like a
-  credential. Use a `{variable}` placeholder.
+  name), a URL with userinfo, or a URL query or fragment parameter named
+  like a credential. A `{variable}` placeholder is fine, but the variable
+  it names is then a credential too and may not carry a literal value or
+  default either.
 - **Names.** Skill names are slugs (`[a-z0-9]+(-[a-z0-9]+)*`, max 64).
   Namespaces are lowercase reverse-DNS: `io.github.<login>` (bound to the
   numeric GitHub id, which must be unique), `ai.openlinker.<handle>` (public

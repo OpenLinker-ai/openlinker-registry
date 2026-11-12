@@ -65,6 +65,16 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 		"nested variable of a credential by name": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"stdio"},"environmentVariables":[{"name":"API_KEY",
 			"value":"{a}","variables":{"a":{"value":"{b}","variables":{"b":{"value":"` + secret + `"}}}}}]}]}`,
+		"variable of a credential parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?api_key={key}","variables":{"key":{"default":"` + secret + `"}}}]}`,
+		"variable of a fragment credential": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-app":{"url":"https://app.example.com/start#access_token={t}","variables":{"t":{"value":"{u}","variables":{"u":{"default":"` + secret + `"}}}}},
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"variable in the userinfo": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"sse","url":"http://localhost:{port}/sse",
+			"variables":{"port":{"default":"3000"}}}}],
+			"x-source":{"url":"https://{who}@git.example/w","variables":{"who":{"default":"` + secret + `"}}},
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 		"query parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?region=eu&api_key=` + secret + `"}]}`,
 		// A package identifier is a download URL for some package types.
@@ -118,6 +128,14 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 	if p, err := Parse([]byte(plain), Options{}); err != nil || !strings.Contains(string(p.Canonical), "docs?lang=en#install") ||
 		!strings.Contains(string(p.Canonical), `"https://mcp.example.com/sse#"`) {
 		t.Fatalf("ordinary URLs must not be rewritten: %v", err)
+	}
+	// Variables used elsewhere in a URL are not credentials.
+	host := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"remotes":[{"type":"sse","url":"https://{tenant}.example.com/sse?region={region}&api_key={key}",
+		"variables":{"tenant":{"default":"acme"},"region":{"default":"eu"},"key":{"description":"Your key","isSecret":true}}}]}`
+	if p, err := Parse([]byte(host), Options{Strict: true}); err != nil || !strings.Contains(string(p.Canonical), `"default":"acme"`) ||
+		!strings.Contains(string(p.Canonical), `"default":"eu"`) {
+		t.Fatalf("variables outside credential positions must keep their defaults: %v", err)
 	}
 	// A variable of an input that is not a credential keeps its default.
 	region := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
