@@ -250,6 +250,9 @@ func ensureUpstreamNS(ctx context.Context, tx pgx.Tx, name string, upstreamID in
 func (s *Store) EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error) {
 	var ns model.Namespace
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := contextGuard(ctx, tx); err != nil {
+			return err
+		}
 		var err error
 		ns, err = ensureUpstreamNS(ctx, tx, name, upstreamID, audit)
 		return err

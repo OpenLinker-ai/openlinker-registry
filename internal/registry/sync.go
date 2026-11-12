@@ -44,7 +44,10 @@ func (s *Service) SyncUpstream(ctx context.Context, actor, name string) (model.U
 	}
 	// A sync walks the whole catalogue: when the upstream throttles it, it
 	// waits and goes on instead of failing and starting over.
-	runCtx, cancel := context.WithTimeout(upstream.WithThrottleRetry(ctx), syncTimeout)
+	// Everything the run writes is conditional on the settings it read
+	// (see model.WithUpstreamGuard): if an administrator changes them
+	// meanwhile, the run stops instead of writing by the old ones.
+	runCtx, cancel := context.WithTimeout(model.WithUpstreamGuard(upstream.WithThrottleRetry(ctx), u.ID, u.ConfigVersion), syncTimeout)
 	res := s.runSync(runCtx, u)
 	cancel()
 	// The cursor is only stored if the settings the run read under are

@@ -152,9 +152,12 @@ func (m *Memory) PublishMCPVersion(_ context.Context, in model.MCPPublishInput, 
 
 // UpsertMirroredMCP implements Store. Nothing is written unless every check
 // passes, like the single transaction of the Postgres store.
-func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error) {
+func (m *Memory) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return "", err
+	}
 	if _, ok := m.upstreams[in.UpstreamID]; ok {
 		if err := m.upstreamCurrent(in.UpstreamID, in.ConfigVersion); err != nil {
 			return "", err
@@ -311,9 +314,12 @@ func (m *Memory) ListMCPVersions(_ context.Context, serverID int64) ([]model.MCP
 }
 
 // SetMCPStatus implements Store.
-func (m *Memory) SetMCPStatus(_ context.Context, serverID int64, version, status, message string, at time.Time, audit model.AuditEvent) (int, error) {
+func (m *Memory) SetMCPStatus(ctx context.Context, serverID int64, version, status, message string, at time.Time, audit model.AuditEvent) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return 0, err
+	}
 	if _, ok := m.mcp[serverID]; !ok {
 		return 0, model.ErrNotFound
 	}
@@ -344,9 +350,12 @@ func (m *Memory) SetMCPStatus(_ context.Context, serverID int64, version, status
 }
 
 // UpdateMCPServer implements Store.
-func (m *Memory) UpdateMCPServer(_ context.Context, serverID int64, p model.MCPPatch, audit model.AuditEvent) (model.MCPServer, error) {
+func (m *Memory) UpdateMCPServer(ctx context.Context, serverID int64, p model.MCPPatch, audit model.AuditEvent) (model.MCPServer, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.MCPServer{}, err
+	}
 	s, ok := m.mcp[serverID]
 	if !ok {
 		return model.MCPServer{}, model.ErrNotFound

@@ -163,6 +163,9 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 	latest := v.IsLatest && status != model.MCPStatusDeleted
 	outcome, stale := model.MirrorUnchanged, false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := contextGuard(ctx, tx); err != nil {
+			return err
+		}
 		visibility, err := mirrorGuard(ctx, tx, in.UpstreamID, in.ConfigVersion, in.Visibility)
 		if err != nil {
 			return err

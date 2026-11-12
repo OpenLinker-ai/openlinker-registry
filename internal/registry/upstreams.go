@@ -427,6 +427,7 @@ func (s *Service) forwardMCP(ctx context.Context, viewer model.Viewer, name, ver
 // the server's mirror lock. found is false when the upstream does not have
 // it.
 func (s *Service) forwardMCPTo(ctx context.Context, u model.Upstream, name, version string) (found bool, err error) {
+	ctx = model.WithUpstreamGuard(ctx, u.ID, u.ConfigVersion)
 	release, err := s.Store.LockMirror(ctx, "mcp:"+name)
 	if err != nil {
 		return false, err
@@ -581,7 +582,10 @@ func (s *Service) RefreshMirroredSkill(ctx context.Context, viewer model.Viewer,
 	if err != nil || !u.Enabled || !u.ProxyOnMiss || u.Kind != model.UpstreamRegistry || !viewer.CanSee(sk.Namespace, u.Visibility) {
 		return false, nil
 	}
-	if err := s.refreshSkill(ctx, u, s.client(u), sk.Namespace, sk.Name, syncStats{}); err != nil {
+	if err := s.refreshSkill(model.WithUpstreamGuard(ctx, u.ID, u.ConfigVersion), u, s.client(u), sk.Namespace, sk.Name, syncStats{}); err != nil {
+		if configChanged(err) {
+			return false, nil
+		}
 		if isStoreFailure(err) && !isUpstreamError(err) {
 			return false, err
 		}
@@ -606,7 +610,10 @@ func (s *Service) forwardSkill(ctx context.Context, viewer model.Viewer, ns, nam
 	}
 	unavailable := false
 	for _, u := range targets {
-		if err := s.refreshSkill(ctx, u, s.client(u), ns, name, syncStats{}); err != nil {
+		if err := s.refreshSkill(model.WithUpstreamGuard(ctx, u.ID, u.ConfigVersion), u, s.client(u), ns, name, syncStats{}); err != nil {
+			if configChanged(err) {
+				continue
+			}
 			if isStoreFailure(err) && !isUpstreamError(err) {
 				return err
 			}

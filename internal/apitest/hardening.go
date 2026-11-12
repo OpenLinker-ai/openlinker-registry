@@ -1101,6 +1101,75 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(e.Do("GET", "/v1/skills/com.big/big", AdminToken, "", nil), 404, "a later version must not be recorded without the earlier one")
 	})
 
+	t.Run("settings changed while an existing entry is refreshed", func(t *testing.T) {
+		// A withdrawn skill would be restored by the upstream's answer, but
+		// while that answer is on its way an administrator denies the
+		// skill's namespace. The answer was asked for under the old
+		// settings: it must change nothing, also on an entry that already
+		// exists (no new version is involved).
+		body := md("back", "Comes back", "MIT")
+		var e *Env
+		phase := 1
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.Path {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[]}`)) // unlisted upstream: only reconciliation reads it
+			case "/v1/skills/com.shy/back":
+				if phase == 2 {
+					w.WriteHeader(404)
+					_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not found"}}`))
+					return
+				}
+				if phase == 3 {
+					req, _ := http.NewRequest("PATCH", e.Base+"/v1/admin/upstreams/shy", strings.NewReader(`{"namespace_deny":["com.shy"]}`))
+					req.Header.Set("Authorization", "Bearer "+AdminToken)
+					req.Header.Set("Content-Type", "application/json")
+					if res, err := http.DefaultClient.Do(req); err != nil || res.StatusCode != 200 {
+						t.Errorf("patch during the sync: %v %v", res, err)
+					} else {
+						res.Body.Close()
+					}
+				}
+				_ = enc.Encode(map[string]any{"namespace": "com.shy", "name": "back", "status": "active", "mode": "hosted", "visibility": "public",
+					"listed": true, "latest_version": "1", "versions": []map[string]any{{"version": "1", "yanked": false, "servable": true}}})
+			case "/v1/skills/com.shy/back/versions/1":
+				_ = enc.Encode(map[string]any{"namespace": "com.shy", "name": "back", "version": "1", "mode": "hosted",
+					"frontmatter": map[string]any{"name": "back", "description": "d"}, "license": map[string]any{"kind": "spdx", "id": "MIT"},
+					"core_compatible": true, "files": []map[string]any{{"path": "SKILL.md", "size": len(body), "sha256": strings.TrimPrefix(sha(body), "sha256:")}},
+					"artifact":       map[string]any{"type": "skill-md", "digest": sha(body), "size": len(body)},
+					"content_access": map[string]any{"full_text": true, "artifact": true}})
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not found"}}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e = NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "shy", "kind": "openlinker-registry", "base_url": fake.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		read := func() int { return e.Do("GET", "/v1/skills/com.shy/back", "", "", nil).Status }
+		if read() != 200 {
+			t.Fatal("the skill must be mirrored by a forwarded read")
+		}
+		phase = 2
+		if s := e.sync("shy"); s["last_status"] != "ok" || stat(s, "skills_withdrawn") != 1 || read() != 404 {
+			t.Fatalf("withdrawal: %v, read %d", s, read())
+		}
+		phase = 3
+		r := e.Expect(e.Do("POST", "/v1/admin/upstreams/shy/sync?wait=true", AdminToken, "", nil), 200, "sync")
+		if s := r.JSON["sync"].(map[string]any); s["last_status"] != "failed" || !strings.Contains(s["last_error"].(string), "settings changed") {
+			t.Fatalf("a refresh overtaken by a settings change: %v", s)
+		}
+		if got := read(); got != 404 {
+			t.Fatalf("a withdrawn skill of a namespace denied meanwhile was restored: %d", got)
+		}
+		e.sync("shy")
+		if got := read(); got != 404 {
+			t.Fatalf("and it must stay withdrawn under the new settings: %d", got)
+		}
+	})
+
 	t.Run("a license approved upstream later", func(t *testing.T) {
 		// The upstream indexes a skill under a custom license, which it does
 		// not serve until a reviewer approves it. The mirror records the

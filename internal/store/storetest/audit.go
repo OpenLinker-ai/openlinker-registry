@@ -424,6 +424,91 @@ var mirrorTests = []testCase{
 			t.Fatal("the waiter never got the lock after release")
 		}
 	}},
+	{"mutations under a guard stop when the settings change", func(t *testing.T, st store.Store) {
+		// A sync carries the version of the settings it read in its context
+		// (model.WithUpstreamGuard). Once they change, none of its writes go
+		// through any more: not new entries, and not changes to existing ones.
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		guarded := model.WithUpstreamGuard(ctx, up.ID, up.ConfigVersion)
+		mirror := mirrorInput(up, "org.mirror/srv", "1.0.0")
+		if got, err := st.UpsertMirroredMCP(guarded, mirror, audit); err != nil || got != model.MirrorCreated {
+			t.Fatalf("mirror write under current settings: %s, %v", got, err)
+		}
+		v := version("1", "spdx")
+		v.Source, v.Locator = nil, &model.Locator{Kind: "registry"}
+		sk, ver, err := st.PublishVersion(guarded, model.PublishInput{Namespace: "org.mirror", Name: "tool", Mode: "indexed",
+			SourceKey: "upstream:up:org.mirror/tool", Visibility: model.VisibilityPublic, Listed: true, UpstreamID: up.ID,
+			UpstreamConfigVersion: up.ConfigVersion, Version: v}, audit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := mcpServer(t, st, "org.mirror/srv")
+
+		deny := []string{"org.mirror"}
+		if _, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{NamespaceDeny: &deny}, audit); err != nil {
+			t.Fatal(err)
+		}
+		private, unlisted := model.VisibilityPrivate, false
+		for name, mutate := range map[string]func() error{
+			"UpdateSkill": func() error {
+				_, err := st.UpdateSkill(guarded, sk.ID, model.SkillPatch{Visibility: &private, Listed: &unlisted}, audit)
+				return err
+			},
+			"SetSkillStatus": func() error {
+				_, err := st.SetSkillStatus(guarded, sk.ID, model.StatusDeprecated, "x", audit)
+				return err
+			},
+			"YankVersion":            func() error { return st.YankVersion(guarded, ver.ID, "x", time.Now(), audit) },
+			"ApproveLicense":         func() error { return st.ApproveLicense(guarded, ver.ID, audit) },
+			"SetVersionMirrorServed": func() error { return st.SetVersionMirrorServed(guarded, ver.ID, true, audit) },
+			"UpdateMCPServer": func() error {
+				_, err := st.UpdateMCPServer(guarded, srv.ID, model.MCPPatch{Visibility: &private}, audit)
+				return err
+			},
+			"SetMCPStatus": func() error {
+				_, err := st.SetMCPStatus(guarded, srv.ID, "", model.MCPStatusDeleted, "x", time.Now(), audit)
+				return err
+			},
+			"EnsureUpstreamNamespace": func() error {
+				_, err := st.EnsureUpstreamNamespace(guarded, "org.other", up.ID, audit)
+				return err
+			},
+			"UpsertMirroredMCP": func() error {
+				in := mirrorInput(up, "org.mirror/srv", "2.0.0")
+				_, err := st.UpsertMirroredMCP(guarded, in, audit)
+				return err
+			},
+		} {
+			if err := mutate(); conflictCode(err) != "upstream_config_changed" {
+				t.Errorf("%s under changed settings: %v", name, err)
+			}
+		}
+		// Nothing was applied.
+		if got, _ := st.GetSkill(ctx, "org.mirror", "tool"); got.Visibility != model.VisibilityPublic || !got.Listed || got.Status != model.StatusActive {
+			t.Errorf("skill changed under a stale guard: %+v", got)
+		}
+		if got, _ := st.GetVersion(ctx, sk.ID, "1"); got.YankedAt != nil || got.LicenseApproved || got.MirrorServed != nil {
+			t.Errorf("version changed under a stale guard: %+v", got)
+		}
+		if got := mcpServer(t, st, "org.mirror/srv"); got.Visibility != model.VisibilityPublic {
+			t.Errorf("server changed under a stale guard: %+v", got)
+		}
+		if got := mcpVersion(t, st, srv.ID, "1.0.0"); got.Status != model.MCPStatusActive {
+			t.Errorf("server version changed under a stale guard: %+v", got)
+		}
+		if _, err := st.GetNamespace(ctx, "org.other"); !errors.Is(err, model.ErrNotFound) {
+			t.Errorf("namespace created under a stale guard: %v", err)
+		}
+		// Without a guard (an administrator, a publisher) the same calls work.
+		if _, err := st.SetSkillStatus(ctx, sk.ID, model.StatusDeprecated, "x", audit); err != nil {
+			t.Errorf("unguarded mutation: %v", err)
+		}
+		// Recording a source check is not a mirror write and is never refused.
+		if err := st.SetVersionCheck(guarded, ver.ID, model.CheckOK, time.Now()); err != nil {
+			t.Errorf("source check under a stale guard: %v", err)
+		}
+	}},
 	{"mirrored namespaces have no members", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		up := newUpstream(t, st, "up")

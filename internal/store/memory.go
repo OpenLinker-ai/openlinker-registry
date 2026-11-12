@@ -222,9 +222,12 @@ func (m *Memory) GetSkill(_ context.Context, namespace, name string) (model.Skil
 }
 
 // PublishVersion implements Store.
-func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error) {
+func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, model.Version{}, err
+	}
 	ns, ok := m.ns[in.Namespace]
 	createNS := false
 	if in.UpstreamID != 0 {
@@ -342,9 +345,12 @@ func (m *Memory) GetVersion(_ context.Context, skillID int64, version string) (m
 }
 
 // UpdateSkill implements Store.
-func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
+func (m *Memory) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, err
+	}
 	s, ok := m.skills[skillID]
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
@@ -369,9 +375,12 @@ func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatc
 }
 
 // SetSkillStatus implements Store.
-func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error) {
+func (m *Memory) SetSkillStatus(ctx context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, err
+	}
 	s, ok := m.skills[skillID]
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
@@ -406,9 +415,16 @@ func (m *Memory) SetAlias(_ context.Context, skillID int64, alias string, audit 
 	return nil
 }
 
-func (m *Memory) mutateVersion(id int64, audit *model.AuditEvent, f func(*model.Version)) error {
+func (m *Memory) mutateVersion(ctx context.Context, id int64, audit *model.AuditEvent, f func(*model.Version)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Audited mutations are the ones a mirror makes on purpose; recording a
+	// source check (no audit) is not one of them.
+	if audit != nil {
+		if err := m.guard(ctx); err != nil {
+			return err
+		}
+	}
 	v, ok := m.versions[id]
 	if !ok {
 		return model.ErrNotFound
@@ -422,8 +438,8 @@ func (m *Memory) mutateVersion(id int64, audit *model.AuditEvent, f func(*model.
 }
 
 // YankVersion implements Store.
-func (m *Memory) YankVersion(_ context.Context, id int64, reason string, at time.Time, audit model.AuditEvent) error {
-	return m.mutateVersion(id, &audit, func(v *model.Version) {
+func (m *Memory) YankVersion(ctx context.Context, id int64, reason string, at time.Time, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) {
 		if v.YankedAt == nil {
 			v.YankedAt, v.YankReason = &at, reason
 		}
@@ -431,13 +447,13 @@ func (m *Memory) YankVersion(_ context.Context, id int64, reason string, at time
 }
 
 // ApproveLicense implements Store.
-func (m *Memory) ApproveLicense(_ context.Context, id int64, audit model.AuditEvent) error {
-	return m.mutateVersion(id, &audit, func(v *model.Version) { v.LicenseApproved = true })
+func (m *Memory) ApproveLicense(ctx context.Context, id int64, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.LicenseApproved = true })
 }
 
 // SetVersionCheck implements Store.
-func (m *Memory) SetVersionCheck(_ context.Context, id int64, result string, at time.Time) error {
-	return m.mutateVersion(id, nil, func(v *model.Version) { v.CheckResult, v.CheckedAt = result, &at })
+func (m *Memory) SetVersionCheck(ctx context.Context, id int64, result string, at time.Time) error {
+	return m.mutateVersion(ctx, id, nil, func(v *model.Version) { v.CheckResult, v.CheckedAt = result, &at })
 }
 
 // Search implements Store.
@@ -612,6 +628,6 @@ func (m *Memory) LockMirror(ctx context.Context, key string) (func(), error) {
 }
 
 // SetVersionMirrorServed implements Store.
-func (m *Memory) SetVersionMirrorServed(_ context.Context, id int64, served bool, audit model.AuditEvent) error {
-	return m.mutateVersion(id, &audit, func(v *model.Version) { v.MirrorServed = &served })
+func (m *Memory) SetVersionMirrorServed(ctx context.Context, id int64, served bool, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.MirrorServed = &served })
 }

@@ -258,9 +258,12 @@ func (m *Memory) createUpstreamNS(ns model.Namespace) model.Namespace {
 }
 
 // EnsureUpstreamNamespace implements Store.
-func (m *Memory) EnsureUpstreamNamespace(_ context.Context, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error) {
+func (m *Memory) EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Namespace{}, err
+	}
 	ns, create, err := m.upstreamNS(name, upstreamID)
 	if err != nil {
 		return model.Namespace{}, err
@@ -311,4 +314,13 @@ func (m *Memory) upstreamCurrent(upstreamID, configVersion int64) error {
 		return model.ErrUpstreamConfigChanged()
 	}
 	return nil
+}
+
+// guard enforces model.WithUpstreamGuard; the caller holds the lock.
+func (m *Memory) guard(ctx context.Context) error {
+	id, version, ok := model.UpstreamGuardFrom(ctx)
+	if !ok {
+		return nil
+	}
+	return m.upstreamCurrent(id, version)
 }

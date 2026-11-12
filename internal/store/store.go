@@ -14,6 +14,10 @@ import (
 // Store is the registry persistence boundary. Every mutating method takes the
 // audit event describing it and must persist both atomically: if the audit
 // row cannot be written, the mutation is rolled back.
+//
+// A context from model.WithUpstreamGuard makes every audited mutation
+// conditional on the upstream's settings being unchanged, checked in the
+// mutation's own transaction (ConflictError upstream_config_changed).
 type Store interface {
 	Ping(ctx context.Context) error
 

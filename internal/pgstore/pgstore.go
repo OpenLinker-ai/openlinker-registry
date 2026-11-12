@@ -149,11 +149,34 @@ func insertAudit(ctx context.Context, q execer, e model.AuditEvent) error {
 // inTx runs fn and the audit insert in one transaction.
 func (s *Store) inTx(ctx context.Context, audit model.AuditEvent, fn func(tx pgx.Tx) error) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := contextGuard(ctx, tx); err != nil {
+			return err
+		}
 		if err := fn(tx); err != nil {
 			return err
 		}
 		return insertAudit(ctx, tx, audit)
 	})
+}
+
+// contextGuard enforces model.WithUpstreamGuard: when ctx carries a guard,
+// the upstream row is share-locked for the rest of the transaction and the
+// transaction fails unless the upstream's settings are still the ones the
+// caller read. It runs first, so the upstream row is always locked before
+// any entry row, the order UpdateUpstream uses.
+func contextGuard(ctx context.Context, tx pgx.Tx) error {
+	id, version, ok := model.UpstreamGuardFrom(ctx)
+	if !ok {
+		return nil
+	}
+	var current int64
+	if err := tx.QueryRow(ctx, `SELECT config_version FROM upstreams WHERE id = $1 FOR SHARE`, id).Scan(&current); err != nil {
+		return notFound(err)
+	}
+	if current != version {
+		return model.ErrUpstreamConfigChanged()
+	}
+	return nil
 }
 
 func conflict(code, msg string) error { return &model.ConflictError{Code: code, Msg: msg} }
