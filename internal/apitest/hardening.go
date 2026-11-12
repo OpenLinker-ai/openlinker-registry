@@ -650,6 +650,50 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a version the upstream removed", func(t *testing.T) {
+		// v1 is mirrored by a forwarded read. The upstream then removes v1
+		// altogether and publishes v2. Neither its listing nor its version
+		// list mention v1 any more; a full sync must not leave it active.
+		entry := func(version string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": "com.feed/tool", "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}}
+		}
+		current := "1.0.0"
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers", "/v0.1/servers/com.feed%2Ftool/versions":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry(current)}})
+			case "/v0.1/servers/com.feed%2Ftool/versions/" + current, "/v0.1/servers/com.feed%2Ftool/versions/latest":
+				_ = enc.Encode(entry(current))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		for _, latestOnly := range []bool{true, false} {
+			current = "1.0.0"
+			e := NewEnv(t, newStore(t), Options{Loopback: true})
+			e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "proxy_on_miss": true,
+				"latest_only": latestOnly, "visibility": "public"}), 201, "upstream")
+			e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Ftool/versions/1.0.0", "", "", nil), 200, "forwarded v1")
+			current = "2.0.0"
+			if s := e.sync("feed"); s["last_status"] != "ok" {
+				t.Fatalf("latest_only=%v: sync: %v", latestOnly, s)
+			}
+			r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Ftool/versions/1.0.0", "", "", nil), 200, "removed version")
+			if official(r.JSON)["status"] != "deleted" {
+				t.Fatalf("latest_only=%v: a version the upstream removed is still %v", latestOnly, official(r.JSON)["status"])
+			}
+			if r = e.Do("GET", "/v0.1/servers/com.feed%2Ftool/versions/latest", "", "", nil); v0Version(r.JSON) != "2.0.0" {
+				t.Fatalf("latest_only=%v: latest: %s", latestOnly, r.Body)
+			}
+		}
+	})
+
 	t.Run("a listing page larger than the response cap", func(t *testing.T) {
 		// Large documents make a full page exceed what one response may
 		// carry, although each document is fine. The sync asks for smaller
@@ -1167,6 +1211,76 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.sync("shy")
 		if got := read(); got != 404 {
 			t.Fatalf("and it must stay withdrawn under the new settings: %d", got)
+		}
+	})
+
+	t.Run("a discovery index that changes", func(t *testing.T) {
+		// A site's discovery index is the whole truth about what it offers:
+		// an entry that leaves it is withdrawn here, one that returns is
+		// restored, and entries follow the visibility the upstream is
+		// configured with.
+		alpha, beta := md("alpha", "Alpha", "MIT"), md("beta", "Beta", "MIT")
+		listBeta := true
+		var site *httptest.Server
+		site = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/.well-known/agent-skills/index.json":
+				w.Header().Set("Content-Type", "application/json")
+				skills := []map[string]any{{"name": "alpha", "type": "skill-md", "description": "Alpha", "url": site.URL + "/alpha/SKILL.md", "digest": sha(alpha)}}
+				if listBeta {
+					skills = append(skills, map[string]any{"name": "beta", "type": "skill-md", "description": "Beta", "url": site.URL + "/beta/SKILL.md", "digest": sha(beta)})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"skills": skills})
+			case r.URL.Path == "/alpha/SKILL.md":
+				_, _ = w.Write(alpha)
+			case r.URL.Path == "/beta/SKILL.md" && listBeta:
+				_, _ = w.Write(beta)
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		t.Cleanup(site.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "site", "kind": "agent-skills", "base_url": site.URL, "target_namespace": "mirror.site", "visibility": "internal"}), 201, "upstream")
+		reader := e.token([]string{"skills:read"}, nil)
+		read := func(name, token string) int {
+			return e.Do("GET", "/v1/skills/mirror.site/"+name, token, "", nil).Status
+		}
+		artifact := func(name string) string {
+			r := e.Do("GET", "/v1/skills/mirror.site/"+name, AdminToken, "", nil)
+			v, _ := r.JSON["latest_version"].(string)
+			return "/v1/skills/mirror.site/" + name + "/versions/" + v + "/artifact"
+		}
+		e.sync("site")
+		if read("alpha", "") != 404 || read("alpha", reader) != 200 {
+			t.Fatal("entries of an internal upstream are internal")
+		}
+		// The administrator makes the mirror public: existing entries follow.
+		e.Expect(e.Do("PATCH", "/v1/admin/upstreams/site", AdminToken, "", map[string]any{"visibility": "public"}), 200, "widen")
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_updated") != 2 {
+			t.Fatalf("sync after widening: %v", s)
+		}
+		if read("alpha", "") != 200 || read("beta", "") != 200 {
+			t.Fatal("existing entries did not follow the upstream's new visibility")
+		}
+		betaArtifact := artifact("beta")
+		e.Expect(e.Do("GET", betaArtifact, "", "", nil), 200, "cached bytes")
+		// The site drops an entry.
+		listBeta = false
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_withdrawn") != 1 {
+			t.Fatalf("sync after an entry left the index: %v", s)
+		}
+		if a, b, c := read("beta", ""), read("beta", reader), e.Do("GET", betaArtifact, reader, "", nil).Status; a != 404 || b != 404 || c != 404 {
+			t.Fatalf("an entry that left the index is still served: anonymous %d, authenticated %d, artifact %d", a, b, c)
+		}
+		if read("alpha", "") != 200 {
+			t.Fatal("the remaining entry must be unaffected")
+		}
+		// And lists it again.
+		listBeta = true
+		e.sync("site")
+		if a, b := read("beta", ""), e.Do("GET", betaArtifact, "", "", nil).Status; a != 200 || b != 200 {
+			t.Fatalf("an entry that returned to the index: metadata %d, artifact %d", a, b)
 		}
 	})
 

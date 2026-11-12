@@ -249,10 +249,9 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 // reconcileMCP looks up, by name, every mirrored server of the upstream that
 // a full listing did not cover, and applies what the upstream says now: its
 // versions' current status, or that the server is gone. A server is covered
-// when the listing showed it and, for a latest-only listing (which shows one
-// version per server), every version mirrored here was among those shown:
-// an older version mirrored earlier may have been deleted or deprecated
-// since.
+// when the listing showed every version mirrored here: a version it did not
+// show (a latest-only listing shows one per server; a version may also have
+// been removed) may have been deleted or deprecated since.
 func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstream.Client, seen map[string]bool, stats syncStats) error {
 	after := ""
 	for {
@@ -266,7 +265,7 @@ func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstrea
 				return ctx.Err()
 			}
 			covered := seen[srv.Name]
-			if covered && u.LatestOnly {
+			if covered {
 				local, err := s.Store.ListMCPVersions(ctx, srv.ID)
 				if err != nil {
 					return err
@@ -307,41 +306,16 @@ func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *ups
 
 // reconcileMissingMCP settles a version that a listing reported changed but
 // that the upstream does not serve by name any more. The caller holds the
-// server's mirror lock. The server's version list is applied; if it does not
-// contain the version either, the version is gone and is marked deleted.
+// server's mirror lock. The server's version list is applied, which marks
+// every version it no longer contains as deleted.
 func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *upstream.Client, doc upstream.MCPDoc) (string, error) {
-	served, err := s.refreshMCPServerLocked(ctx, u, c, doc.Name, syncStats{})
-	if err != nil {
+	if _, err := s.refreshMCPServerLocked(ctx, u, c, doc.Name, syncStats{}); err != nil {
 		if isUpstreamError(err) {
 			return "", errUnconfirmed
 		}
 		return "", err
 	}
-	if served == nil || served[doc.Version] {
-		return model.MirrorUpdated, nil // withdrawn as a whole, or applied from the list
-	}
-	srv, err := s.Store.GetMCPServer(ctx, doc.Name)
-	if errors.Is(err, model.ErrNotFound) {
-		return "ignored", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	v, err := s.Store.GetMCPVersion(ctx, srv.ID, doc.Version)
-	if errors.Is(err, model.ErrNotFound) || (err == nil && v.Status == model.MCPStatusDeleted) {
-		return model.MirrorUnchanged, nil
-	}
-	if err != nil {
-		return "", err
-	}
-	// Only this version changes. Which version is latest was just taken
-	// from the upstream's own list and is not recomputed here: the upstream
-	// decides it, and its choice need not be the highest version.
-	actor := "upstream:" + u.Name
-	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, ConfigVersion: u.ConfigVersion, Namespace: srv.Namespace, Name: srv.Name,
-		Visibility: srv.Visibility, Listed: srv.Listed, Fresh: true, Version: model.MCPVersion{Version: v.Version, ServerJSON: v.ServerJSON,
-			Digest: v.Digest, Status: model.MCPStatusDeleted, StatusMessage: "no longer available from the upstream registry", CreatedBy: actor}},
-		auditEvent(actor, "mcp.mirror", srv.Namespace, srv.Name+"@"+v.Version, map[string]any{"status": model.MCPStatusDeleted, "upstream": u.Name}))
+	return model.MirrorUpdated, nil
 }
 
 // refreshMCPServerLocked is refreshMCPServer for a caller that holds the
@@ -382,6 +356,27 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 		default:
 			stats.add("mcp_skipped")
 		}
+	}
+	// A version mirrored here that the upstream's own list no longer has is
+	// gone. Only that version changes: which version is latest was just
+	// taken from the upstream's list and is not recomputed by version number.
+	local, err := s.Store.ListMCPVersions(ctx, srv.ID)
+	if err != nil {
+		return nil, err
+	}
+	actor := "upstream:" + u.Name
+	for _, v := range local {
+		if served[v.Version] || v.Status == model.MCPStatusDeleted {
+			continue
+		}
+		if _, err := s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, ConfigVersion: u.ConfigVersion,
+			Namespace: srv.Namespace, Name: srv.Name, Visibility: srv.Visibility, Listed: srv.Listed, Fresh: true,
+			Version: model.MCPVersion{Version: v.Version, ServerJSON: v.ServerJSON, Digest: v.Digest, Status: model.MCPStatusDeleted,
+				StatusMessage: "no longer available from the upstream registry", CreatedBy: actor}},
+			auditEvent(actor, "mcp.mirror", srv.Namespace, srv.Name+"@"+v.Version, map[string]any{"status": model.MCPStatusDeleted, "upstream": u.Name})); err != nil {
+			return nil, err
+		}
+		stats.add("mcp_updated")
 	}
 	return served, nil
 }
@@ -962,6 +957,12 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 		return err
 	}
 	stats["skills_skipped"] += dropped
+	// Every name the index lists, before any cap: an entry is only withdrawn
+	// when the index really no longer has it.
+	indexed := map[string]bool{}
+	for _, e := range entries {
+		indexed[e.Name] = true
+	}
 	if len(entries) > maxIndexEntries {
 		stats["skills_skipped"] += len(entries) - maxIndexEntries
 		entries = entries[:maxIndexEntries]
@@ -981,8 +982,18 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 		}
 		version := "sha-" + strings.TrimPrefix(e.Digest, "sha256:")[:12]
 		if local, err := s.Store.GetSkill(ctx, ns, e.Name); err == nil {
+			// An entry that is (again) in the index is shown as the upstream
+			// is configured now, whether or not its content changed.
+			restored, err := s.restoreIndexSkill(ctx, u, local)
+			if err != nil {
+				return err
+			}
 			if _, err := s.Store.GetVersion(ctx, local.ID, version); err == nil {
-				stats.add("skills_unchanged")
+				if restored {
+					stats.add("skills_updated")
+				} else {
+					stats.add("skills_unchanged")
+				}
 				continue
 			} else if !errors.Is(err, model.ErrNotFound) {
 				return err
@@ -1047,7 +1058,50 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 			stats.add("skills_skipped")
 		}
 	}
-	return nil
+	// Entries mirrored earlier that the index no longer lists are withdrawn.
+	afterNS, afterName := "", ""
+	for {
+		rows, err := s.Store.ListMirroredSkills(ctx, u.ID, afterNS, afterName, 200)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			afterNS, afterName = row.Namespace, row.Name
+			if row.Namespace != ns || indexed[row.Name] {
+				continue
+			}
+			if err := s.withdrawSkill(ctx, u, ns, row.Name, stats); err != nil {
+				return err
+			}
+		}
+		if len(rows) < 200 {
+			return nil
+		}
+	}
+}
+
+// restoreIndexSkill gives a skill that the discovery index lists the
+// visibility its upstream is configured with, lists it, and lifts a
+// withdrawal. It reports whether anything changed.
+func (s *Service) restoreIndexSkill(ctx context.Context, u model.Upstream, local model.Skill) (bool, error) {
+	actor := "upstream:" + u.Name
+	changed := false
+	if local.Visibility != u.Visibility || !local.Listed {
+		visibility, listed := u.Visibility, true
+		if _, err := s.Store.UpdateSkill(ctx, local.ID, model.SkillPatch{Visibility: &visibility, Listed: &listed},
+			auditEvent(actor, "skill.update", local.Namespace, local.Name, map[string]any{"visibility": visibility, "listed": true})); err != nil {
+			return false, err
+		}
+		changed = true
+	}
+	if local.Status == model.StatusDeprecated && local.StatusReason == withdrawnReason {
+		if _, err := s.Store.SetSkillStatus(ctx, local.ID, model.StatusActive, "",
+			auditEvent(actor, "skill.active", local.Namespace, local.Name, map[string]any{"reason": "listed again by the upstream"})); err != nil {
+			return false, err
+		}
+		changed = true
+	}
+	return changed, nil
 }
 
 // readMirrored re-reads a mirrored or URL-indexed version from its source and

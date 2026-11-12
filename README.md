@@ -205,7 +205,7 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
 |---|---|---|
 | `openlinker-registry` | Another openlinker-registry | Skills (through `/v1`) and MCP servers (through `/v0.1`) |
 | `mcp-registry` | Any registry with the official MCP read API | MCP servers; `latest_only` keeps one version per server |
-| `agent-skills` | A site with `/.well-known/agent-skills/index.json` | Its skills, into the local `target_namespace`; each digest becomes version `sha-<12 hex>` |
+| `agent-skills` | A site with `/.well-known/agent-skills/index.json` | Its skills, into the local `target_namespace`; each digest becomes version `sha-<12 hex>`. An entry that leaves the index is withdrawn and returns when it is listed again |
 
 - **Forward on miss** (`proxy_on_miss`): a direct read of a skill, a version
   of a mirrored skill, or an MCP server version that is not stored here is
