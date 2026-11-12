@@ -154,6 +154,11 @@ func uniqueViolation(err error) (string, bool) {
 	return "", false
 }
 
+func foreignKeyViolation(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "23503"
+}
+
 func notFound(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.ErrNotFound
@@ -161,8 +166,21 @@ func notFound(err error) error {
 	return err
 }
 
-// CreateNamespace implements store.Store.
+const nsCols = `id, name, kind, github_id, display_name, COALESCE(upstream_id, 0), created_at`
+
+func scanNamespace(row pgx.Row) (model.Namespace, error) {
+	var ns model.Namespace
+	err := row.Scan(&ns.ID, &ns.Name, &ns.Kind, &ns.GitHubID, &ns.DisplayName, &ns.UpstreamID, &ns.CreatedAt)
+	return ns, err
+}
+
+// CreateNamespace implements store.Store. It only creates local namespaces;
+// upstream-managed ones come from EnsureUpstreamNamespace.
 func (s *Store) CreateNamespace(ctx context.Context, ns model.Namespace, audit model.AuditEvent) (model.Namespace, error) {
+	if ns.Kind == model.NSKindUpstream {
+		return model.Namespace{}, store.ErrNamespaceKind()
+	}
+	ns.UpstreamID = 0
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `INSERT INTO namespaces (name, kind, github_id, display_name)
 		VALUES ($1, $2, $3, $4) RETURNING id, created_at`, ns.Name, ns.Kind, ns.GitHubID, ns.DisplayName).Scan(&ns.ID, &ns.CreatedAt)
@@ -178,10 +196,18 @@ func (s *Store) CreateNamespace(ctx context.Context, ns model.Namespace, audit m
 
 // GetNamespace implements store.Store.
 func (s *Store) GetNamespace(ctx context.Context, name string) (model.Namespace, error) {
-	var ns model.Namespace
-	err := s.pool.QueryRow(ctx, `SELECT id, name, kind, github_id, display_name, created_at FROM namespaces WHERE name = $1`, name).
-		Scan(&ns.ID, &ns.Name, &ns.Kind, &ns.GitHubID, &ns.DisplayName, &ns.CreatedAt)
+	ns, err := scanNamespace(s.pool.QueryRow(ctx, `SELECT `+nsCols+` FROM namespaces WHERE name = $1`, name))
 	return ns, notFound(err)
+}
+
+// ListNamespaces implements store.Store. Names sort in byte order, like the
+// in-memory store, whatever the database collation.
+func (s *Store) ListNamespaces(ctx context.Context) ([]model.Namespace, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+nsCols+` FROM namespaces ORDER BY name COLLATE "C"`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.Namespace, error) { return scanNamespace(row) })
 }
 
 // SetRole implements store.Store.
@@ -252,6 +278,20 @@ func (s *Store) GetToken(ctx context.Context, id string) (model.Token, error) {
 	return t, notFound(err)
 }
 
+// ListTokens implements store.Store. The secret hash is never selected.
+func (s *Store) ListTokens(ctx context.Context) ([]model.Token, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, name, scopes, created_by, created_at, expires_at, revoked_at
+		FROM api_tokens ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.Token, error) {
+		var t model.Token
+		err := row.Scan(&t.ID, &t.Name, &t.Scopes, &t.CreatedBy, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt)
+		return t, err
+	})
+}
+
 // RevokeToken implements store.Store.
 func (s *Store) RevokeToken(ctx context.Context, id string, at time.Time, audit model.AuditEvent) error {
 	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
@@ -270,12 +310,16 @@ func rowsOrNotFound(tag pgconn.CommandTag, err error) error {
 }
 
 const skillCols = `s.id, n.name, s.name, s.description, s.visibility, s.listed, s.status, s.status_reason,
-	s.mode, COALESCE(s.source_key, ''), COALESCE(s.global_alias, ''), s.created_at, s.updated_at`
+	s.mode, COALESCE(s.source_key, ''), COALESCE(s.global_alias, ''), COALESCE(u.name, ''), s.created_at, s.updated_at`
+
+// skillFrom joins what skillCols reads: the namespace and, for an
+// upstream-managed namespace, its upstream.
+const skillFrom = ` FROM skills s JOIN namespaces n ON n.id = s.namespace_id LEFT JOIN upstreams u ON u.id = n.upstream_id `
 
 func scanSkill(row pgx.Row, extra ...any) (model.Skill, error) {
 	var k model.Skill
 	dest := append([]any{&k.ID, &k.Namespace, &k.Name, &k.Description, &k.Visibility, &k.Listed, &k.Status,
-		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.CreatedAt, &k.UpdatedAt}, extra...)
+		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.Upstream, &k.CreatedAt, &k.UpdatedAt}, extra...)
 	err := row.Scan(dest...)
 	return k, err
 }
@@ -283,14 +327,13 @@ func scanSkill(row pgx.Row, extra ...any) (model.Skill, error) {
 func (s *Store) getSkillByID(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, id int64) (model.Skill, error) {
-	k, err := scanSkill(q.QueryRow(ctx, `SELECT `+skillCols+` FROM skills s JOIN namespaces n ON n.id = s.namespace_id WHERE s.id = $1`, id))
+	k, err := scanSkill(q.QueryRow(ctx, `SELECT `+skillCols+skillFrom+`WHERE s.id = $1`, id))
 	return k, notFound(err)
 }
 
 // GetSkill implements store.Store.
 func (s *Store) GetSkill(ctx context.Context, namespace, name string) (model.Skill, error) {
-	k, err := scanSkill(s.pool.QueryRow(ctx, `SELECT `+skillCols+` FROM skills s JOIN namespaces n ON n.id = s.namespace_id
-		WHERE n.name = $1 AND s.name = $2`, namespace, name))
+	k, err := scanSkill(s.pool.QueryRow(ctx, `SELECT `+skillCols+skillFrom+`WHERE n.name = $1 AND s.name = $2`, namespace, name))
 	return k, notFound(err)
 }
 
@@ -299,9 +342,15 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 	var outSkill model.Skill
 	var outVer model.Version
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
-		var nsID int64
-		if err := tx.QueryRow(ctx, `SELECT id FROM namespaces WHERE name = $1`, in.Namespace).Scan(&nsID); err != nil {
+		var nsID, nsUpstream int64
+		if err := tx.QueryRow(ctx, `SELECT id, COALESCE(upstream_id, 0) FROM namespaces WHERE name = $1`, in.Namespace).
+			Scan(&nsID, &nsUpstream); err != nil {
 			return notFound(err)
+		}
+		// The owner of a namespace never changes (schema trigger), so this
+		// needs no lock.
+		if nsUpstream != in.UpstreamID {
+			return model.ErrNamespaceManaged()
 		}
 		var sourceKey *string
 		if in.SourceKey != "" {
@@ -318,8 +367,8 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		if err != nil {
 			return err
 		}
-		k, err := scanSkill(tx.QueryRow(ctx, `SELECT `+skillCols+` FROM skills s JOIN namespaces n ON n.id = s.namespace_id
-			WHERE s.namespace_id = $1 AND s.name = $2 FOR UPDATE OF s`, nsID, in.Name))
+		k, err := scanSkill(tx.QueryRow(ctx, `SELECT `+skillCols+skillFrom+`WHERE s.namespace_id = $1 AND s.name = $2 FOR UPDATE OF s`,
+			nsID, in.Name))
 		if err != nil {
 			return err
 		}
@@ -542,21 +591,31 @@ func (s *Store) SetVersionCheck(ctx context.Context, id int64, result string, at
 const latestJoin = `LEFT JOIN LATERAL (SELECT * FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL
 	ORDER BY v.id DESC LIMIT 1) lv ON true`
 
+// visibleSQL is model.Viewer.CanSee as a SQL condition over the visibility
+// column col and the namespace name n.name; it is "" for admins, who see
+// everything. arg binds a query parameter and returns its placeholder.
+func visibleSQL(col string, v model.Viewer, arg func(any) string) string {
+	if v.Admin {
+		return ""
+	}
+	vis := col + " = 'public'"
+	if v.Authenticated {
+		vis += " OR " + col + " = 'internal'"
+	}
+	if len(v.Namespaces) > 0 {
+		vis += " OR (" + col + " = 'private' AND n.name = ANY(" + arg(v.Namespaces) + "))"
+	}
+	return "(" + vis + ")"
+}
+
 // Search implements store.Store. Visibility is enforced in SQL with the same
 // rules as model.Viewer.CanSee.
 func (s *Store) Search(ctx context.Context, q model.SearchQuery) ([]model.SkillSummary, error) {
 	where := []string{"s.listed", "s.status <> 'yanked'"}
 	args := []any{}
 	arg := func(v any) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
-	if !q.Viewer.Admin {
-		vis := "s.visibility = 'public'"
-		if q.Viewer.Authenticated {
-			vis += " OR s.visibility = 'internal'"
-		}
-		if len(q.Viewer.Namespaces) > 0 {
-			vis += " OR (s.visibility = 'private' AND n.name = ANY(" + arg(q.Viewer.Namespaces) + "))"
-		}
-		where = append(where, "("+vis+")")
+	if vis := visibleSQL("s.visibility", q.Viewer, arg); vis != "" {
+		where = append(where, vis)
 	}
 	if q.Q != "" {
 		p := arg("%" + likeEscape(strings.ToLower(q.Q)) + "%")
@@ -574,7 +633,7 @@ func (s *Store) Search(ctx context.Context, q model.SearchQuery) ([]model.SkillS
 	if q.AfterNS != "" {
 		where = append(where, "(n.name, s.name) > ("+arg(q.AfterNS)+", "+arg(q.AfterName)+")")
 	}
-	sql := `SELECT ` + skillCols + `, COALESCE(lv.version, '') FROM skills s JOIN namespaces n ON n.id = s.namespace_id ` +
+	sql := `SELECT ` + skillCols + `, COALESCE(lv.version, '')` + skillFrom +
 		latestJoin + ` WHERE ` + strings.Join(where, " AND ") + ` ORDER BY n.name, s.name`
 	if q.Limit > 0 {
 		sql += " LIMIT " + arg(q.Limit)

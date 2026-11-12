@@ -20,7 +20,16 @@ var errNotFound = &registry.Error{Status: http.StatusNotFound, Code: "not_found"
 // loadVisible returns the skill only if the caller may see it; invisible
 // skills are indistinguishable from missing ones.
 func (s *Server) loadVisible(r *http.Request) (model.Skill, error) {
-	sk, err := s.Svc.Store.GetSkill(r.Context(), r.PathValue("ns"), r.PathValue("name"))
+	ns, name := r.PathValue("ns"), r.PathValue("name")
+	sk, err := s.Svc.Store.GetSkill(r.Context(), ns, name)
+	// A local miss may be forwarded to the upstream registries.
+	if errors.Is(err, model.ErrNotFound) {
+		if ferr := s.allowForward(r); ferr == nil {
+			sk, err = s.Svc.ResolveSkill(r.Context(), ns, name, true)
+		} else if ferr != errNoForward {
+			return model.Skill{}, ferr
+		}
+	}
 	if err != nil {
 		if errors.Is(err, model.ErrNotFound) {
 			return model.Skill{}, errNotFound
@@ -56,6 +65,9 @@ func skillJSON(sk model.Skill, latest string) map[string]any {
 	}
 	if sk.GlobalAlias != "" {
 		out["global_alias"] = sk.GlobalAlias
+	}
+	if sk.Upstream != "" {
+		out["upstream"] = sk.Upstream
 	}
 	return out
 }

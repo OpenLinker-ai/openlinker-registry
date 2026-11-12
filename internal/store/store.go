@@ -52,4 +52,65 @@ type Store interface {
 
 	AppendAudit(ctx context.Context, e model.AuditEvent) error
 	ListAudit(ctx context.Context, limit int) ([]model.AuditEvent, error)
+
+	// ListNamespaces returns every namespace ordered by name.
+	ListNamespaces(ctx context.Context) ([]model.Namespace, error)
+	// ListTokens returns every token (newest first). SecretHash is not set.
+	ListTokens(ctx context.Context) ([]model.Token, error)
+
+	// --- MCP servers ---
+
+	// PublishMCPVersion creates the server if needed and appends an immutable
+	// version atomically, deciding IsLatest under the server row lock. The
+	// namespace must be local (not upstream-managed). ConflictError codes:
+	// namespace_upstream_managed, mode_mismatch, version_exists,
+	// server_name_conflict (another server differs only by letter case).
+	PublishMCPVersion(ctx context.Context, in model.MCPPublishInput, audit model.AuditEvent) (model.MCPServer, model.MCPVersion, error)
+	// UpsertMirroredMCP stores one mirrored version: it creates the
+	// upstream-managed namespace and the server when missing, inserts the
+	// version, or updates the status fields and IsLatest of an existing one.
+	// It returns MirrorCreated, MirrorUpdated or MirrorUnchanged.
+	// ConflictError codes: namespace_upstream_managed (the namespace is local
+	// or belongs to another upstream), server_name_conflict, digest_mismatch
+	// (the stored version has a different server.json; it is left untouched).
+	UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput) (string, error)
+	// GetMCPServer looks a server up by its exact full name.
+	GetMCPServer(ctx context.Context, name string) (model.MCPServer, error)
+	// GetMCPVersion returns one version; version "latest" resolves to the
+	// version flagged IsLatest.
+	GetMCPVersion(ctx context.Context, serverID int64, version string) (model.MCPVersion, error)
+	// ListMCPVersions returns every version of a server, newest first.
+	ListMCPVersions(ctx context.Context, serverID int64) ([]model.MCPVersion, error)
+	// SetMCPStatus changes the status of one version, or of every version
+	// when version is "". It returns the number of versions changed. When the
+	// latest version is deleted, IsLatest moves to the best remaining
+	// non-deleted version (and back when a better version is restored).
+	SetMCPStatus(ctx context.Context, serverID int64, version, status, message string, at time.Time, audit model.AuditEvent) (int, error)
+	UpdateMCPServer(ctx context.Context, serverID int64, p model.MCPPatch, audit model.AuditEvent) (model.MCPServer, error)
+	// SearchMCP lists (server, version) rows; see model.MCPQuery.
+	SearchMCP(ctx context.Context, q model.MCPQuery) ([]model.MCPEntry, error)
+
+	// --- upstreams ---
+
+	// CreateUpstream stores a new upstream (ConflictError upstream_exists).
+	CreateUpstream(ctx context.Context, u model.Upstream, audit model.AuditEvent) (model.Upstream, error)
+	GetUpstream(ctx context.Context, name string) (model.Upstream, error)
+	// ListUpstreams returns upstreams ordered by priority, then name.
+	ListUpstreams(ctx context.Context) ([]model.Upstream, error)
+	UpdateUpstream(ctx context.Context, name string, p model.UpstreamPatch, audit model.AuditEvent) (model.Upstream, error)
+	// DeleteUpstream removes an upstream that manages no namespace
+	// (ConflictError upstream_in_use otherwise).
+	DeleteUpstream(ctx context.Context, name string, audit model.AuditEvent) error
+	// ClaimUpstreamSync marks the upstream as syncing and returns true unless
+	// a sync that started after staleBefore is still running. It is atomic
+	// across processes.
+	ClaimUpstreamSync(ctx context.Context, id int64, now, staleBefore time.Time) (bool, error)
+	// FinishUpstreamSync records a sync result and returns the upstream to
+	// idle. The cursor is stored only when the result status is SyncOK.
+	FinishUpstreamSync(ctx context.Context, id int64, res model.UpstreamSyncResult) error
+	// EnsureUpstreamNamespace returns the namespace managed by the upstream,
+	// creating it (kind "upstream") when missing. A namespace that is local
+	// or managed by another upstream yields ConflictError
+	// namespace_upstream_managed.
+	EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64) (model.Namespace, error)
 }

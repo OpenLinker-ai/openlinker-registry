@@ -1,0 +1,36 @@
+{{define "skill"}}{{template "head" .}}
+{{with .Data}}
+<p class="crumbs"><a href="{{$.Base}}/ui/">{{$.T "nav.skills"}}</a> / {{.Skill.Namespace}}</p>
+<h1>{{.Skill.Name}} <span class="mono muted">{{.Version.Version}}</span>
+  {{if ne .Skill.Status "active"}}{{template "status" .Skill.Status}}{{end}}
+  {{if .Version.YankedAt}}<span class="tag bad">yanked</span>{{end}}</h1>
+<p class="lead">{{.Version.FrontmatterDescription}}</p>
+{{if .Skill.StatusReason}}<p class="alert">{{.Skill.StatusReason}}</p>{{end}}
+<dl class="facts">
+  <dt>{{$.T "col.kind"}}</dt><dd>{{if .Skill.Upstream}}{{$.T "kind.mirrored"}} · {{.Skill.Upstream}}{{else if eq .Skill.Mode "hosted"}}{{$.T "kind.hosted"}}{{else}}{{$.T "kind.indexed"}}{{end}}</dd>
+  <dt>{{$.T "fact.visibility"}}</dt><dd>{{.Skill.Visibility}}{{if not .Skill.Listed}} · unlisted{{end}}</dd>
+  <dt>{{$.T "fact.license"}}</dt><dd>{{if .Version.LicenseID}}{{.Version.LicenseID}}{{else}}{{.Version.LicenseKind}}{{end}}</dd>
+  <dt>{{$.T "fact.digest"}}</dt><dd class="mono">{{.Version.ArtifactDigest}}</dd>
+  <dt>{{$.T "fact.published"}}</dt><dd>{{date .Version.CreatedAt}}</dd>
+  {{if .SourceURL}}<dt>{{$.T "fact.source"}}</dt><dd><a href="{{.SourceURL}}" rel="noreferrer noopener">{{.SourceURL}}</a></dd>{{end}}
+  {{if .Version.CheckResult}}<dt>{{$.T "fact.check"}}</dt><dd>{{.Version.CheckResult}} {{datep .Version.CheckedAt}}</dd>{{end}}
+</dl>
+{{if .Install}}<h2>{{$.T "install"}}</h2><pre class="code">{{.Install}}</pre>{{end}}
+{{if .ArtifactURL}}<p><a class="button" href="{{.ArtifactURL}}">{{$.T "download"}}</a>
+  {{if .ArchiveURL}}<a class="button" href="{{.ArchiveURL}}">.tar.gz</a>{{end}}</p>{{end}}
+{{if .ContentNote}}<p class="alert">{{.ContentNote}}</p>{{end}}
+{{if .SkillMD}}<h2>SKILL.md</h2><pre class="doc">{{.SkillMD}}</pre>{{end}}
+<h2>{{$.T "files"}}</h2>
+<table><thead><tr><th>{{$.T "col.path"}}</th><th>{{$.T "col.size"}}</th><th>sha256</th></tr></thead><tbody>
+{{range .Version.Files}}<tr><td class="mono">{{.Path}}</td><td>{{.Size}}</td><td class="mono">{{short .SHA256}}</td></tr>{{end}}
+</tbody></table>
+<h2>{{$.T "versions"}}</h2>
+<table><thead><tr><th>{{$.T "col.version"}}</th><th>{{$.T "fact.published"}}</th><th>{{$.T "fact.digest"}}</th><th></th></tr></thead><tbody>
+{{range .Versions}}<tr>
+  <td><a class="mono" href="{{$.Base}}/ui/skills/{{esc $.Data.Skill.Namespace}}/{{esc $.Data.Skill.Name}}/versions/{{esc .Version}}">{{.Version}}</a></td>
+  <td>{{date .CreatedAt}}</td><td class="mono">{{short .ArtifactDigest}}</td>
+  <td>{{if .YankedAt}}<span class="tag bad">yanked</span>{{end}}</td>
+</tr>{{end}}
+</tbody></table>
+{{end}}
+{{template "foot" .}}{{end}}

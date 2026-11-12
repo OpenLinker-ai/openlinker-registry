@@ -12,10 +12,12 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/ratelimit"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/registry"
 )
 
@@ -27,6 +29,20 @@ type Server struct {
 	AllowAnonRead  bool
 	MaxUploadBytes int64
 	Log            *slog.Logger
+
+	// Per-client limits; nil limiters allow everything.
+	ReadLimit    *ratelimit.Limiter
+	WriteLimit   *ratelimit.Limiter
+	ForwardLimit *ratelimit.Limiter
+	// Clients resolves client addresses behind trusted proxies.
+	Clients ratelimit.ClientAddr
+	// UI serves the built-in web pages when enabled.
+	UI bool
+	// SecureCookies marks the UI session cookie Secure (https deployments).
+	SecureCookies bool
+	// Background is the lifetime of work started by a request but finished
+	// after it (asynchronous syncs); nil means context.Background().
+	Background context.Context
 }
 
 const maxJSONBody = 64 << 10
@@ -54,7 +70,7 @@ func (s *Server) Handler() http.Handler {
 		outer.HandleFunc("GET /healthz", s.healthz)
 		h = outer
 	}
-	return s.recoverer(s.headers(s.logger(s.authenticate(h))))
+	return s.recoverer(s.headers(s.logger(s.authenticate(s.limit(h)))))
 }
 
 func (s *Server) routes(m *http.ServeMux) {
@@ -93,6 +109,12 @@ func (s *Server) routes(m *http.ServeMux) {
 	m.HandleFunc("PUT /v1/admin/skills/{ns}/{name}/alias", s.admin(s.setAlias))
 	m.HandleFunc("POST /v1/admin/skills/{ns}/{name}/versions/{version}/approve-license", s.admin(s.approveLicense))
 	m.HandleFunc("GET /v1/admin/audit", s.admin(s.listAudit))
+
+	s.mcpRoutes(m)
+	s.adminRoutes(m)
+	if s.UI {
+		s.uiRoutes(m)
+	}
 }
 
 // --- middleware ---
@@ -159,6 +181,15 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hdr := r.Header.Get("Authorization")
 		if hdr == "" {
+			// The built-in pages (and only they) authenticate by session
+			// cookie. A stale cookie means "signed out", not an error.
+			if s.isUIPath(r) {
+				if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+					if p, err := s.Auth.Authenticate(r.Context(), c.Value); err == nil {
+						r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, p))
+					}
+				}
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -229,6 +260,9 @@ func writeError(w http.ResponseWriter, e *registry.Error) {
 	body := map[string]any{"code": e.Code, "message": e.Msg}
 	if e.SourceURL != "" {
 		body["source_url"] = e.SourceURL
+	}
+	if e.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
 	}
 	writeJSON(w, e.Status, map[string]any{"error": body})
 }

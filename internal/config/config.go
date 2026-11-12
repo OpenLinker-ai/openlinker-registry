@@ -6,12 +6,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/OpenLinker-ai/openlinker-registry/internal/ratelimit"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 )
 
@@ -44,6 +46,37 @@ type Config struct {
 	// ArtifactGCGrace is how old an unreferenced artifact must be before it
 	// is garbage collected.
 	ArtifactGCGrace time.Duration
+
+	// UI enables the built-in web pages (default: on for private instances,
+	// off for public ones, whose pages are served by the site in front).
+	UI bool
+
+	// Upstream access (forwarding and mirroring).
+	UpstreamAllowHTTP  bool
+	UpstreamAllowCIDRs []netip.Prefix
+	UpstreamTimeout    time.Duration
+	// BackgroundSync runs upstream syncs whose interval has elapsed.
+	BackgroundSync bool
+
+	// Per-client limits per minute; 0 disables a limit.
+	RateLimitRead    int
+	RateLimitWrite   int
+	RateLimitForward int
+	// TrustedProxies are the reverse proxies whose X-Forwarded-For is used
+	// to identify clients.
+	TrustedProxies []netip.Prefix
+
+	getenv func(string) string
+}
+
+// UpstreamToken returns the bearer token configured for an upstream, read
+// from REGISTRY_UPSTREAM_TOKEN_<NAME> (name upper-cased, "-" as "_"). Tokens
+// are never stored in the database.
+func (c *Config) UpstreamToken(name string) string {
+	if c.getenv == nil {
+		return ""
+	}
+	return c.getenv("REGISTRY_UPSTREAM_TOKEN_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_")))
 }
 
 // Load reads REGISTRY_* environment variables and then args.
@@ -57,7 +90,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		}
 		return def
 	}
-	c := Config{}
+	c := Config{getenv: getenv}
 	fs := flag.NewFlagSet("openlinker-registry", flag.ContinueOnError)
 	fs.StringVar(&c.Listen, "listen", env("LISTEN", ":8080"), "listen address")
 	fs.StringVar(&c.BasePath, "base-path", env("BASE_PATH", ""), `URL path prefix, e.g. "/registry" or ""`)
@@ -80,6 +113,15 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	verify := fs.String("verify-interval", env("VERIFY_INTERVAL", "1h"), "re-verify indexed sources after this long (0 = every read)")
 	gcGrace := fs.String("artifact-gc-grace", env("ARTIFACT_GC_GRACE", "24h"), "minimum age of unreferenced artifacts before deletion")
 	cacheBytes := fs.String("cache-max-bytes", env("CACHE_MAX_BYTES", strconv.Itoa(1<<30)), "cache capacity in bytes")
+	ui := fs.String("ui", env("UI", ""), "serve the built-in web pages (default: true in private mode, false in public mode)")
+	upHTTP := fs.String("upstream-allow-http", env("UPSTREAM_ALLOW_HTTP", "false"), "allow http:// upstream URLs")
+	upCIDRs := fs.String("upstream-allow-cidrs", env("UPSTREAM_ALLOW_CIDRS", ""), "comma-separated private networks upstreams may live in")
+	upTimeout := fs.String("upstream-timeout", env("UPSTREAM_TIMEOUT", "30s"), "timeout for each upstream request")
+	bgSync := fs.String("background-sync", env("BACKGROUND_SYNC", "true"), "run scheduled upstream syncs in this process")
+	rlRead := fs.String("rate-limit-read", env("RATE_LIMIT_READ", "600"), "read requests per client per minute (0 = unlimited)")
+	rlWrite := fs.String("rate-limit-write", env("RATE_LIMIT_WRITE", "60"), "write requests per client per minute (0 = unlimited)")
+	rlForward := fs.String("rate-limit-forward", env("RATE_LIMIT_FORWARD", "30"), "reads forwarded to upstreams per client per minute (0 = unlimited)")
+	proxies := fs.String("trusted-proxies", env("TRUSTED_PROXIES", ""), "comma-separated reverse proxy addresses or networks whose X-Forwarded-For is trusted")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -130,6 +172,29 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		c.VerifyInterval = v
 	}
 	c.ArtifactGCGrace = parseDur("artifact-gc-grace", *gcGrace)
+	c.UI = parseBool("ui", *ui, c.Mode == "private")
+	c.UpstreamAllowHTTP = parseBool("upstream-allow-http", *upHTTP, false)
+	c.BackgroundSync = parseBool("background-sync", *bgSync, true)
+	c.UpstreamTimeout = parseDur("upstream-timeout", *upTimeout)
+	parseLimit := func(name, v string) int {
+		n, perr := strconv.Atoi(v)
+		if (perr != nil || n < 0 || n > 1_000_000) && err == nil {
+			err = fmt.Errorf("%s: must be an integer between 0 and 1000000", name)
+		}
+		return n
+	}
+	c.RateLimitRead = parseLimit("rate-limit-read", *rlRead)
+	c.RateLimitWrite = parseLimit("rate-limit-write", *rlWrite)
+	c.RateLimitForward = parseLimit("rate-limit-forward", *rlForward)
+	parsePrefixes := func(name, v string) []netip.Prefix {
+		ps, perr := ratelimit.ParsePrefixes(v)
+		if perr != nil && err == nil {
+			err = fmt.Errorf("%s: invalid address or network", name)
+		}
+		return ps
+	}
+	c.UpstreamAllowCIDRs = parsePrefixes("upstream-allow-cidrs", *upCIDRs)
+	c.TrustedProxies = parsePrefixes("trusted-proxies", *proxies)
 	if err != nil {
 		return Config{}, err
 	}

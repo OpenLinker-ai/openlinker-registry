@@ -1,0 +1,36 @@
+{{define "mcpserver"}}{{template "head" .}}
+{{with .Data}}
+<p class="crumbs"><a href="{{$.Base}}/ui/mcp">{{$.T "nav.mcp"}}</a></p>
+<h1>{{.Server.Name}} <span class="mono muted">{{.Version.Version}}</span> {{template "status" .Version.Status}}</h1>
+{{if .Doc.Title}}<p class="lead">{{.Doc.Title}}</p>{{end}}
+<p>{{.Doc.Description}}</p>
+{{if .Version.StatusMessage}}<p class="alert">{{.Version.StatusMessage}}</p>{{end}}
+{{if eq .Server.Mode "indexed"}}<p class="alert">{{$.T "mcp.indexed.note"}}</p>{{end}}
+<dl class="facts">
+  <dt>{{$.T "col.kind"}}</dt><dd>{{if eq .Server.Mode "mirrored"}}{{$.T "kind.mirrored"}} · {{.Server.Upstream}}{{else if eq .Server.Mode "registered"}}{{$.T "kind.registered"}}{{else}}{{$.T "kind.indexed"}}{{end}}</dd>
+  <dt>{{$.T "fact.visibility"}}</dt><dd>{{.Server.Visibility}}{{if not .Server.Listed}} · unlisted{{end}}</dd>
+  <dt>{{$.T "fact.published"}}</dt><dd>{{date .Version.PublishedAt}}</dd>
+  <dt>{{$.T "fact.digest"}}</dt><dd class="mono">{{.Version.Digest}}</dd>
+  {{if .Website}}<dt>{{$.T "fact.website"}}</dt><dd><a href="{{.Website}}" rel="noreferrer noopener">{{.Website}}</a></dd>{{end}}
+  {{if .Repository}}<dt>{{$.T "fact.repository"}}</dt><dd><a href="{{.Repository}}" rel="noreferrer noopener">{{.Repository}}</a></dd>{{end}}
+</dl>
+{{if .Doc.Remotes}}<h2>{{$.T "mcp.remotes"}}</h2>
+<table><thead><tr><th>{{$.T "col.transport"}}</th><th>URL</th></tr></thead><tbody>
+{{range .Doc.Remotes}}<tr><td><span class="tag">{{.Type}}</span></td><td class="mono">{{.URL}}</td></tr>{{end}}
+</tbody></table>
+{{if .Config}}<h3>{{$.T "mcp.config"}}</h3><pre class="code">{{.Config}}</pre>{{end}}
+{{else}}<p class="alert">{{$.T "mcp.selfhost"}}</p>{{end}}
+{{if .Doc.Packages}}<h2>{{$.T "mcp.packages"}}</h2>
+<table><thead><tr><th>{{$.T "col.registry"}}</th><th>{{$.T "col.package"}}</th><th>{{$.T "col.version"}}</th><th>{{$.T "col.transport"}}</th></tr></thead><tbody>
+{{range .Doc.Packages}}<tr><td>{{.RegistryType}}</td><td class="mono">{{.Identifier}}</td><td class="mono">{{.Version}}</td><td><span class="tag">{{.Transport.Type}}</span></td></tr>{{end}}
+</tbody></table>{{end}}
+<h2>{{$.T "versions"}}</h2>
+<table><thead><tr><th>{{$.T "col.version"}}</th><th>{{$.T "fact.published"}}</th><th>{{$.T "col.status"}}</th></tr></thead><tbody>
+{{range .Versions}}<tr>
+  <td><a class="mono" href="{{$.Base}}/ui/mcp/{{$.Data.Path}}/versions/{{esc .Version}}">{{.Version}}</a>{{if .IsLatest}} <span class="tag ok">latest</span>{{end}}</td>
+  <td>{{date .PublishedAt}}</td><td>{{template "status" .Status}}</td>
+</tr>{{end}}
+</tbody></table>
+<h2>server.json</h2><pre class="doc">{{.JSON}}</pre>
+{{end}}
+{{template "foot" .}}{{end}}

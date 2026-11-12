@@ -1,0 +1,55 @@
+# A private openlinker-registry with its own PostgreSQL.
+#
+#   cp env.example .env   # then set the three secrets
+#   docker compose up -d --build
+#   open http://localhost:8080/ui/   (sign in with REGISTRY_ADMIN_TOKEN)
+#
+# Put a TLS-terminating reverse proxy in front for anything but local use and
+# set REGISTRY_PUBLIC_URL to the external https URL.
+name: openlinker-registry
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: ${REGISTRY_POSTGRES_PASSWORD:?set REGISTRY_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: registry
+    volumes:
+      - registry-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d registry"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  registry:
+    build:
+      context: ..
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      REGISTRY_MODE: ${REGISTRY_MODE:-private}
+      REGISTRY_PUBLIC_URL: ${REGISTRY_PUBLIC_URL:-http://localhost:8080}
+      REGISTRY_DATABASE_URL: postgres://registry:${REGISTRY_POSTGRES_PASSWORD}@postgres:5432/registry?sslmode=disable
+      REGISTRY_ADMIN_TOKEN: ${REGISTRY_ADMIN_TOKEN:?set REGISTRY_ADMIN_TOKEN in .env (at least 32 characters)}
+      REGISTRY_GITHUB_TOKEN: ${REGISTRY_GITHUB_TOKEN:-}
+      # Reverse proxies whose X-Forwarded-For identifies clients for rate limits.
+      REGISTRY_TRUSTED_PROXIES: ${REGISTRY_TRUSTED_PROXIES:-}
+      # Private networks upstream registries may live in (public addresses are
+      # always allowed), e.g. 10.0.0.0/8.
+      REGISTRY_UPSTREAM_ALLOW_CIDRS: ${REGISTRY_UPSTREAM_ALLOW_CIDRS:-}
+      REGISTRY_UPSTREAM_ALLOW_HTTP: ${REGISTRY_UPSTREAM_ALLOW_HTTP:-false}
+      # Bearer token for an upstream named "hub": REGISTRY_UPSTREAM_TOKEN_HUB.
+      REGISTRY_UPSTREAM_TOKEN_HUB: ${REGISTRY_UPSTREAM_TOKEN_HUB:-}
+    ports:
+      - "${REGISTRY_BIND:-127.0.0.1:8080}:8080"
+    volumes:
+      - registry-data:/data
+
+volumes:
+  registry-db:
+  registry-data:

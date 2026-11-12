@@ -12,14 +12,18 @@ import (
 
 // Memory is an in-memory Store with the same semantics as the Postgres store.
 type Memory struct {
-	mu       sync.Mutex
-	nextID   int64
-	ns       map[string]model.Namespace
-	roles    map[string]map[string]model.Role // subject -> namespace -> role
-	tokens   map[string]model.Token
-	skills   map[int64]model.Skill
-	versions map[int64]model.Version
-	audit    []model.AuditEvent
+	mu        sync.Mutex
+	nextID    int64
+	ns        map[string]model.Namespace
+	roles     map[string]map[string]model.Role // subject -> namespace -> role
+	tokens    map[string]model.Token
+	tokenIDs  []string // creation order
+	skills    map[int64]model.Skill
+	versions  map[int64]model.Version
+	audit     []model.AuditEvent
+	upstreams map[int64]model.Upstream
+	mcp       map[int64]model.MCPServer
+	mcpVers   map[int64]model.MCPVersion
 }
 
 // NewMemory returns an empty in-memory store.
@@ -27,6 +31,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		ns: map[string]model.Namespace{}, roles: map[string]map[string]model.Role{},
 		tokens: map[string]model.Token{}, skills: map[int64]model.Skill{}, versions: map[int64]model.Version{},
+		upstreams: map[int64]model.Upstream{}, mcp: map[int64]model.MCPServer{}, mcpVers: map[int64]model.MCPVersion{},
 	}
 }
 
@@ -39,8 +44,13 @@ func conflict(code, msg string) error { return &model.ConflictError{Code: code, 
 // Ping implements Store.
 func (m *Memory) Ping(context.Context) error { return nil }
 
-// CreateNamespace implements Store.
+// CreateNamespace implements Store. It only creates local namespaces;
+// upstream-managed ones come from EnsureUpstreamNamespace.
 func (m *Memory) CreateNamespace(_ context.Context, ns model.Namespace, audit model.AuditEvent) (model.Namespace, error) {
+	if ns.Kind == model.NSKindUpstream {
+		return model.Namespace{}, ErrNamespaceKind()
+	}
+	ns.UpstreamID = 0
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.ns[ns.Name]; ok {
@@ -68,6 +78,18 @@ func (m *Memory) GetNamespace(_ context.Context, name string) (model.Namespace, 
 		return model.Namespace{}, model.ErrNotFound
 	}
 	return ns, nil
+}
+
+// ListNamespaces implements Store.
+func (m *Memory) ListNamespaces(context.Context) ([]model.Namespace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]model.Namespace, 0, len(m.ns))
+	for _, ns := range m.ns {
+		out = append(out, ns)
+	}
+	slices.SortFunc(out, func(a, b model.Namespace) int { return strings.Compare(a.Name, b.Name) })
+	return out, nil
 }
 
 // SetRole implements Store.
@@ -111,6 +133,7 @@ func (m *Memory) CreateToken(_ context.Context, t model.Token, roles []model.Rol
 	t.CreatedAt = time.Now().UTC()
 	t.Scopes = slices.Clone(t.Scopes)
 	m.tokens[t.ID] = t
+	m.tokenIDs = append(m.tokenIDs, t.ID)
 	subject := "token:" + t.ID
 	for _, rb := range roles {
 		if m.roles[subject] == nil {
@@ -133,6 +156,19 @@ func (m *Memory) GetToken(_ context.Context, id string) (model.Token, error) {
 	return t, nil
 }
 
+// ListTokens implements Store.
+func (m *Memory) ListTokens(context.Context) ([]model.Token, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]model.Token, 0, len(m.tokenIDs))
+	for _, id := range slices.Backward(m.tokenIDs) {
+		t := m.tokens[id]
+		t.SecretHash, t.Scopes = nil, slices.Clone(t.Scopes)
+		out = append(out, t)
+	}
+	return out, nil
+}
+
 // RevokeToken implements Store.
 func (m *Memory) RevokeToken(_ context.Context, id string, at time.Time, audit model.AuditEvent) error {
 	m.mu.Lock()
@@ -147,6 +183,13 @@ func (m *Memory) RevokeToken(_ context.Context, id string, at time.Time, audit m
 	}
 	m.appendAudit(audit)
 	return nil
+}
+
+// withUpstream fills the read-only Upstream field of a skill that is about to
+// leave the store; stored skills never carry it.
+func (m *Memory) withUpstream(s model.Skill) model.Skill {
+	s.Upstream = m.upstreamName(s.Namespace)
+	return s
 }
 
 func (m *Memory) findSkill(namespace, name string) (model.Skill, bool) {
@@ -166,15 +209,19 @@ func (m *Memory) GetSkill(_ context.Context, namespace, name string) (model.Skil
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
 	}
-	return s, nil
+	return m.withUpstream(s), nil
 }
 
 // PublishVersion implements Store.
 func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.ns[in.Namespace]; !ok {
+	ns, ok := m.ns[in.Namespace]
+	if !ok {
 		return model.Skill{}, model.Version{}, model.ErrNotFound
+	}
+	if ns.UpstreamID != in.UpstreamID {
+		return model.Skill{}, model.Version{}, model.ErrNamespaceManaged()
 	}
 	now := time.Now().UTC()
 	s, ok := m.findSkill(in.Namespace, in.Name)
@@ -217,7 +264,7 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 	s.Description, s.UpdatedAt = v.FrontmatterDescription, now
 	m.skills[s.ID] = s
 	m.appendAudit(audit)
-	return s, v, nil
+	return m.withUpstream(s), v, nil
 }
 
 // ListVersions implements Store (newest first).
@@ -283,7 +330,7 @@ func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatc
 	s.UpdatedAt = time.Now().UTC()
 	m.skills[skillID] = s
 	m.appendAudit(audit)
-	return s, nil
+	return m.withUpstream(s), nil
 }
 
 // SetSkillStatus implements Store.
@@ -300,7 +347,7 @@ func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason
 	s.Status, s.StatusReason, s.UpdatedAt = status, reason, time.Now().UTC()
 	m.skills[skillID] = s
 	m.appendAudit(audit)
-	return s, nil
+	return m.withUpstream(s), nil
 }
 
 // SetAlias implements Store.
@@ -382,7 +429,7 @@ func (m *Memory) Search(_ context.Context, q model.SearchQuery) ([]model.SkillSu
 		if q.AfterNS != "" && (s.Namespace < q.AfterNS || s.Namespace == q.AfterNS && s.Name <= q.AfterName) {
 			continue
 		}
-		out = append(out, model.SkillSummary{Skill: s, LatestVersion: lv.Version})
+		out = append(out, model.SkillSummary{Skill: m.withUpstream(s), LatestVersion: lv.Version})
 	}
 	slices.SortFunc(out, func(a, b model.SkillSummary) int {
 		if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
@@ -409,7 +456,7 @@ func (m *Memory) IndexCandidates(_ context.Context, namespace string, aliasOnly 
 			continue
 		}
 		if v, ok := m.latest(s.ID); ok {
-			out = append(out, model.IndexCandidate{Skill: s, Version: v})
+			out = append(out, model.IndexCandidate{Skill: m.withUpstream(s), Version: v})
 		}
 	}
 	slices.SortFunc(out, func(a, b model.IndexCandidate) int {

@@ -32,6 +32,13 @@ const (
 	MsgLicenseRequired  = "public hosted skills need a license on every non-yanked version"
 )
 
+// ErrNamespaceManaged is returned when a write targets a namespace owned by a
+// different party: local publishing into an upstream-managed namespace, or a
+// mirror write into a local namespace or another upstream's namespace.
+func ErrNamespaceManaged() error {
+	return &ConflictError{Code: "namespace_upstream_managed", Msg: "this namespace is managed by a different source"}
+}
+
 // ErrSkillYanked is returned when a yanked skill would change status.
 func ErrSkillYanked() error {
 	return &ConflictError{Code: "skill_yanked", Msg: "a yanked skill cannot change status"}
@@ -87,7 +94,10 @@ type Namespace struct {
 	Kind        string
 	GitHubID    *int64
 	DisplayName string
-	CreatedAt   time.Time
+	// UpstreamID is the upstream that manages this namespace (0 for local
+	// namespaces). Kind is NSKindUpstream exactly when it is set.
+	UpstreamID int64
+	CreatedAt  time.Time
 }
 
 // Token is a stored API token (only the secret hash is persisted).
@@ -121,8 +131,11 @@ type Skill struct {
 	Mode         string
 	SourceKey    string // indexed only
 	GlobalAlias  string // empty when unset
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// Upstream is the name of the upstream that manages the namespace ("" for
+	// local entries). Read-only.
+	Upstream  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Source describes where hosted bytes came from.
@@ -138,7 +151,7 @@ type Source struct {
 
 // Locator identifies indexed content without storing it.
 type Locator struct {
-	Kind string `json:"kind"` // github | url
+	Kind string `json:"kind"` // github | url | registry
 	// GitHub
 	Owner      string `json:"owner,omitempty"`
 	Repo       string `json:"repo,omitempty"`
@@ -146,9 +159,22 @@ type Locator struct {
 	Path       string `json:"path,omitempty"`
 	TreeSHA    string `json:"tree_sha,omitempty"`
 	SingleFile bool   `json:"single_file,omitempty"`
-	// URL (schema only in R1; no importer yet)
-	URL    string `json:"url,omitempty"`
-	Digest string `json:"digest,omitempty"`
+	// URL: an entry of an external agent-skills discovery index. Digest is
+	// the sha256 of the bytes at URL; EntryType is "skill-md" or "archive".
+	URL       string `json:"url,omitempty"`
+	Digest    string `json:"digest,omitempty"`
+	EntryType string `json:"entry_type,omitempty"`
+	// Registry: a version mirrored from an upstream registry. Upstream is
+	// the upstream name (also set for URL locators created by a sync);
+	// Namespace/Name/Version address the version there. Artifact and FullText
+	// record what the upstream itself serves, so this instance never
+	// redistributes more than its source does.
+	Upstream  string `json:"upstream,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Version   string `json:"version,omitempty"`
+	Artifact  bool   `json:"artifact,omitempty"`
+	FullText  bool   `json:"full_text,omitempty"`
 }
 
 // Version is an immutable published or indexed version. Only the review,
@@ -255,6 +281,10 @@ type PublishInput struct {
 	SourceKey  string
 	Visibility string // used only when creating the skill
 	Listed     bool   // used only when creating the skill
+	// UpstreamID must equal the namespace's UpstreamID (0 for local
+	// publishing); otherwise the store rejects the publish with the
+	// ConflictError code namespace_upstream_managed.
+	UpstreamID int64
 	Version    Version
 }
 

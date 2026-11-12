@@ -16,14 +16,27 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 )
 
-// Access returns what may be served for a version.
+// Access returns what may be served for a version. A version mirrored from
+// an upstream registry is served exactly as far as that registry serves it:
+// the upstream already applied its own hosting and license rules, and this
+// instance never redistributes more than its source does.
 func Access(v model.Version) skill.Access {
+	if l := v.Locator; l != nil && l.Kind == "registry" {
+		acc := skill.Access{FullText: l.FullText, Artifact: l.Artifact}
+		if !acc.FullText || !acc.Artifact {
+			acc.Reason = "upstream_withheld"
+		}
+		return acc
+	}
 	return skill.ContentAccess(v.Mode, v.LicenseKind, v.LicenseApproved)
 }
 
 // SourceURL returns a browsable source link for indexed or GitHub-imported
 // versions ("" otherwise).
 func (s *Service) SourceURL(v model.Version) string {
+	if l := v.Locator; l != nil && l.Kind == "url" {
+		return l.URL
+	}
 	if s.GitHub == nil {
 		return ""
 	}
@@ -80,29 +93,45 @@ func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Versi
 			return nil, nil, err
 		}
 	}
+	files, data, result := s.readSource(ctx, v)
+	if result != "" {
+		return nil, nil, s.markCheck(ctx, v, result)
+	}
+	_, _ = s.Blobs.Put(ctx, blobstore.Cache, data)
+	_ = s.Store.SetVersionCheck(ctx, v.ID, model.CheckOK, s.Now())
+	return files, data, nil
+}
+
+// readSource reads an indexed version from where its locator points and
+// verifies it against the recorded digests. It returns a check result ("" when
+// verified).
+func (s *Service) readSource(ctx context.Context, v model.Version) ([]skill.File, []byte, string) {
 	l := v.Locator
-	if l == nil || l.Kind != "github" || s.GitHub == nil {
-		return nil, nil, fail(http.StatusBadGateway, model.CheckSourceUnavailable, "the source cannot be read")
+	if l == nil {
+		return nil, nil, model.CheckSourceUnavailable
+	}
+	if l.Kind == "registry" || l.Kind == "url" {
+		return s.readMirrored(ctx, v)
+	}
+	if l.Kind != "github" || s.GitHub == nil {
+		return nil, nil, model.CheckSourceUnavailable
 	}
 	snap, err := s.GitHub.Fetch(ctx, github.Ref{Owner: l.Owner, Repo: l.Repo, Dir: l.Path, SingleFile: l.SingleFile}, l.Commit)
 	if err != nil {
 		var ge *github.Error
-		result := model.CheckSourceUnavailable
 		if errors.As(err, &ge) && ge.Code == "integrity_mismatch" {
-			result = model.CheckSourceChanged
+			return nil, nil, model.CheckSourceChanged
 		}
-		return nil, nil, s.markCheck(ctx, v, result)
+		return nil, nil, model.CheckSourceUnavailable
 	}
 	if snap.TreeSHA != l.TreeSHA {
-		return nil, nil, s.markCheck(ctx, v, model.CheckSourceChanged)
+		return nil, nil, model.CheckSourceChanged
 	}
 	_, data, err := s.snapshotArtifact(snap)
 	if err != nil || skill.Digest(data) != v.ArtifactDigest {
-		return nil, nil, s.markCheck(ctx, v, model.CheckSourceChanged)
+		return nil, nil, model.CheckSourceChanged
 	}
-	_, _ = s.Blobs.Put(ctx, blobstore.Cache, data)
-	_ = s.Store.SetVersionCheck(ctx, v.ID, model.CheckOK, s.Now())
-	return snap.Files, data, nil
+	return snap.Files, data, ""
 }
 
 // recentlyVerified reports whether v's source was verified successfully
@@ -238,16 +267,31 @@ func (s *Service) Eligible(c model.IndexCandidate, entryName string) (IndexEntry
 		return IndexEntry{}, false, "source_check_failed"
 	}
 	l := v.Locator
-	if l == nil || l.Kind != "github" || s.GitHub == nil {
+	switch {
+	case l == nil:
 		return IndexEntry{}, false, "no_stable_url"
-	}
-	if l.SingleFile {
+	case l.Kind == "github" && s.GitHub != nil && l.SingleFile:
 		// A single public file: point at the immutable raw URL of the commit.
 		e.Type, e.URL, e.Digest = "skill-md", s.GitHub.RawURL(l.Owner, l.Repo, l.Commit, path.Join(l.Path, skill.SkillFile)), v.ArtifactDigest
 		return e, true, ""
+	case l.Kind == "url" && l.EntryType == "skill-md":
+		// Likewise a single public file at the URL its own index publishes.
+		e.Type, e.URL, e.Digest = "skill-md", l.URL, v.ArtifactDigest
+		return e, true, ""
+	case l.Kind == "github" && s.GitHub == nil:
+		return IndexEntry{}, false, "no_stable_url"
+	case l.Kind != "github" && l.Kind != "url" && l.Kind != "registry":
+		return IndexEntry{}, false, "no_stable_url"
 	}
 	if !Access(v).Artifact {
 		return IndexEntry{}, false, "license_not_redistributable"
+	}
+	if v.ArtifactType == archive.TypeSkillMD {
+		e.Type, e.URL, e.Digest = "skill-md", s.VersionURL(sk.Namespace, sk.Name, v.Version, "artifact"), v.ArtifactDigest
+		return e, true, ""
+	}
+	if v.ArchiveDigest == "" {
+		return IndexEntry{}, false, "no_stable_url"
 	}
 	e.Type, e.URL, e.Digest = "archive", s.VersionURL(sk.Namespace, sk.Name, v.Version, "archive.tar.gz"), v.ArchiveDigest
 	return e, true, ""

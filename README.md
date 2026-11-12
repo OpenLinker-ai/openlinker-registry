@@ -1,20 +1,70 @@
 # openlinker-registry
 
-A standalone registry for Agent Skills. It stores **hosted** skills (immutable,
-content-addressed versions you upload or import from a fixed GitHub commit) and
-**indexed** skills (a locator, file manifest and digest for content that stays
-at its source), serves a read API, and publishes
-[agentskills.io discovery v0.2.0](https://schemas.agentskills.io/discovery/0.2.0/schema.json)
-indexes so standard clients such as `npx skills add` can install from it.
+A standalone registry for Agent Skills and MCP servers. One binary, one
+PostgreSQL database, a directory for blobs.
+
+It **stores** what you publish to it:
+
+- **Hosted skills**: immutable, content-addressed versions you upload or import
+  from a fixed GitHub commit.
+- **Indexed skills**: a locator, file manifest and digest for content that
+  stays at its source (a GitHub directory, or an entry of another site's
+  discovery index).
+- **MCP servers**: `server.json` documents, registered by the namespace owner
+  or indexed by someone else, with versions and status.
+
+It **forwards to and mirrors other registries** (upstreams): another
+openlinker-registry, any registry that speaks the official MCP Registry API
+(including `registry.modelcontextprotocol.io`), or a site that publishes an
+[agentskills.io discovery index](https://schemas.agentskills.io/discovery/0.2.0/schema.json).
+A read of something that is not stored locally can be forwarded to an
+upstream; upstreams can also be mirrored on a schedule. Content only flows
+in: nothing stored here is ever pushed to an upstream.
+
+It **serves standard clients**: discovery indexes for `npx skills add`, and
+the official MCP Registry read API under `/v0.1` (and `/v0`).
 
 The same binary serves a public instance (anonymous reads) and private
-deployments (authenticated reads by default).
+deployments (authenticated reads by default, with built-in web pages).
 
-> Status: **R1, first deliverable.** Not released, not deployed. See
-> [Not in R1](#not-in-r1).
+> Status: source only. Not released. See [Not included](#not-included).
+
+## Quick start (private instance)
+
+```sh
+cd deploy
+cp env.example .env        # set REGISTRY_POSTGRES_PASSWORD and REGISTRY_ADMIN_TOKEN
+docker compose up -d --build
+```
+
+Open `http://localhost:8080/ui/` and sign in with the admin token. Then, with
+`ADMIN=$REGISTRY_ADMIN_TOKEN` and `R=http://localhost:8080`:
+
+```sh
+# A namespace and a publishing token for it.
+curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"name":"internal.team","kind":"internal"}' $R/v1/admin/namespaces
+curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"name":"ci","scopes":["skills:read","skills:write"],"roles":[{"namespace":"internal.team","role":"publisher"}]}' \
+  $R/v1/admin/tokens          # the token is shown once
+
+# Store a skill and an MCP server.
+curl -sS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/markdown' \
+  --data-binary @SKILL.md "$R/v1/skills/internal.team/my-skill/versions?version=1.0.0"
+curl -sS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @server.json $R/v1/mcp/servers/internal.team
+
+# Forward to and mirror the official MCP Registry.
+curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"name":"official","kind":"mcp-registry","base_url":"https://registry.modelcontextprotocol.io",
+       "proxy_on_miss":true,"latest_only":true,"sync_interval_seconds":3600}' $R/v1/admin/upstreams
+```
 
 ## Boundary
 
+- Skill and MCP content is metadata and bytes. The registry never runs an MCP
+  server, never executes skill content and never stores secret values such as
+  authentication header values.
 - No dependency on any OpenLinker module (SDK, Core, Cloud, CLI, Node or
   Plugin). Dependencies are the Go standard library, `jackc/pgx/v5` and
   `gopkg.in/yaml.v3`. OpenLinker Core is expected to talk to the registry over
@@ -67,6 +117,14 @@ Secrets are read from the environment only.
 | `REGISTRY_CACHE_MAX_AGE` / `_CACHE_MAX_BYTES` | flags | `720h` / 1 GiB | Evictable cache for indexed content |
 | `REGISTRY_VERIFY_INTERVAL` | `-verify-interval` | `1h` | Cached indexed content is served only this long after the last successful source verification (`0` = verify on every read) |
 | `REGISTRY_ARTIFACT_GC_GRACE` | `-artifact-gc-grace` | `24h` | Unreferenced hosted artifacts (left by failed publishes) older than this are deleted hourly. GC and publishes of the same digest are serialized by an in-process per-digest lock, so one registry process must own a storage directory |
+| `REGISTRY_UI` | `-ui` | `true` if private, else `false` | Built-in web pages under `/ui/` |
+| `REGISTRY_UPSTREAM_TOKEN_<NAME>` | env only | unset | Bearer token for the upstream `<name>` (upper-cased, `-` as `_`). Never stored in the database; sent only to that upstream's own origin |
+| `REGISTRY_UPSTREAM_ALLOW_CIDRS` | `-upstream-allow-cidrs` | empty | Private networks upstreams may live in. Public addresses are always allowed; everything else is refused at connect time |
+| `REGISTRY_UPSTREAM_ALLOW_HTTP` | `-upstream-allow-http` | `false` | Allow `http://` upstream URLs |
+| `REGISTRY_UPSTREAM_TIMEOUT` | `-upstream-timeout` | `30s` | Per-request timeout for upstreams |
+| `REGISTRY_BACKGROUND_SYNC` | `-background-sync` | `true` | Run scheduled upstream syncs in this process |
+| `REGISTRY_RATE_LIMIT_READ` / `_WRITE` / `_FORWARD` | flags | 600 / 60 / 30 | Requests per client per minute: reads, writes, and misses forwarded to upstreams (`0` = unlimited). Clients are the token subject, or the address when anonymous. Limits are per process |
+| `REGISTRY_TRUSTED_PROXIES` | `-trusted-proxies` | empty | Reverse proxies whose `X-Forwarded-For` identifies the client |
 
 ## API summary
 
@@ -103,15 +161,98 @@ Invisible entries return 404 on every read path.
 | `POST /v1/skills/{ns}/{name}/deprecate`, `…/yank`, `…/versions/{v}/yank` | Optional `{"reason"}` |
 | `PATCH /v1/skills/{ns}/{name}` | Owner role: `{"visibility","listed"}` |
 
+### MCP servers
+
+| Method and path | Notes |
+|---|---|
+| `GET /v1/mcp/servers?q=&namespace=&mode=&version=&limit=&cursor=` | One row per server at its latest version (`version=all` for every version) |
+| `GET /v1/mcp/servers/{ns}/{name}`, `…/versions/{v}` | Detail with versions; one version (`latest` allowed) |
+| `POST /v1/mcp/servers/{ns}?visibility=&listed=&indexed=` | Body is a `server.json`; its name must be `{ns}/…`. `indexed=true` marks an entry not published by the server's author. Publisher role |
+| `POST /v1/mcp/servers/{ns}/{name}/status`, `…/versions/{v}/status` | `{"status":"active\|deprecated\|deleted","message"}` for all versions or one |
+| `PATCH /v1/mcp/servers/{ns}/{name}` | Owner role: `{"visibility","listed"}` |
+| `GET /v0.1/servers?search=&cursor=&limit=&updated_since=&version=&include_deleted=` | Official MCP Registry list: one record per version ordered by name then version; `version=latest` for latest only; `updated_since` includes deletions |
+| `GET /v0.1/servers/{serverName}/versions`, `…/versions/{version\|latest}` | Official read endpoints; `serverName` is URL-encoded (`io.github.a%2Fb`); a decoded slash is accepted too |
+| `POST /v0.1/publish` | Body is a `server.json`; authorized by a registry token with the publisher role in the name's namespace |
+
+Every `/v0.1` path is also served under `/v0`. Responses follow the official
+shapes (`{"servers":[{"server":…,"_meta":{"io.modelcontextprotocol.registry/official":…}}],"metadata":{"nextCursor","count"}}`,
+errors `{"error":"…"}`); this registry's own facts (mode, upstream, digest) are
+under `_meta["ai.openlinker.registry/entry"]`.
+
 ### Admin (`admin` scope or bootstrap token)
 
-`POST /v1/admin/namespaces`, `POST /v1/admin/namespaces/{ns}/roles`,
-`POST /v1/admin/tokens` (returns the plaintext once), `POST /v1/admin/tokens/{id}/revoke`,
+`POST /v1/admin/namespaces`, `GET /v1/admin/namespaces`,
+`POST /v1/admin/namespaces/{ns}/roles`,
+`POST /v1/admin/tokens` (returns the plaintext once), `GET /v1/admin/tokens`,
+`POST /v1/admin/tokens/{id}/revoke`,
 `PUT /v1/admin/skills/{ns}/{name}/alias`,
 `POST /v1/admin/skills/{ns}/{name}/versions/{v}/approve-license`, `GET /v1/admin/audit`.
+`GET /v1/whoami` describes the caller.
+
+Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams/{name}`,
+`POST /v1/admin/upstreams/{name}/sync[?wait=true]`.
+
+## Upstreams: forwarding and mirroring
+
+```json
+{"name": "hub", "kind": "openlinker-registry", "base_url": "https://registry.example.com",
+ "proxy_on_miss": true, "sync_interval_seconds": 3600, "visibility": "internal",
+ "namespace_allow": ["com.example.*"], "namespace_deny": [], "priority": 100}
+```
+
+| Kind | Upstream | What is mirrored |
+|---|---|---|
+| `openlinker-registry` | Another openlinker-registry | Skills (through `/v1`) and MCP servers (through `/v0.1`) |
+| `mcp-registry` | Any registry with the official MCP read API | MCP servers; `latest_only` keeps one version per server |
+| `agent-skills` | A site with `/.well-known/agent-skills/index.json` | Its skills, into the local `target_namespace`; each digest becomes version `sha-<12 hex>` |
+
+- **Forward on miss** (`proxy_on_miss`): a direct read of a skill or MCP
+  server that is not stored here is looked up on the upstreams, in priority
+  order, and the answer is mirrored. Listings and search only show what is
+  already here, so use a sync interval for a complete catalogue.
+- **Sync** (`sync_interval_seconds`, or `POST …/sync`): MCP servers are synced
+  incrementally with `updated_since`; skills are listed in full and details
+  fetched only for those that changed. Status changes, yanks and deletions
+  propagate. One run per upstream is active at a time, across replicas.
+- **Bytes are pulled through and verified.** Mirroring a skill records its
+  metadata; the artifact is fetched from the upstream on first read, checked
+  against the recorded sha256 digest and file manifest, then cached. A
+  mismatch is recorded as `source_changed` and nothing is served.
+- **A mirror serves no more than its source.** Whether artifact bytes and
+  file text may be served is taken from the upstream's own answer.
+- **Ownership.** Mirrored entries keep their upstream namespace, which
+  becomes read-only here and belongs to that one upstream. A namespace that
+  exists locally is never forwarded or overwritten; conflicts are counted in
+  the sync result. Mirrored entries are `public` or `internal`, never private.
+- **Outbound safety.** Upstream URLs must be https and resolve to public
+  addresses unless explicitly allowed; the connected address is checked after
+  DNS resolution, redirects are not followed, responses are size-capped.
+  Tokens are sent only to the upstream's own origin. URLs found inside an
+  upstream's data are fetched under the same policy, without the token unless
+  they are on the upstream's origin.
+- **MCP documents** from upstreams are validated leniently; literal secret
+  values are removed before storing, so the stored digest is this registry's.
+
+## Built-in pages
+
+Private instances serve read-only pages under `/ui/`: skills, MCP servers
+(with a client configuration snippet), and upstream status for administrators.
+English and Chinese, chosen by `Accept-Language`. No scripts and no third-party
+resources. Sign-in takes an API token and keeps it in an `HttpOnly`,
+`SameSite=Strict` cookie scoped to `/ui/`; the JSON API never reads that
+cookie. The public instance leaves pages to the site in front of it
+(`REGISTRY_UI=true` enables them when the registry has its own origin).
 
 ## Key rules
 
+- **MCP servers.** Names follow the official pattern `<namespace>/<name>`; the
+  namespace part (lowercased) must be a namespace of this registry, and names
+  that differ only by letter case are rejected. Published documents are
+  validated against the official `server.json` rules (2025-12-11), stored in
+  canonical form, and identified by the sha256 of that form. Versions are
+  immutable; only status changes. "Latest" is the highest semantic version
+  that is not deleted, or the most recently published when versions are not
+  semantic. A document with a literal secret value is rejected.
 - **Names.** Skill names are slugs (`[a-z0-9]+(-[a-z0-9]+)*`, max 64).
   Namespaces are lowercase reverse-DNS: `io.github.<login>` (bound to the
   numeric GitHub id, which must be unique), `ai.openlinker.<handle>` (public
@@ -155,13 +296,16 @@ Invisible entries return 404 on every read path.
   is the same empty index as for a namespace without public entries.
   Duplicate-source conflicts do not name the existing entry.
 
-## Not in R1
+## Not included
 
-MCP endpoints (`/v1/mcp`, `/v0`), the built-in web UI for private instances,
-GitHub OAuth login and namespace self-service, GitHub Actions OIDC, Core
-gateway assertions, URL/well-known indexing (schema exists, importer does not),
-claims, shares, upstream sync and mirroring, S3 storage (interface exists),
-rate limiting and review queues, offline bundles, publisher signatures.
+OpenLinker Core integration (catalog proxy, gateway assertions, import into
+Core), GitHub OAuth login and namespace self-service, GitHub Actions OIDC,
+enterprise OIDC single sign-on, DNS/HTTP namespace verification, claims and
+shares, review queues and abuse reports, offline bundles, publisher
+signatures, S3 storage (the interface exists; blobs are on local disk, so one
+process owns a storage directory), rate limits shared between replicas,
+indexing a single arbitrary URL by hand (discovery indexes are synced as
+upstreams), write access from the built-in pages.
 
 ## Tests
 
