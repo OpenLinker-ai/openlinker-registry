@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -233,21 +234,42 @@ var mirrorTests = []testCase{
 		if _, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{Visibility: &internal}, audit); err != nil {
 			t.Fatal(err)
 		}
-		stale := mirrorInput(up, "org.mirror/srv", "1.0.0") // carries the old "public"
-		mirrorMCP(t, st, stale, model.MirrorCreated)
-		if got := mcpServer(t, st, "org.mirror/srv"); got.Visibility != internal {
-			t.Fatalf("mirrored server written with stale settings: %+v", got)
+		// Written by the settings the sync read before the change: refused,
+		// and nothing is left behind, not even the namespace.
+		stale := mirrorInput(up, "org.mirror/srv", "1.0.0")
+		if _, err := st.UpsertMirroredMCP(ctx, stale, audit); conflictCode(err) != "upstream_config_changed" {
+			t.Fatalf("mirror write under old settings: %v", err)
 		}
-		mirrorMCP(t, st, stale, model.MirrorUnchanged)
 		v := version("1", "spdx")
 		v.Source, v.Locator = nil, &model.Locator{Kind: "registry"}
-		sk, _, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "org.mirror", Name: "tool", Mode: "indexed",
-			SourceKey: "upstream:up:org.mirror/tool", Visibility: public, Listed: true, UpstreamID: up.ID, Version: v}, audit)
+		skillIn := model.PublishInput{Namespace: "org.mirror", Name: "tool", Mode: "indexed", SourceKey: "upstream:up:org.mirror/tool",
+			Visibility: public, Listed: true, UpstreamID: up.ID, UpstreamConfigVersion: up.ConfigVersion, Version: v}
+		if _, _, err := st.PublishVersion(ctx, skillIn, audit); conflictCode(err) != "upstream_config_changed" {
+			t.Fatalf("mirror publish under old settings: %v", err)
+		}
+		if _, err := st.GetNamespace(ctx, "org.mirror"); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a refused mirror write created the namespace: %v", err)
+		}
+		// Under the current settings the write goes through, and can never
+		// be more public than the upstream is configured to mirror.
+		now, err := st.GetUpstream(ctx, "up")
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := mirrorInput(now, "org.mirror/srv", "1.0.0")
+		current.Visibility = public
+		mirrorMCP(t, st, current, model.MirrorCreated)
+		if got := mcpServer(t, st, "org.mirror/srv"); got.Visibility != internal {
+			t.Fatalf("mirrored server more public than its upstream allows: %+v", got)
+		}
+		mirrorMCP(t, st, current, model.MirrorUnchanged)
+		skillIn.UpstreamConfigVersion = now.ConfigVersion
+		sk, _, err := st.PublishVersion(ctx, skillIn, audit)
 		if err != nil || sk.Visibility != internal {
-			t.Fatalf("mirrored skill written with stale settings: %+v, %v", sk, err)
+			t.Fatalf("mirrored skill more public than its upstream allows: %+v, %v", sk, err)
 		}
 		if got, err := st.UpdateSkill(ctx, sk.ID, model.SkillPatch{Visibility: &public}, audit); err != nil || got.Visibility != internal {
-			t.Fatalf("mirrored skill patched with stale settings: %+v, %v", got, err)
+			t.Fatalf("mirrored skill patched more public than its upstream allows: %+v, %v", got, err)
 		}
 		// Local entries are not affected by any upstream.
 		local, _, err := publish(st, "local", internal, "1", "spdx")
@@ -282,7 +304,7 @@ var mirrorTests = []testCase{
 		if got := finish(before.ConfigVersion, "stale"); got != "" {
 			t.Fatalf("a run under older settings stored its cursor %q", got)
 		}
-		now, _ := st.GetUpstream(ctx, "up")
+		now, _ = st.GetUpstream(ctx, "up")
 		if now.ConfigVersion <= before.ConfigVersion {
 			t.Fatalf("a selection change must advance the config version: %d -> %d", before.ConfigVersion, now.ConfigVersion)
 		}

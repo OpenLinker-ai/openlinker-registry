@@ -299,3 +299,16 @@ func (m *Memory) mirrorVisibility(upstreamID int64, v string) string {
 	}
 	return v
 }
+
+// upstreamCurrent checks that a write on behalf of an upstream was prepared
+// under the upstream's current settings.
+func (m *Memory) upstreamCurrent(upstreamID, configVersion int64) error {
+	u, ok := m.upstreams[upstreamID]
+	if !ok {
+		return model.ErrNotFound
+	}
+	if u.ConfigVersion != configVersion {
+		return model.ErrUpstreamConfigChanged()
+	}
+	return nil
+}

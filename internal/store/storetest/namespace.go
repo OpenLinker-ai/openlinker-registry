@@ -150,8 +150,17 @@ var namespaceTests = []testCase{
 				t.Fatalf("rejected publish into %s created the skill", c.ns)
 			}
 		}
-		if _, err := pub("org.missing", up.ID); !errors.Is(err, model.ErrNotFound) {
-			t.Fatalf("missing namespace: %v", err)
+		// A local publish needs its namespace; a publish for an upstream
+		// creates the upstream's namespace when it is missing.
+		if _, err := pub("org.nowhere", 0); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("local publish into a missing namespace: %v", err)
+		}
+		created, err := pub("org.fresh", up.ID)
+		if err != nil || created.Upstream != "up" {
+			t.Fatalf("mirror publish into a missing namespace: %+v, %v", created, err)
+		}
+		if ns, err := st.GetNamespace(ctx, "org.fresh"); err != nil || ns.UpstreamID != up.ID || ns.Kind != model.NSKindUpstream {
+			t.Fatalf("namespace created by a mirror publish: %+v, %v", ns, err)
 		}
 		local, err := pub("com.example", 0)
 		if err != nil || local.Upstream != "" {
@@ -163,7 +172,7 @@ var namespaceTests = []testCase{
 		}
 
 		// Every read path reports the managing upstream.
-		want := map[string]string{"com.example": "", "org.mirror": "up"}
+		want := map[string]string{"com.example": "", "org.mirror": "up", "org.fresh": "up"}
 		for ns, upstream := range want {
 			if got, err := st.GetSkill(ctx, ns, "s"); err != nil || got.Upstream != upstream {
 				t.Fatalf("GetSkill %s: upstream %q, %v", ns, got.Upstream, err)
@@ -177,7 +186,7 @@ var namespaceTests = []testCase{
 			t.Fatalf("SetSkillStatus: upstream %q, %v", got.Upstream, err)
 		}
 		found, err := st.Search(ctx, model.SearchQuery{})
-		if err != nil || len(found) != 2 {
+		if err != nil || len(found) != len(want) {
 			t.Fatalf("Search: %d rows, %v", len(found), err)
 		}
 		for _, sum := range found {
@@ -186,7 +195,7 @@ var namespaceTests = []testCase{
 			}
 		}
 		cands, err := st.IndexCandidates(ctx, "", false)
-		if err != nil || len(cands) != 2 {
+		if err != nil || len(cands) != len(want) {
 			t.Fatalf("IndexCandidates: %d rows, %v", len(cands), err)
 		}
 		for _, c := range cands {

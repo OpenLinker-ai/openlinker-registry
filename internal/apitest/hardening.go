@@ -683,6 +683,61 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("settings changed during a sync", func(t *testing.T) {
+		// While a sync waits for a listing, an administrator denies a
+		// namespace. The page that then arrives was selected by the old
+		// settings; nothing of it may be written, not even the namespace.
+		var e *Env
+		patched := false
+		entry := func(name string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": "1.0.0",
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}}
+		}
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path != "/v0.1/servers" {
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				return
+			}
+			if !patched {
+				patched = true
+				body := strings.NewReader(`{"namespace_deny":["com.denied"]}`)
+				req, _ := http.NewRequest("PATCH", e.Base+"/v1/admin/upstreams/feed", body)
+				req.Header.Set("Authorization", "Bearer "+AdminToken)
+				req.Header.Set("Content-Type", "application/json")
+				res, err := http.DefaultClient.Do(req)
+				if err != nil || res.StatusCode != 200 {
+					t.Errorf("patch during the sync: %v %v", res, err)
+				}
+				if res != nil {
+					res.Body.Close()
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{entry("com.denied/server"), entry("com.ok/server")}})
+		}))
+		t.Cleanup(fake.Close)
+		e = NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		r := e.Expect(e.Do("POST", "/v1/admin/upstreams/feed/sync?wait=true", AdminToken, "", nil), 200, "sync")
+		if s := r.JSON["sync"].(map[string]any); s["last_status"] != "failed" || !strings.Contains(s["last_error"].(string), "settings changed") {
+			t.Fatalf("a sync overtaken by a settings change: %v", s)
+		}
+		if got := servers(e.Do("GET", "/v0.1/servers?include_deleted=true", AdminToken, "", nil)); len(got) != 0 {
+			t.Fatalf("entries selected by the old settings were written: %d", len(got))
+		}
+		if r = e.Do("GET", "/v1/admin/namespaces", AdminToken, "", nil); len(r.JSON["namespaces"].([]any)) != 0 {
+			t.Fatalf("a namespace was created under the old settings: %s", r.Body)
+		}
+		// The next run works by the new settings.
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_created") != 1 || stat(s, "mcp_skipped") != 1 {
+			t.Fatalf("sync under the new settings: %v", s)
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers/com.ok%2Fserver/versions/latest", "", "", nil), 200, "allowed entry")
+		e.Expect(e.Do("GET", "/v0.1/servers/com.denied%2Fserver/versions/latest", AdminToken, "", nil), 404, "denied entry")
+	})
+
 	t.Run("watermark", func(t *testing.T) {
 		// One entry the mirror rejects claims an update far in the future;
 		// one good entry was updated in the past. The watermark may only
@@ -694,7 +749,9 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": "1.0.0",
 				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse?api_key={key}&token=LEAK-QUERY",
 					"variables": map[string]any{"key": map[string]any{"default": "LEAK-VARIABLE"}},
-					"headers":   []map[string]any{{"name": "Authorization", "value": "Bearer LEAK-HEADER"}}}}},
+					"headers":   []map[string]any{{"name": "Authorization", "value": "Bearer LEAK-HEADER"}}}},
+				"packages": []map[string]any{{"registryType": "npm", "identifier": "pkg", "transport": map[string]any{"type": "stdio"},
+					"packageArguments": []map[string]any{{"type": "named", "name": "--cookie", "value": "sid=LEAK-FLAG"}}}}},
 				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true, "updatedAt": updated, "publishedAt": updated}}}
 		}
 		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

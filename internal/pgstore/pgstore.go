@@ -245,19 +245,31 @@ func grantRole(ctx context.Context, tx pgx.Tx, namespace, subject string, role m
 	return err
 }
 
-// mirrorVisibility returns the visibility a write on behalf of an upstream
-// may give an entry: never public while the upstream mirrors as internal.
-// The upstream row is share-locked for the rest of the transaction, so the
-// write is ordered against UpdateUpstream: either it sees the lowered
-// setting, or UpdateUpstream lowers what it wrote. Every such write takes
-// this lock before any entry row, the same order as UpdateUpstream.
-func mirrorVisibility(ctx context.Context, tx pgx.Tx, upstreamID int64, v string) (string, error) {
+// mirrorGuard is taken by every write on behalf of an upstream before it
+// touches an entry. It share-locks the upstream row for the rest of the
+// transaction, which orders the write against UpdateUpstream (which locks
+// the row first too), and then:
+//
+//   - refuses the write when the upstream's settings are no longer the ones
+//     the caller prepared it under (configVersion; -1 skips this check for a
+//     write that depends on none of them);
+//   - returns the visibility the write may give an entry: never public
+//     while the upstream mirrors as internal.
+//
+// So a write either sees the new settings, or commits first and is then
+// corrected by UpdateUpstream.
+func mirrorGuard(ctx context.Context, tx pgx.Tx, upstreamID, configVersion int64, v string) (string, error) {
 	if upstreamID == 0 {
 		return v, nil
 	}
 	var limit string
-	if err := tx.QueryRow(ctx, `SELECT visibility FROM upstreams WHERE id = $1 FOR SHARE`, upstreamID).Scan(&limit); err != nil {
+	var current int64
+	if err := tx.QueryRow(ctx, `SELECT visibility, config_version FROM upstreams WHERE id = $1 FOR SHARE`, upstreamID).
+		Scan(&limit, &current); err != nil {
 		return "", notFound(err)
+	}
+	if configVersion >= 0 && current != configVersion {
+		return "", model.ErrUpstreamConfigChanged()
 	}
 	if limit == model.VisibilityInternal && v == model.VisibilityPublic {
 		return model.VisibilityInternal, nil
@@ -375,8 +387,22 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 	var outSkill model.Skill
 	var outVer model.Version
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		// For an upstream: the guard first, then its namespace, created
+		// when missing (in this transaction, so a refused publish leaves no
+		// namespace behind).
+		visibility, err := mirrorGuard(ctx, tx, in.UpstreamID, in.UpstreamConfigVersion, in.Visibility)
+		if err != nil {
+			return err
+		}
 		var nsID, nsUpstream int64
-		if err := tx.QueryRow(ctx, `SELECT id, COALESCE(upstream_id, 0) FROM namespaces WHERE name = $1`, in.Namespace).
+		if in.UpstreamID != 0 {
+			ns, err := ensureUpstreamNS(ctx, tx, in.Namespace, in.UpstreamID, model.AuditEvent{Actor: audit.Actor,
+				Action: "namespace.mirror", Namespace: in.Namespace, Details: map[string]any{"upstream_id": in.UpstreamID}})
+			if err != nil {
+				return err
+			}
+			nsID, nsUpstream = ns.ID, ns.UpstreamID
+		} else if err := tx.QueryRow(ctx, `SELECT id, COALESCE(upstream_id, 0) FROM namespaces WHERE name = $1`, in.Namespace).
 			Scan(&nsID, &nsUpstream); err != nil {
 			return notFound(err)
 		}
@@ -384,10 +410,6 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		// needs no lock.
 		if nsUpstream != in.UpstreamID {
 			return model.ErrNamespaceManaged()
-		}
-		visibility, err := mirrorVisibility(ctx, tx, in.UpstreamID, in.Visibility)
-		if err != nil {
-			return err
 		}
 		var sourceKey *string
 		if in.SourceKey != "" {
@@ -536,14 +558,14 @@ func (s *Store) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPat
 	var out model.Skill
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
 		// The upstream of a mirrored skill, read (and share-locked) before
-		// the skill row: see mirrorVisibility.
+		// the skill row: see mirrorGuard.
 		var upstreamID int64
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(n.upstream_id, 0) FROM skills s JOIN namespaces n ON n.id = s.namespace_id
 			WHERE s.id = $1`, skillID).Scan(&upstreamID); err != nil {
 			return notFound(err)
 		}
 		if p.Visibility != nil {
-			v, err := mirrorVisibility(ctx, tx, upstreamID, *p.Visibility)
+			v, err := mirrorGuard(ctx, tx, upstreamID, -1, *p.Visibility)
 			if err != nil {
 				return err
 			}

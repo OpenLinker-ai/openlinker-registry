@@ -155,6 +155,11 @@ func (m *Memory) PublishMCPVersion(_ context.Context, in model.MCPPublishInput, 
 func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.upstreams[in.UpstreamID]; ok {
+		if err := m.upstreamCurrent(in.UpstreamID, in.ConfigVersion); err != nil {
+			return "", err
+		}
+	}
 	ns, createNS, err := m.upstreamNS(in.Namespace, in.UpstreamID)
 	if err != nil {
 		return "", err

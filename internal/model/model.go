@@ -39,6 +39,12 @@ func ErrNamespaceManaged() error {
 	return &ConflictError{Code: "namespace_upstream_managed", Msg: "this namespace is managed by a different source"}
 }
 
+// ErrUpstreamConfigChanged is returned when a write on behalf of an upstream
+// was prepared under settings that have changed since.
+func ErrUpstreamConfigChanged() error {
+	return &ConflictError{Code: "upstream_config_changed", Msg: "the upstream's settings changed; the sync has to start again"}
+}
+
 // ErrSkillYanked is returned when a yanked skill would change status.
 func ErrSkillYanked() error {
 	return &ConflictError{Code: "skill_yanked", Msg: "a yanked skill cannot change status"}
@@ -287,6 +293,13 @@ type PublishInput struct {
 	// publishing); otherwise the store rejects the publish with the
 	// ConflictError code namespace_upstream_managed.
 	UpstreamID int64
+	// UpstreamConfigVersion is the upstream's ConfigVersion the caller read
+	// its settings (allow and deny lists, visibility) under. The store
+	// refuses the write (ErrUpstreamConfigChanged) when the settings have
+	// changed since, in the same transaction, so a sync that is still running
+	// under old settings cannot write by them. For a write on behalf of an
+	// upstream the namespace is created when missing.
+	UpstreamConfigVersion int64
 	// ExpectNewest, when set, is the version that must currently be the
 	// newest of the skill ("" for none). A mirror uses it so that two
 	// concurrent refreshes cannot interleave and leave versions out of the

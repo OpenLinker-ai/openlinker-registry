@@ -89,11 +89,14 @@ type MCPPublishInput struct {
 // an existing server too, in the same transaction as the version.
 type MCPMirrorInput struct {
 	UpstreamID int64
-	Namespace  string
-	Name       string
-	Visibility string
-	Listed     bool
-	Version    MCPVersion
+	// ConfigVersion is the upstream's ConfigVersion the caller read its
+	// settings under (see PublishInput.UpstreamConfigVersion).
+	ConfigVersion int64
+	Namespace     string
+	Name          string
+	Visibility    string
+	Listed        bool
+	Version       MCPVersion
 	// Fresh says the document was read from the upstream just now, under
 	// the entry's mirror lock. A document that is not fresh (it came with a
 	// listing page read some time ago) may be older than what a fresh read

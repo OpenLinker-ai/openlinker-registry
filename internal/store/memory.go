@@ -226,7 +226,16 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ns, ok := m.ns[in.Namespace]
-	if !ok {
+	createNS := false
+	if in.UpstreamID != 0 {
+		if err := m.upstreamCurrent(in.UpstreamID, in.UpstreamConfigVersion); err != nil {
+			return model.Skill{}, model.Version{}, err
+		}
+		var err error
+		if ns, createNS, err = m.upstreamNS(in.Namespace, in.UpstreamID); err != nil {
+			return model.Skill{}, model.Version{}, err
+		}
+	} else if !ok {
 		return model.Skill{}, model.Version{}, model.ErrNotFound
 	}
 	if ns.UpstreamID != in.UpstreamID {
@@ -276,6 +285,12 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 		if newest != *in.ExpectNewest {
 			return model.Skill{}, model.Version{}, conflict("version_order", "the newest version is not the expected one")
 		}
+	}
+	if createNS {
+		// Created last: by now nothing can refuse the publish any more.
+		m.createUpstreamNS(ns)
+		m.appendAudit(model.AuditEvent{Actor: audit.Actor, Action: "namespace.mirror", Namespace: in.Namespace,
+			Details: map[string]any{"upstream_id": in.UpstreamID}})
 	}
 	v := in.Version
 	v.ID, v.SkillID, v.CreatedAt, v.Mode = m.id(), s.ID, now, in.Mode

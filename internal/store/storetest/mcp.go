@@ -56,8 +56,8 @@ func publishMCP(t *testing.T, st store.Store, in model.MCPPublishInput) (model.M
 func mirrorInput(up model.Upstream, name, version string) model.MCPMirrorInput {
 	ns, _, _ := strings.Cut(name, "/")
 	doc := serverJSON(name, version, "", "")
-	return model.MCPMirrorInput{UpstreamID: up.ID, Namespace: strings.ToLower(ns), Name: name, Visibility: up.Visibility, Listed: true,
-		Fresh: true, Version: model.MCPVersion{Version: version, ServerJSON: doc, Digest: digestOf(doc), Status: model.MCPStatusActive,
+	return model.MCPMirrorInput{UpstreamID: up.ID, ConfigVersion: up.ConfigVersion, Namespace: strings.ToLower(ns), Name: name,
+		Visibility: up.Visibility, Listed: true, Fresh: true, Version: model.MCPVersion{Version: version, ServerJSON: doc, Digest: digestOf(doc), Status: model.MCPStatusActive,
 			CreatedBy: "upstream:" + up.Name}}
 }
 

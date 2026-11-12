@@ -359,7 +359,8 @@ func credentialName(v any) bool {
 	if !ok {
 		return false
 	}
-	name = strings.ReplaceAll(strings.ToLower(name), "-", "_")
+	// An argument is named by its flag: "--cookie", "-H", "--api-key".
+	name = strings.ReplaceAll(strings.ToLower(strings.TrimLeft(name, "-")), "-", "_")
 	switch name {
 	case "authorization", "proxy_authorization", "cookie":
 		return true

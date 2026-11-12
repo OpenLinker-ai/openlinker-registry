@@ -75,6 +75,13 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 			"variables":{"port":{"default":"3000"}}}}],
 			"x-source":{"url":"https://{who}@git.example/w","variables":{"who":{"default":"` + secret + `"}}},
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		// An argument is named by its flag.
+		"flag named like a credential": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"stdio"},
+			"packageArguments":[{"type":"named","name":"--cookie","value":"sid=` + secret + `"}]}]}`,
+		"authorization flag with a variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"stdio"},
+			"runtimeArguments":[{"type":"named","name":"--authorization","value":"Bearer {k}","variables":{"k":{"default":"` + secret + `"}}}]}]}`,
 		"query parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?region=eu&api_key=` + secret + `"}]}`,
 		// A package identifier is a download URL for some package types.

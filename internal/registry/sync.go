@@ -213,7 +213,7 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 				if doc.UpdatedAt.After(watermark) && !doc.UpdatedAt.After(start) {
 					watermark = doc.UpdatedAt
 				}
-			case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
+			case errors.Is(err, errUpstreamKind) || isStoreFailure(err) || configChanged(err):
 				return "", err
 			case errors.Is(err, errUnconfirmed):
 				pending = true
@@ -335,7 +335,7 @@ func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *
 	// from the upstream's own list and is not recomputed here: the upstream
 	// decides it, and its choice need not be the highest version.
 	actor := "upstream:" + u.Name
-	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: srv.Namespace, Name: srv.Name,
+	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, ConfigVersion: u.ConfigVersion, Namespace: srv.Namespace, Name: srv.Name,
 		Visibility: srv.Visibility, Listed: srv.Listed, Fresh: true, Version: model.MCPVersion{Version: v.Version, ServerJSON: v.ServerJSON,
 			Digest: v.Digest, Status: model.MCPStatusDeleted, StatusMessage: "no longer available from the upstream registry", CreatedBy: actor}},
 		auditEvent(actor, "mcp.mirror", srv.Namespace, srv.Name+"@"+v.Version, map[string]any{"status": model.MCPStatusDeleted, "upstream": u.Name}))
@@ -372,7 +372,7 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 		switch {
 		case err == nil:
 			stats.add("mcp_" + res)
-		case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
+		case errors.Is(err, errUpstreamKind) || isStoreFailure(err) || configChanged(err):
 			return nil, err
 		case errors.Is(err, model.ErrConflict):
 			stats.add("mcp_conflicts")
@@ -413,6 +413,15 @@ func (s *Service) mirrorListedMCP(ctx context.Context, u model.Upstream, c *upst
 		return "", err
 	}
 	return s.mirrorMCP(ctx, u, fresh, onlyExisting, true)
+}
+
+// configChanged reports whether a mirror write was refused because the
+// upstream's settings changed after the sync read them. Everything the sync
+// would still write was selected by the old settings, so it stops; the next
+// run starts under the new ones.
+func configChanged(err error) bool {
+	var ce *model.ConflictError
+	return errors.As(err, &ce) && ce.Code == "upstream_config_changed"
 }
 
 // tooLarge reports whether an upstream response exceeded the size cap.
@@ -514,7 +523,7 @@ func (s *Service) refreshSkill(ctx context.Context, u model.Upstream, c *upstrea
 	err = s.mirrorSkill(ctx, u, c, detail, stats)
 	switch {
 	case err == nil:
-	case isStoreFailure(err):
+	case isStoreFailure(err) || configChanged(err):
 		return err
 	case errors.Is(err, model.ErrConflict):
 		stats.add("skills_conflicts")
@@ -773,7 +782,7 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			stats.add("skills_created")
 		case isStoreFailure(err):
 			return err
-		case errors.As(err, &ce) && (ce.Code == "namespace_upstream_managed" || ce.Code == "version_order"):
+		case errors.As(err, &ce) && (ce.Code == "namespace_upstream_managed" || ce.Code == "version_order" || ce.Code == "upstream_config_changed"):
 			// Not ours to write, or another refresh of this skill is
 			// running: leave the rest to it.
 			return err
@@ -877,9 +886,6 @@ func (s *Service) mirrorSkillVersion(ctx context.Context, u model.Upstream, sv u
 	}
 	slices.SortFunc(files, func(a, b skill.ManifestEntry) int { return strings.Compare(a.Path, b.Path) })
 	actor := "upstream:" + u.Name
-	if _, err := s.Store.EnsureUpstreamNamespace(ctx, sv.Namespace, u.ID, namespaceAudit(u, sv.Namespace)); err != nil {
-		return model.Skill{}, err
-	}
 	served := sv.AccessArtifact && sv.AccessFullText
 	v := model.Version{
 		Version: sv.Version, FrontmatterName: sv.FrontmatterName, FrontmatterDescription: sv.FrontmatterDescription,
@@ -895,7 +901,7 @@ func (s *Service) mirrorSkillVersion(ctx context.Context, u model.Upstream, sv u
 	}
 	sk, stored, err := s.Store.PublishVersion(ctx, model.PublishInput{Namespace: sv.Namespace, Name: sv.Name, Mode: skill.ModeIndexed,
 		SourceKey: "upstream:" + u.Name + ":" + sv.Namespace + "/" + sv.Name, Visibility: visibility, Listed: listed,
-		UpstreamID: u.ID, ExpectNewest: &newest, Version: v},
+		UpstreamID: u.ID, UpstreamConfigVersion: u.ConfigVersion, ExpectNewest: &newest, Version: v},
 		auditEvent(actor, "skill.mirror", sv.Namespace, sv.Name+"@"+sv.Version, map[string]any{"digest": sv.ArtifactDigest, "upstream": u.Name}))
 	if err != nil {
 		return model.Skill{}, err
@@ -1024,12 +1030,13 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 		v.Locator = &model.Locator{Kind: "url", URL: e.URL, Digest: e.Digest, EntryType: e.Type, Upstream: u.Name}
 		v.IndexedBy, v.CreatedBy, v.CheckResult, v.CheckedAt = actor, actor, model.CheckOK, &now
 		_, _, err = s.Store.PublishVersion(ctx, model.PublishInput{Namespace: ns, Name: e.Name, Mode: skill.ModeIndexed,
-			SourceKey: "upstream:" + u.Name + ":" + e.Name, Visibility: u.Visibility, Listed: true, UpstreamID: u.ID, Version: v},
+			SourceKey: "upstream:" + u.Name + ":" + e.Name, Visibility: u.Visibility, Listed: true, UpstreamID: u.ID,
+			UpstreamConfigVersion: u.ConfigVersion, Version: v},
 			auditEvent(actor, "skill.mirror", ns, e.Name+"@"+version, map[string]any{"digest": v.ArtifactDigest, "upstream": u.Name, "url_digest": e.Digest}))
 		switch {
 		case err == nil:
 			stats.add("skills_created")
-		case isStoreFailure(err):
+		case isStoreFailure(err) || configChanged(err):
 			return err
 		case errors.Is(err, model.ErrConflict):
 			stats.add("skills_conflicts")

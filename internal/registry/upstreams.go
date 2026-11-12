@@ -544,7 +544,7 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 	if status == model.MCPStatusActive {
 		msg = ""
 	}
-	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: p.Namespace, Name: p.Name,
+	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, ConfigVersion: u.ConfigVersion, Namespace: p.Namespace, Name: p.Name,
 		Visibility: visibility, Listed: listed, Fresh: fresh, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
 			Status: status, StatusMessage: msg, StatusChangedAt: doc.StatusChangedAt, PublishedAt: doc.PublishedAt,
 			IsLatest: doc.IsLatest && status != model.MCPStatusDeleted, CreatedBy: actor}},

@@ -99,6 +99,13 @@ func runMCP(t *testing.T, e *Env) {
 	if r := e.Expect(e.publishMCP(pub, "com.acme", indirect), 422, "credential behind a placeholder"); errCode(r) != "secret_value" || strings.Contains(string(r.Body), "hunter2") {
 		t.Fatalf("credential behind a placeholder: %s", r.Body)
 	}
+	// And an argument whose flag names a credential.
+	flagged := map[string]any{"name": name, "description": "d", "version": "2.0.0", "packages": []map[string]any{{"registryType": "npm",
+		"identifier": "weather", "transport": map[string]any{"type": "stdio"},
+		"packageArguments": []map[string]any{{"type": "named", "name": "--cookie", "value": "sid=hunter2"}}}}}
+	if r := e.Expect(e.publishMCP(pub, "com.acme", flagged), 422, "credential in a flag"); errCode(r) != "secret_value" || strings.Contains(string(r.Body), "hunter2") {
+		t.Fatalf("credential in a flag: %s", r.Body)
+	}
 	if r := e.Expect(e.publishMCP(pub, "com.acme", serverJSON(name, "1.0.0", "https://changed.example/mcp")), 409, "republish"); errCode(r) != "version_exists" {
 		t.Fatalf("got %s", r.Body)
 	}
