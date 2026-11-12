@@ -179,6 +179,10 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 	full := since == nil
 	// What a full listing showed, by server name and by name and version.
 	seen := map[string]bool{}
+	// pending: a change could not be confirmed with the upstream this time.
+	// The watermark then stays where it is, so the next run reads the same
+	// changes again instead of moving past the one that was not applied.
+	pending := false
 	page := ""
 	for i := 0; ; i++ {
 		if i == maxSyncPages {
@@ -204,6 +208,9 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 				}
 			case errors.Is(err, errUpstreamKind) || isStoreFailure(err):
 				return "", err
+			case errors.Is(err, errUnconfirmed):
+				pending = true
+				stats.add("mcp_pending")
 			case errors.Is(err, model.ErrConflict):
 				stats.add("mcp_conflicts")
 			default:
@@ -223,7 +230,7 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 	if u.Kind != model.UpstreamMCP {
 		return "", nil
 	}
-	if watermark.IsZero() {
+	if watermark.IsZero() || pending {
 		return u.Cursor, nil
 	}
 	return watermark.UTC().Format(time.RFC3339Nano), nil
@@ -330,16 +337,24 @@ func (s *Service) mirrorListedMCP(ctx context.Context, u model.Upstream, c *upst
 	}
 	defer release()
 	fresh, err := c.GetMCP(ctx, doc.Name, doc.Version)
-	if err != nil {
-		// Gone or unreadable right now: nothing was widened, and the
-		// reconciliation of this or the next run settles it.
-		if isUpstreamError(err) {
-			return "", fail(http.StatusBadGateway, "upstream_changed", "the upstream entry changed while it was being read")
-		}
+	switch {
+	case errors.Is(err, upstream.ErrNotFound):
+		// The version is gone since the page was read; the upstream's
+		// listing or the reconciliation of a full run reports that.
+		return "", fail(http.StatusBadGateway, "upstream_changed", "the upstream entry changed while it was being read")
+	case err != nil && isUpstreamError(err):
+		// Unreadable right now. Nothing was changed here; the sync must
+		// come back to this entry.
+		return "", errUnconfirmed
+	case err != nil:
 		return "", err
 	}
 	return s.mirrorMCP(ctx, u, fresh, onlyExisting, true)
 }
+
+// errUnconfirmed: a listing document needed a fresh read to be applied and
+// the upstream could not be read.
+var errUnconfirmed = fail(http.StatusBadGateway, "upstream_unconfirmed", "the upstream could not confirm a change")
 
 // syncSkills mirrors the skills of another openlinker-registry: metadata
 // now, bytes on first read (see Materialize). The native API has no change
@@ -617,19 +632,20 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 		}
 	}
 	created := false
+	// Oldest first, stopping at the first version that cannot be recorded,
+	// whatever the reason (not served yet, malformed, beyond this instance's
+	// limits). Versions are only ever added after the newest one here, so
+	// going on would leave that version out for good, even after the reason
+	// is gone; instead the skill waits and every refresh tries again.
 	for i := fresh - 1; i >= 0; i-- {
 		ref := d.Versions[i]
 		if !skill.ValidVersion(ref.Version) {
-			stats.add("skills_skipped")
-			continue
+			stats.add("skills_incomplete")
+			break
 		}
 		sv, err := c.GetSkillVersion(ctx, d.Namespace, d.Name, ref.Version)
 		var ue *upstream.Error
 		if errors.Is(err, upstream.ErrNotFound) || errors.As(err, &ue) {
-			// The upstream lists this version but does not serve it (yet).
-			// Recording newer ones now would leave it out for good, since
-			// versions are only ever added after the newest one here; so
-			// this skill waits, and the next refresh tries again.
 			stats.add("skills_incomplete")
 			break
 		}
@@ -651,10 +667,11 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			// Not ours to write, or another refresh of this skill is
 			// running: leave the rest to it.
 			return err
-		case errors.Is(err, model.ErrConflict):
-			stats.add("skills_conflicts")
 		default:
-			stats.add("skills_skipped")
+			stats.add("skills_incomplete")
+		}
+		if err != nil {
+			break
 		}
 	}
 	if created {

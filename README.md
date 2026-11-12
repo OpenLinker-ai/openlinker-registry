@@ -222,9 +222,11 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   update stored, never later than the start of the run). Status changes,
   yanks of any version and deletions propagate. With `latest_only` a full run
   takes latest versions only; changes to versions that are mirrored still
-  arrive. A malformed entry is skipped, not fatal; a skill with a version
-  the upstream lists but does not serve waits for the next run, so versions
-  are never recorded out of order. When the upstream throttles a sync
+  arrive. A malformed entry is skipped, not fatal. A skill with a version
+  that cannot be recorded here (not served yet, malformed, or beyond this
+  instance's limits) waits for a later run, newer versions included, so
+  versions are never recorded out of order or left out. A change the
+  upstream could not confirm holds the watermark until it is applied. When the upstream throttles a sync
   (`429`), the sync waits for `Retry-After` and continues. One run per
   upstream is active at a time, across replicas. Changing what an upstream selects (URL,
   allow and deny lists, `latest_only`, `visibility`) starts the next sync

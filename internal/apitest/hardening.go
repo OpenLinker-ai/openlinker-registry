@@ -512,6 +512,70 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("an unconfirmed change holds the watermark", func(t *testing.T) {
+		// An incremental run sees a deletion that needs a fresh read to be
+		// applied, and that read fails once. Another entry in the same run
+		// is newer. The watermark must not move past the deletion, or no
+		// later run would ever read it again.
+		now := time.Now().UTC().Truncate(time.Second)
+		t1, t2, t3 := now.Add(-3*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour)
+		entry := func(name, version, status string, updated time.Time) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": status != "deleted",
+					"updatedAt": updated.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
+		}
+		phase := 1
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				if phase == 1 {
+					_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "1.0.0", "active", t1), entry("com.feed/b", "1.0.0", "active", t1)}})
+					return
+				}
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "1.0.0", "deleted", t2), entry("com.feed/b", "2.0.0", "active", t3)}})
+			case "/v0.1/servers/com.feed%2Fa/versions/1.0.0":
+				if phase == 2 {
+					w.WriteHeader(503)
+					return
+				}
+				_ = enc.Encode(entry("com.feed/a", "1.0.0", "deleted", t2))
+			case "/v0.1/servers/com.feed%2Fb/versions/2.0.0":
+				_ = enc.Encode(entry("com.feed/b", "2.0.0", "active", t3))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		cursorOf := func(s map[string]any) time.Time {
+			c, _ := time.Parse(time.RFC3339Nano, s["cursor"].(string))
+			return c
+		}
+		status := func() any {
+			return official(e.Do("GET", "/v0.1/servers/com.feed%2Fa/versions/1.0.0", "", "", nil).JSON)["status"]
+		}
+		if s := e.sync("feed"); s["last_status"] != "ok" || !cursorOf(s).Equal(t1) {
+			t.Fatalf("first sync: %v", s)
+		}
+		phase = 2
+		s := e.sync("feed")
+		if s["last_status"] != "ok" || stat(s, "mcp_pending") != 1 || stat(s, "mcp_updated") != 1 {
+			t.Fatalf("sync with an unconfirmed change: %v", s)
+		}
+		if !cursorOf(s).Equal(t1) || status() != "active" {
+			t.Fatalf("the watermark moved to %v past a change that was not applied (status %v)", cursorOf(s), status())
+		}
+		phase = 3
+		if s = e.sync("feed"); !cursorOf(s).Equal(t3) || status() != "deleted" {
+			t.Fatalf("after the upstream recovered: cursor %v, status %v", cursorOf(s), status())
+		}
+	})
+
 	t.Run("watermark", func(t *testing.T) {
 		// One entry the mirror rejects claims an update far in the future;
 		// one good entry was updated in the past. The watermark may only
@@ -814,6 +878,53 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if vs := r.JSON["versions"].([]any); r.JSON["latest_version"] != "v2" || len(vs) != 2 || vs[1].(map[string]any)["version"] != "v1" {
 			t.Fatalf("versions out of order or incomplete: %s", r.Body)
 		}
+	})
+
+	t.Run("a version beyond local limits", func(t *testing.T) {
+		// The upstream allows more files per skill than this instance. v1
+		// has too many; v2 is small. v2 must not be recorded without v1:
+		// later refreshes only add versions after the newest one here, so
+		// v1 would stay missing even after the limit is raised.
+		body := md("big", "Big skill", "MIT")
+		hash := strings.TrimPrefix(sha(body), "sha256:")
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			version := func(v string, files int) map[string]any {
+				manifest := []map[string]any{{"path": "SKILL.md", "size": len(body), "sha256": hash}}
+				for i := 1; i < files; i++ {
+					manifest = append(manifest, map[string]any{"path": fmt.Sprintf("data/%03d.txt", i), "size": 1, "sha256": hash})
+				}
+				return map[string]any{"namespace": "com.big", "name": "big", "version": v, "mode": "hosted",
+					"frontmatter": map[string]any{"name": "big", "description": "d"}, "license": map[string]any{"kind": "spdx", "id": "MIT"},
+					"core_compatible": false, "files": manifest,
+					"artifact":       map[string]any{"type": "tar", "digest": sha(body), "size": 4096},
+					"content_access": map[string]any{"full_text": true, "artifact": true}}
+			}
+			switch r.URL.Path {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[{"namespace":"com.big","name":"big"}]}`))
+			case "/v1/skills/com.big/big":
+				_ = enc.Encode(map[string]any{"namespace": "com.big", "name": "big", "status": "active", "mode": "hosted", "visibility": "public",
+					"listed": true, "latest_version": "v2", "versions": []map[string]any{{"version": "v2"}, {"version": "v1"}}})
+			case "/v1/skills/com.big/big/versions/v1":
+				_ = enc.Encode(version("v1", 300))
+			case "/v1/skills/com.big/big/versions/v2":
+				_ = enc.Encode(version("v2", 1))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not found"}}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "big", "kind": "openlinker-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		for i := range 2 {
+			if s := e.sync("big"); s["last_status"] != "ok" || stat(s, "skills_created") != 0 || stat(s, "skills_incomplete") != 1 {
+				t.Fatalf("sync %d of a skill with a version beyond local limits: %v", i, s)
+			}
+		}
+		e.Expect(e.Do("GET", "/v1/skills/com.big/big", AdminToken, "", nil), 404, "a later version must not be recorded without the earlier one")
 	})
 
 	t.Run("a skill yanked upstream with unseen versions", func(t *testing.T) {

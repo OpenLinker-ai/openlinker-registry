@@ -65,6 +65,8 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 			"packages":[{"registryType":"mcpb","identifier":"https://downloads.example/tool.mcpb?api_key=` + secret + `","transport":{"type":"stdio"}}]}`,
 		"url in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-mirrors":["https://u:` + secret + `@mirror.example/w"],
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"user name with an at sign": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"https://alice@example.org:` + secret + `@downloads.example/w.mcpb","transport":{"type":"stdio"}}]}`,
 		"template scheme": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"{scheme}://user:` + secret + `@mcp.example.com/sse","variables":{"scheme":{"default":"https"}}}]}`,
 		// A remote URL may be a template; it is still a URL.
