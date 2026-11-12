@@ -15,7 +15,7 @@ import (
 
 const upstreamCols = `id, name, kind, base_url, enabled, priority, visibility, namespace_allow, namespace_deny,
 	target_namespace, sync_interval_seconds, proxy_on_miss, latest_only, cursor, sync_state, sync_started_at,
-	last_sync_at, last_sync_status, last_sync_error, last_sync_stats, created_at, updated_at`
+	last_sync_at, last_sync_status, last_sync_error, last_sync_stats, created_at, updated_at, config_version`
 
 func scanUpstream(row pgx.Row) (model.Upstream, error) {
 	var u model.Upstream
@@ -23,7 +23,7 @@ func scanUpstream(row pgx.Row) (model.Upstream, error) {
 	var stats []byte
 	err := row.Scan(&u.ID, &u.Name, &u.Kind, &u.BaseURL, &u.Enabled, &u.Priority, &u.Visibility, &u.NamespaceAllow,
 		&u.NamespaceDeny, &u.TargetNamespace, &seconds, &u.ProxyOnMiss, &u.LatestOnly, &u.Cursor, &u.SyncState,
-		&u.SyncStartedAt, &u.LastSyncAt, &u.LastSyncStatus, &u.LastSyncError, &stats, &u.CreatedAt, &u.UpdatedAt)
+		&u.SyncStartedAt, &u.LastSyncAt, &u.LastSyncStatus, &u.LastSyncError, &stats, &u.CreatedAt, &u.UpdatedAt, &u.ConfigVersion)
 	if err != nil {
 		return u, err
 	}
@@ -104,6 +104,10 @@ func (s *Store) UpdateUpstream(ctx context.Context, name string, p model.Upstrea
 			cursor = CASE WHEN ($2::text IS NOT NULL AND $2 <> base_url) OR ($5::text IS NOT NULL AND $5 <> visibility)
 				OR ($6::text[] IS NOT NULL AND $6 <> namespace_allow) OR ($7::text[] IS NOT NULL AND $7 <> namespace_deny)
 				OR ($10::boolean IS NOT NULL AND $10 <> latest_only) THEN '' ELSE cursor END,
+			config_version = config_version + CASE WHEN ($2::text IS NOT NULL AND $2 <> base_url)
+				OR ($5::text IS NOT NULL AND $5 <> visibility) OR ($6::text[] IS NOT NULL AND $6 <> namespace_allow)
+				OR ($7::text[] IS NOT NULL AND $7 <> namespace_deny) OR ($10::boolean IS NOT NULL AND $10 <> latest_only)
+				THEN 1 ELSE 0 END,
 			base_url = COALESCE($2, base_url), enabled = COALESCE($3, enabled), priority = COALESCE($4, priority),
 			visibility = COALESCE($5, visibility), namespace_allow = COALESCE($6, namespace_allow),
 			namespace_deny = COALESCE($7, namespace_deny), sync_interval_seconds = COALESCE($8, sync_interval_seconds),
@@ -182,8 +186,8 @@ func (s *Store) FinishUpstreamSync(ctx context.Context, id int64, res model.Upst
 	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
 		return rowsOrNotFound(tx.Exec(ctx, `UPDATE upstreams SET sync_state = 'idle', sync_started_at = NULL, last_sync_at = $2,
 			last_sync_status = $3, last_sync_error = $4, last_sync_stats = $5,
-			cursor = CASE WHEN $3 = 'ok' THEN $6 ELSE cursor END WHERE id = $1`,
-			id, res.At, res.Status, store.SyncError(res.Error), b, res.Cursor))
+			cursor = CASE WHEN $3 = 'ok' AND config_version = $7 THEN $6 ELSE cursor END WHERE id = $1`,
+			id, res.At, res.Status, store.SyncError(res.Error), b, res.Cursor, res.ConfigVersion))
 	})
 }
 

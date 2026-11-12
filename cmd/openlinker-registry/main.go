@@ -79,8 +79,9 @@ func run(args []string, log *slog.Logger) error {
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, cfg.AdminToken), BasePath: cfg.BasePath,
 		AllowAnonRead: cfg.AllowAnonRead, MaxUploadBytes: cfg.MaxUploadBytes, Log: log,
 		ReadLimit: ratelimit.New(cfg.RateLimitRead), WriteLimit: ratelimit.New(cfg.RateLimitWrite),
-		ForwardLimit: ratelimit.New(cfg.RateLimitForward), Clients: ratelimit.ClientAddr{Trusted: cfg.TrustedProxies},
-		UI: cfg.UI, SecureCookies: strings.HasPrefix(cfg.PublicURL, "https://"), Background: ctx}
+		ForwardLimit: ratelimit.New(cfg.RateLimitForward), AuthFailLimit: ratelimit.New(cfg.RateLimitAuthFailures),
+		Clients: ratelimit.ClientAddr{Trusted: cfg.TrustedProxies},
+		UI:      cfg.UI, SecureCookies: strings.HasPrefix(cfg.PublicURL, "https://"), Background: ctx}
 
 	if cfg.BackgroundSync {
 		go func() {

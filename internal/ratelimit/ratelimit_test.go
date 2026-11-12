@@ -117,3 +117,31 @@ func TestKey(t *testing.T) {
 		t.Fatal("bad prefix accepted")
 	}
 }
+
+func TestExhaustedDoesNotConsume(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := New(2)
+	l.now = func() time.Time { return now }
+	if over, _ := l.Exhausted("a"); over {
+		t.Fatal("an unknown key is not exhausted")
+	}
+	l.Allow("a")
+	for range 5 {
+		if over, _ := l.Exhausted("a"); over {
+			t.Fatal("peeking must not consume")
+		}
+	}
+	l.Allow("a")
+	over, wait := l.Exhausted("a")
+	if !over || wait <= 0 || wait > 30*time.Second {
+		t.Fatalf("exhausted=%v wait=%v", over, wait)
+	}
+	now = now.Add(31 * time.Second)
+	if over, _ := l.Exhausted("a"); over {
+		t.Fatal("the budget refills")
+	}
+	var none *Limiter
+	if over, _ := none.Exhausted("a"); over {
+		t.Fatal("a nil limiter never refuses")
+	}
+}

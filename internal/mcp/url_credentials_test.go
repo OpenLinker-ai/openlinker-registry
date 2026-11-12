@@ -60,6 +60,11 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 			"variables":{"t":{"variables":{"db_password":{"value":"` + secret + `"}}}}}]}]}`,
 		"query parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?region=eu&api_key=` + secret + `"}]}`,
+		// A package identifier is a download URL for some package types.
+		"package identifier": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"https://downloads.example/tool.mcpb?api_key=` + secret + `","transport":{"type":"stdio"}}]}`,
+		"url in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-mirrors":["https://u:` + secret + `@mirror.example/w"],
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 		"encoded query name": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?access%5Ftoken=` + secret + `"}]}`,
 	}

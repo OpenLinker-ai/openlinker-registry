@@ -42,9 +42,14 @@ func (s *Service) SyncUpstream(ctx context.Context, actor, name string) (model.U
 	if !claimed {
 		return model.Upstream{}, fail(http.StatusConflict, "sync_running", "a sync of this upstream is already running")
 	}
-	runCtx, cancel := context.WithTimeout(ctx, syncTimeout)
+	// A sync walks the whole catalogue: when the upstream throttles it, it
+	// waits and goes on instead of failing and starting over.
+	runCtx, cancel := context.WithTimeout(upstream.WithThrottleRetry(ctx), syncTimeout)
 	res := s.runSync(runCtx, u)
 	cancel()
+	// The cursor is only stored if the settings the run read under are
+	// still the upstream's.
+	res.ConfigVersion = u.ConfigVersion
 	// The result is recorded even when the caller went away mid-run, so the
 	// upstream never stays "running" until the stale timeout.
 	done, cancelDone := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -172,6 +177,7 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 		since = &from
 	}
 	full := since == nil
+	// What a full listing showed, by server name and by name and version.
 	seen := map[string]bool{}
 	page := ""
 	for i := 0; ; i++ {
@@ -188,7 +194,7 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 			return "", err
 		}
 		for _, doc := range docs {
-			seen[doc.Name] = true
+			seen[doc.Name], seen[doc.Name+"@"+doc.Version] = true, true
 			res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest)
 			switch {
 			case err == nil:
@@ -224,8 +230,12 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 }
 
 // reconcileMCP looks up, by name, every mirrored server of the upstream that
-// a full listing did not show, and applies what the upstream says now: its
-// versions' current status, or that the server is gone.
+// a full listing did not cover, and applies what the upstream says now: its
+// versions' current status, or that the server is gone. A server is covered
+// when the listing showed it and, for a latest-only listing (which shows one
+// version per server), every version mirrored here was among those shown:
+// an older version mirrored earlier may have been deleted or deprecated
+// since.
 func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstream.Client, seen map[string]bool, stats syncStats) error {
 	after := ""
 	for {
@@ -235,11 +245,21 @@ func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstrea
 		}
 		for _, srv := range servers {
 			after = srv.Name
-			if seen[srv.Name] {
-				continue
-			}
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			covered := seen[srv.Name]
+			if covered && u.LatestOnly {
+				local, err := s.Store.ListMCPVersions(ctx, srv.ID)
+				if err != nil {
+					return err
+				}
+				for _, v := range local {
+					covered = covered && seen[srv.Name+"@"+v.Version]
+				}
+			}
+			if covered {
+				continue
 			}
 			docs, err := c.ListMCPVersions(ctx, srv.Name)
 			var ue *upstream.Error
@@ -485,6 +505,25 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 	if exists && local.Upstream != u.Name {
 		return model.ErrNamespaceManaged()
 	}
+	// A yank is final and nothing of a yanked skill is served: there is
+	// nothing to gain from recording more of its history, and the store does
+	// not add versions to a yanked skill. A skill that was never mirrored is
+	// not created just to be yanked.
+	if d.Status == model.StatusYanked {
+		if !exists {
+			return invalid("upstream_yanked", "the upstream yanked this skill")
+		}
+		_, changed, err := s.applySkillSettings(ctx, actor, local, d, visibility)
+		if err != nil {
+			return err
+		}
+		if changed {
+			stats.add("skills_updated")
+		} else {
+			stats.add("skills_unchanged")
+		}
+		return nil
+	}
 	changed := false
 	if exists {
 		if local, changed, err = s.applySkillSettings(ctx, actor, local, d, visibility); err != nil {
@@ -533,8 +572,12 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 		sv, err := c.GetSkillVersion(ctx, d.Namespace, d.Name, ref.Version)
 		var ue *upstream.Error
 		if errors.Is(err, upstream.ErrNotFound) || errors.As(err, &ue) {
-			stats.add("skills_skipped")
-			continue
+			// The upstream lists this version but does not serve it (yet).
+			// Recording newer ones now would leave it out for good, since
+			// versions are only ever added after the newest one here; so
+			// this skill waits, and the next refresh tries again.
+			stats.add("skills_incomplete")
+			break
 		}
 		if err != nil {
 			return err

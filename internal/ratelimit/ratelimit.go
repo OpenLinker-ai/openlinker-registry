@@ -65,6 +65,27 @@ func (l *Limiter) Allow(key string) (bool, time.Duration) {
 	return false, wait
 }
 
+// Exhausted reports whether key is over its limit without consuming an
+// event, and how long until it is not. It lets a caller count only failures
+// (Allow on failure) yet refuse work once too many have happened.
+func (l *Limiter) Exhausted(key string) (bool, time.Duration) {
+	if l == nil {
+		return false, 0
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.buckets[key]
+	if b == nil {
+		return false, 0
+	}
+	tokens := min(l.perMinute, b.tokens+now.Sub(b.last).Minutes()*l.perMinute)
+	if tokens >= 1 {
+		return false, 0
+	}
+	return true, time.Duration((1 - tokens) / l.perMinute * float64(time.Minute))
+}
+
 // prune drops buckets that have refilled completely. If every bucket is
 // still in use the map is reset: forgetting limits briefly is preferable to
 // unbounded growth.

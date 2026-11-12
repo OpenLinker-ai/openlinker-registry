@@ -411,6 +411,14 @@ func runUpstreams(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("%s of a mirrored skill: %d %s", what, r.Status, r.Body)
 		}
 	}
+	// A mirrored namespace has no members: nobody can be given a role in it.
+	if r = down.Do("POST", "/v1/admin/namespaces/com.acme/roles", admin, "", map[string]any{"subject": "token:aaaaaaaaaaaaaaaa", "role": "reader"}); r.Status != 409 || errCode(r) != "namespace_upstream_managed" {
+		t.Fatalf("role in a mirrored namespace: %d %s", r.Status, r.Body)
+	}
+	if r = down.Do("POST", "/v1/admin/tokens", admin, "", map[string]any{"name": "t", "scopes": []string{"skills:read"},
+		"roles": []map[string]string{{"namespace": "com.acme", "role": "reader"}}}); r.Status != 409 || errCode(r) != "namespace_upstream_managed" {
+		t.Fatalf("token with a role in a mirrored namespace: %d %s", r.Status, r.Body)
+	}
 	down.Expect(down.Do("DELETE", "/v1/admin/upstreams/hub", admin, "", nil), 409, "upstream in use")
 
 	// --- sync ---

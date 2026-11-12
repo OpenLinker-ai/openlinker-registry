@@ -161,6 +161,11 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 	latest := v.IsLatest && status != model.MCPStatusDeleted
 	outcome := model.MirrorUnchanged
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		visibility, err := mirrorVisibility(ctx, tx, in.UpstreamID, in.Visibility)
+		if err != nil {
+			return err
+		}
+		in.Visibility = visibility
 		ns, err := ensureUpstreamNS(ctx, tx, in.Namespace, in.UpstreamID, model.AuditEvent{Actor: audit.Actor,
 			Action: "namespace.mirror", Namespace: in.Namespace, Details: map[string]any{"upstream_id": in.UpstreamID}})
 		if err != nil {

@@ -175,6 +175,7 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, a
 		message = ""
 	}
 	latest := in.Version.IsLatest && status != model.MCPStatusDeleted
+	in.Visibility = m.mirrorVisibility(in.UpstreamID, in.Visibility)
 
 	// The upstream's visibility and listing apply to an existing server too,
 	// together with the version.

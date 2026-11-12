@@ -34,6 +34,9 @@ type Server struct {
 	ReadLimit    *ratelimit.Limiter
 	WriteLimit   *ratelimit.Limiter
 	ForwardLimit *ratelimit.Limiter
+	// AuthFailLimit bounds failed authentications per client address, so
+	// guessing tokens cannot turn into unlimited database lookups.
+	AuthFailLimit *ratelimit.Limiter
 	// Clients resolves client addresses behind trusted proxies.
 	Clients ratelimit.ClientAddr
 	// UI serves the built-in web pages when enabled.
@@ -198,8 +201,21 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid authorization header"})
 			return
 		}
+		// Rate limits are per subject and so apply after authentication.
+		// Before it, only failures are counted, by address. An address that
+		// keeps presenting bad tokens is refused without a lookup until its
+		// failures age out; that includes requests with a good token from
+		// the same address, which is the price of not doing the lookup.
+		addr := ratelimit.Key(s.Clients.From(r))
+		if over, wait := s.AuthFailLimit.Exhausted(addr); over {
+			s.reject(w, r, tooManyRequests(wait))
+			return
+		}
 		p, err := s.Auth.Authenticate(r.Context(), strings.TrimSpace(tok))
 		if err != nil {
+			if errors.Is(err, auth.ErrInvalidToken) {
+				s.AuthFailLimit.Allow(addr)
+			}
 			if !errors.Is(err, auth.ErrInvalidToken) {
 				s.Log.Error("authentication backend error", "err", err.Error())
 				s.reject(w, r, &registry.Error{Status: http.StatusServiceUnavailable, Code: "unavailable", Msg: "authentication unavailable"})

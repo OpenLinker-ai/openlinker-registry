@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/safehttp"
 )
@@ -155,9 +157,35 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, max int64) 
 	if c.HTTP == nil {
 		return nil, invalidArg("upstream client has no HTTP client")
 	}
+	for attempt := 0; ; attempt++ {
+		body, hdr, err := c.send(ctx, u, accept, max)
+		var se *safehttp.Error
+		if err == nil {
+			return body, nil
+		}
+		if !errors.As(err, &se) || se.Code != safehttp.CodeStatus {
+			return nil, err
+		}
+		switch {
+		case se.Status == http.StatusNotFound:
+			// Both ErrNotFound (errors.Is) and the *safehttp.Error
+			// (errors.As) stay reachable.
+			return nil, fmt.Errorf("%w (%w)", ErrNotFound, err)
+		case se.Status == http.StatusTooManyRequests && throttleRetry(ctx) && attempt < maxThrottleRetries:
+			if werr := waitRetry(ctx, hdr.Get("Retry-After")); werr != nil {
+				return nil, err
+			}
+		default:
+			return nil, err
+		}
+	}
+}
+
+// send performs one request.
+func (c *Client) send(ctx context.Context, u *url.URL, accept string, max int64) ([]byte, http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, invalidURL("upstream request cannot be built")
+		return nil, nil, invalidURL("upstream request cannot be built")
 	}
 	ua := c.UserAgent
 	if ua == "" {
@@ -168,23 +196,57 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, max int64) 
 	if c.Token != "" {
 		b, err := c.base()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if origin(u) == origin(b) {
 			req.Header.Set("Authorization", "Bearer "+c.Token)
 		}
 	}
-	body, _, err := safehttp.Do(c.HTTP, req, max)
-	if err != nil {
-		var se *safehttp.Error
-		if errors.As(err, &se) && se.Code == safehttp.CodeStatus && se.Status == http.StatusNotFound {
-			// Both ErrNotFound (errors.Is) and the *safehttp.Error
-			// (errors.As) stay reachable.
-			return nil, fmt.Errorf("%w (%w)", ErrNotFound, err)
-		}
-		return nil, err
+	return safehttp.Do(c.HTTP, req, max)
+}
+
+// A long-running reader (a sync) walks a whole catalogue and will meet the
+// upstream's rate limit; giving up there would restart from the beginning
+// every time and never reach the end. With WithThrottleRetry a request
+// answered 429 waits for the upstream's Retry-After and is sent again.
+// Interactive reads do not wait: they report the failure.
+type throttleRetryKey struct{}
+
+const (
+	maxThrottleRetries = 20
+	maxRetryWait       = time.Minute
+)
+
+// WithThrottleRetry returns a context under which requests answered
+// "429 Too Many Requests" are retried after the upstream's Retry-After (at
+// most a minute per wait), until the context ends.
+func WithThrottleRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, throttleRetryKey{}, true)
+}
+
+func throttleRetry(ctx context.Context) bool {
+	on, _ := ctx.Value(throttleRetryKey{}).(bool)
+	return on
+}
+
+// waitRetry sleeps for the Retry-After of a 429 (seconds; one second when
+// absent or unreadable), or returns the context's error.
+func waitRetry(ctx context.Context, retryAfter string) error {
+	wait := time.Second
+	if n, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && n >= 0 {
+		wait = min(time.Duration(n)*time.Second, maxRetryWait)
 	}
-	return body, nil
+	if wait <= 0 {
+		wait = 100 * time.Millisecond
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // getJSON fetches an API path under BaseURL as JSON, capped by MaxBody.

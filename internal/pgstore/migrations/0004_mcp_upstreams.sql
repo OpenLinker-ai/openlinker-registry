@@ -19,6 +19,9 @@ CREATE TABLE upstreams (
     proxy_on_miss         BOOLEAN NOT NULL DEFAULT false,
     latest_only           BOOLEAN NOT NULL DEFAULT false,
     cursor                TEXT NOT NULL DEFAULT '',
+    -- Counts changes to what is selected and how it is shown; a sync that
+    -- started under an older version does not store its cursor.
+    config_version        BIGINT NOT NULL DEFAULT 0,
     sync_state            TEXT NOT NULL DEFAULT 'idle' CHECK (sync_state IN ('idle', 'running')),
     sync_started_at       TIMESTAMPTZ,
     last_sync_at          TIMESTAMPTZ,

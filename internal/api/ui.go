@@ -13,6 +13,7 @@ import (
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/ratelimit"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/registry"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 )
@@ -198,10 +199,17 @@ func (s *Server) uiLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	token := strings.TrimSpace(r.PostFormValue("token"))
+	addr := ratelimit.Key(s.Clients.From(r))
+	if over, _ := s.AuthFailLimit.Exhausted(addr); over {
+		s.uiRender(w, r, http.StatusTooManyRequests, "login", &uiPage{Title: "Sign in", Tab: "login", Error: "too many failed attempts; retry later"})
+		return
+	}
 	if _, err := s.Auth.Authenticate(r.Context(), token); err != nil {
 		status, msg := http.StatusUnauthorized, "invalid or expired token"
 		if !errors.Is(err, auth.ErrInvalidToken) {
 			status, msg = http.StatusServiceUnavailable, "authentication unavailable"
+		} else {
+			s.AuthFailLimit.Allow(addr)
 		}
 		s.uiRender(w, r, status, "login", &uiPage{Title: "Sign in", Tab: "login", Error: msg})
 		return

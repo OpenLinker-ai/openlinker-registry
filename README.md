@@ -124,6 +124,7 @@ Secrets are read from the environment only.
 | `REGISTRY_UPSTREAM_TIMEOUT` | `-upstream-timeout` | `30s` | Per-request timeout for upstreams |
 | `REGISTRY_BACKGROUND_SYNC` | `-background-sync` | `true` | Run scheduled upstream syncs in this process |
 | `REGISTRY_RATE_LIMIT_READ` / `_WRITE` / `_FORWARD` | flags | 600 / 60 / 30 | Requests per client per minute: reads, writes, and misses forwarded to upstreams (`0` = unlimited). Clients are the token subject, or the address when anonymous. Limits are per process |
+| `REGISTRY_RATE_LIMIT_AUTH_FAILURES` | `-rate-limit-auth-failures` | 30 | Failed authentications per client address per minute. An address over the limit is refused without a token lookup until its failures age out, requests with a valid token included |
 | `REGISTRY_TRUSTED_PROXIES` | `-trusted-proxies` | empty | Reverse proxies whose `X-Forwarded-For` identifies the client |
 
 ## API summary
@@ -221,8 +222,11 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   update stored, never later than the start of the run). Status changes,
   yanks of any version and deletions propagate. With `latest_only` a full run
   takes latest versions only; changes to versions that are mirrored still
-  arrive. A malformed entry is skipped, not fatal. One run per upstream is
-  active at a time, across replicas. Changing what an upstream selects (URL,
+  arrive. A malformed entry is skipped, not fatal; a skill with a version
+  the upstream lists but does not serve waits for the next run, so versions
+  are never recorded out of order. When the upstream throttles a sync
+  (`429`), the sync waits for `Retry-After` and continues. One run per
+  upstream is active at a time, across replicas. Changing what an upstream selects (URL,
   allow and deny lists, `latest_only`, `visibility`) starts the next sync
   from scratch.
 - **A mirror never shows an entry more widely than its upstream does.** An
@@ -239,7 +243,10 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   `openlinker-registry`; as `mcp-registry` its sync is refused, because that
   kind follows the official change feed, which carries no visibility.
 - **Mirrored entries are read-only here**, for administrators too: they
-  follow their upstream. A skill is mirrored with all of its versions, in
+  follow their upstream, and nobody can be given a role in a mirrored
+  namespace. Writes made by a sync obey the upstream's settings as they are
+  when the write happens, so lowering `visibility` during a running sync
+  holds. A skill is mirrored with all of its versions, in
   the upstream's order (skills with more than 1000 versions are skipped).
 - **Bytes are pulled through and verified.** Mirroring a skill records its
   metadata; the artifact is fetched from the upstream on first read, checked

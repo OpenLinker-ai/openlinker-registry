@@ -141,6 +141,7 @@ func (m *Memory) UpdateUpstream(_ context.Context, name string, p model.Upstream
 		(p.LatestOnly != nil && *p.LatestOnly != u.LatestOnly)
 	if reset {
 		u.Cursor = ""
+		u.ConfigVersion++
 	}
 	if p.BaseURL != nil {
 		u.BaseURL = *p.BaseURL
@@ -222,7 +223,7 @@ func (m *Memory) FinishUpstreamSync(_ context.Context, id int64, res model.Upstr
 	}
 	u.SyncState, u.SyncStartedAt, u.LastSyncAt = model.SyncIdle, nil, microPtr(&res.At)
 	u.LastSyncStatus, u.LastSyncError, u.LastSyncStats = res.Status, SyncError(res.Error), maps.Clone(res.Stats)
-	if res.Status == model.SyncOK {
+	if res.Status == model.SyncOK && res.ConfigVersion == u.ConfigVersion {
 		u.Cursor = res.Cursor
 	}
 	m.upstreams[id] = u
@@ -287,4 +288,14 @@ func (m *Memory) tightenUpstream(upstreamID int64, at time.Time) {
 			m.touchMCPVersions(id, at)
 		}
 	}
+}
+
+// mirrorVisibility is the visibility a write on behalf of an upstream may
+// give an entry: never public while the upstream mirrors as internal.
+// upstreamID 0 (a local write) returns v unchanged.
+func (m *Memory) mirrorVisibility(upstreamID int64, v string) string {
+	if u, ok := m.upstreams[upstreamID]; ok && u.Visibility == model.VisibilityInternal && v == model.VisibilityPublic {
+		return model.VisibilityInternal
+	}
+	return v
 }

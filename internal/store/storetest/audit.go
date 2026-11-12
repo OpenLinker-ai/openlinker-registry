@@ -223,6 +223,97 @@ var mirrorTests = []testCase{
 			t.Fatal("a patch without a change stamped the versions")
 		}
 	}},
+	{"mirror writes obey the upstream's current visibility", func(t *testing.T, st store.Store) {
+		// A sync that started while the upstream mirrored as public keeps
+		// writing "public" after an administrator lowered it. The store
+		// decides by the setting at the time of the write.
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		internal, public := model.VisibilityInternal, model.VisibilityPublic
+		if _, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{Visibility: &internal}, audit); err != nil {
+			t.Fatal(err)
+		}
+		stale := mirrorInput(up, "org.mirror/srv", "1.0.0") // carries the old "public"
+		mirrorMCP(t, st, stale, model.MirrorCreated)
+		if got := mcpServer(t, st, "org.mirror/srv"); got.Visibility != internal {
+			t.Fatalf("mirrored server written with stale settings: %+v", got)
+		}
+		mirrorMCP(t, st, stale, model.MirrorUnchanged)
+		v := version("1", "spdx")
+		v.Source, v.Locator = nil, &model.Locator{Kind: "registry"}
+		sk, _, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "org.mirror", Name: "tool", Mode: "indexed",
+			SourceKey: "upstream:up:org.mirror/tool", Visibility: public, Listed: true, UpstreamID: up.ID, Version: v}, audit)
+		if err != nil || sk.Visibility != internal {
+			t.Fatalf("mirrored skill written with stale settings: %+v, %v", sk, err)
+		}
+		if got, err := st.UpdateSkill(ctx, sk.ID, model.SkillPatch{Visibility: &public}, audit); err != nil || got.Visibility != internal {
+			t.Fatalf("mirrored skill patched with stale settings: %+v, %v", got, err)
+		}
+		// Local entries are not affected by any upstream.
+		local, _, err := publish(st, "local", internal, "1", "spdx")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := st.UpdateSkill(ctx, local.ID, model.SkillPatch{Visibility: &public}, audit); err != nil || got.Visibility != public {
+			t.Fatalf("local skill: %+v, %v", got, err)
+		}
+
+		// The cursor of a run that started under older settings is dropped.
+		before, err := st.GetUpstream(ctx, "up")
+		if err != nil {
+			t.Fatal(err)
+		}
+		allow := []string{"org.*"}
+		if _, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{NamespaceAllow: &allow}, audit); err != nil {
+			t.Fatal(err)
+		}
+		finish := func(configVersion int64, cursor string) string {
+			t.Helper()
+			if err := st.FinishUpstreamSync(ctx, up.ID, model.UpstreamSyncResult{At: time.Now(), Status: model.SyncOK, Cursor: cursor,
+				ConfigVersion: configVersion}, audit); err != nil {
+				t.Fatal(err)
+			}
+			u, err := st.GetUpstream(ctx, "up")
+			if err != nil {
+				t.Fatal(err)
+			}
+			return u.Cursor
+		}
+		if got := finish(before.ConfigVersion, "stale"); got != "" {
+			t.Fatalf("a run under older settings stored its cursor %q", got)
+		}
+		now, _ := st.GetUpstream(ctx, "up")
+		if now.ConfigVersion <= before.ConfigVersion {
+			t.Fatalf("a selection change must advance the config version: %d -> %d", before.ConfigVersion, now.ConfigVersion)
+		}
+		if got := finish(now.ConfigVersion, "current"); got != "current" {
+			t.Fatalf("cursor of a current run = %q", got)
+		}
+	}},
+	{"mirrored namespaces have no members", func(t *testing.T, st store.Store) {
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID, audit); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetRole(ctx, "org.mirror", "token:aaaaaaaaaaaaaaaa", model.RoleReader, audit); conflictCode(err) != "namespace_upstream_managed" {
+			t.Fatalf("role in a mirrored namespace: %v", err)
+		}
+		tok := model.Token{ID: "bbbbbbbbbbbbbbbb", SecretHash: make([]byte, 32), Name: "t", Scopes: []string{"skills:read"}, CreatedBy: "test"}
+		err := st.CreateToken(ctx, tok, []model.RoleBinding{{Namespace: "com.example", Role: model.RoleReader}, {Namespace: "org.mirror", Role: model.RoleReader}}, audit)
+		if conflictCode(err) != "namespace_upstream_managed" {
+			t.Fatalf("token with a role in a mirrored namespace: %v", err)
+		}
+		if _, err := st.GetToken(ctx, tok.ID); err == nil {
+			t.Fatal("the refused token was created")
+		}
+		if roles, _ := st.RolesForSubject(ctx, "token:"+tok.ID); len(roles) != 0 {
+			t.Fatalf("roles of the refused token: %v", roles)
+		}
+		if err := st.SetRole(ctx, "com.example", "token:aaaaaaaaaaaaaaaa", model.RoleReader, audit); err != nil {
+			t.Fatalf("role in a local namespace: %v", err)
+		}
+	}},
 	{"upstream policy changes", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		up := newUpstream(t, st, "up")
@@ -243,8 +334,16 @@ var mirrorTests = []testCase{
 			if ok, err := st.ClaimUpstreamSync(ctx, up.ID, time.Now(), time.Now().Add(-time.Hour)); err != nil || !ok {
 				t.Fatalf("claim: %v %v", ok, err)
 			}
-			if err := st.FinishUpstreamSync(ctx, up.ID, model.UpstreamSyncResult{At: time.Now(), Status: model.SyncOK, Cursor: "c"}, audit); err != nil {
+			cur, err := st.GetUpstream(ctx, "up")
+			if err != nil {
 				t.Fatal(err)
+			}
+			if err := st.FinishUpstreamSync(ctx, up.ID, model.UpstreamSyncResult{At: time.Now(), Status: model.SyncOK, Cursor: "c",
+				ConfigVersion: cur.ConfigVersion}, audit); err != nil {
+				t.Fatal(err)
+			}
+			if cur, _ = st.GetUpstream(ctx, "up"); cur.Cursor != "c" {
+				t.Fatalf("cursor not stored: %+v", cur)
 			}
 		}
 		cursor := func() string {

@@ -19,6 +19,10 @@ type Store interface {
 
 	CreateNamespace(ctx context.Context, ns model.Namespace, audit model.AuditEvent) (model.Namespace, error)
 	GetNamespace(ctx context.Context, name string) (model.Namespace, error)
+	// SetRole and the roles of CreateToken apply to local namespaces only:
+	// an upstream-managed namespace has no members (ConflictError
+	// namespace_upstream_managed), so an entry withdrawn there is visible to
+	// administrators alone.
 	SetRole(ctx context.Context, namespace, subject string, role model.Role, audit model.AuditEvent) error
 	RolesForSubject(ctx context.Context, subject string) (map[string]model.Role, error)
 
@@ -27,6 +31,12 @@ type Store interface {
 	RevokeToken(ctx context.Context, id string, at time.Time, audit model.AuditEvent) error
 
 	GetSkill(ctx context.Context, namespace, name string) (model.Skill, error)
+	// Writes on behalf of an upstream (PublishVersion and UpdateSkill in an
+	// upstream-managed namespace, UpsertMirroredMCP) never make an entry
+	// public while the upstream's mirror visibility is internal: the store
+	// reads that setting in the transaction of the write, so a write racing
+	// with an administrator lowering it cannot undo the change.
+	//
 	// PublishVersion creates the skill if needed and appends an immutable
 	// version atomically. It returns ConflictError codes: mode_mismatch,
 	// source_mismatch, source_already_indexed, version_exists, skill_yanked.

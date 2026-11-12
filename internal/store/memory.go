@@ -96,8 +96,12 @@ func (m *Memory) ListNamespaces(context.Context) ([]model.Namespace, error) {
 func (m *Memory) SetRole(_ context.Context, namespace, subject string, role model.Role, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.ns[namespace]; !ok {
+	ns, ok := m.ns[namespace]
+	if !ok {
 		return model.ErrNotFound
+	}
+	if ns.UpstreamID != 0 {
+		return model.ErrNamespaceManaged()
 	}
 	if m.roles[subject] == nil {
 		m.roles[subject] = map[string]model.Role{}
@@ -126,8 +130,12 @@ func (m *Memory) CreateToken(_ context.Context, t model.Token, roles []model.Rol
 		return conflict("token_exists", "token id collision")
 	}
 	for _, rb := range roles {
-		if _, ok := m.ns[rb.Namespace]; !ok {
+		ns, ok := m.ns[rb.Namespace]
+		if !ok {
 			return model.ErrNotFound
+		}
+		if ns.UpstreamID != 0 {
+			return model.ErrNamespaceManaged()
 		}
 	}
 	t.CreatedAt = time.Now().UTC()
@@ -254,7 +262,7 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 		if in.Mode == "hosted" && in.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
 			return model.Skill{}, model.Version{}, &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
 		}
-		s = model.Skill{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Visibility: in.Visibility, Listed: in.Listed,
+		s = model.Skill{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Visibility: m.mirrorVisibility(in.UpstreamID, in.Visibility), Listed: in.Listed,
 			Status: model.StatusActive, Mode: in.Mode, SourceKey: in.SourceKey, CreatedAt: now}
 	}
 	if in.ExpectNewest != nil {
@@ -333,7 +341,7 @@ func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatc
 		}
 	}
 	if p.Visibility != nil {
-		s.Visibility = *p.Visibility
+		s.Visibility = m.mirrorVisibility(m.ns[s.Namespace].UpstreamID, *p.Visibility)
 	}
 	if p.Listed != nil {
 		s.Listed = *p.Listed

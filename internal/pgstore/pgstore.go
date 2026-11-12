@@ -213,17 +213,44 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]model.Namespace, error) {
 // SetRole implements store.Store.
 func (s *Store) SetRole(ctx context.Context, namespace, subject string, role model.Role, audit model.AuditEvent) error {
 	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `INSERT INTO namespace_roles (namespace_id, subject, role)
-			SELECT id, $2, $3 FROM namespaces WHERE name = $1
-			ON CONFLICT (namespace_id, subject) DO UPDATE SET role = EXCLUDED.role`, namespace, subject, string(role))
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			return model.ErrNotFound
-		}
-		return nil
+		return grantRole(ctx, tx, namespace, subject, role)
 	})
+}
+
+// grantRole gives subject a role in a local namespace. An upstream-managed
+// namespace has no members.
+func grantRole(ctx context.Context, tx pgx.Tx, namespace, subject string, role model.Role) error {
+	var nsID, upstreamID int64
+	if err := tx.QueryRow(ctx, `SELECT id, COALESCE(upstream_id, 0) FROM namespaces WHERE name = $1`, namespace).
+		Scan(&nsID, &upstreamID); err != nil {
+		return notFound(err)
+	}
+	if upstreamID != 0 {
+		return model.ErrNamespaceManaged()
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO namespace_roles (namespace_id, subject, role) VALUES ($1, $2, $3)
+		ON CONFLICT (namespace_id, subject) DO UPDATE SET role = EXCLUDED.role`, nsID, subject, string(role))
+	return err
+}
+
+// mirrorVisibility returns the visibility a write on behalf of an upstream
+// may give an entry: never public while the upstream mirrors as internal.
+// The upstream row is share-locked for the rest of the transaction, so the
+// write is ordered against UpdateUpstream: either it sees the lowered
+// setting, or UpdateUpstream lowers what it wrote. Every such write takes
+// this lock before any entry row, the same order as UpdateUpstream.
+func mirrorVisibility(ctx context.Context, tx pgx.Tx, upstreamID int64, v string) (string, error) {
+	if upstreamID == 0 {
+		return v, nil
+	}
+	var limit string
+	if err := tx.QueryRow(ctx, `SELECT visibility FROM upstreams WHERE id = $1 FOR SHARE`, upstreamID).Scan(&limit); err != nil {
+		return "", notFound(err)
+	}
+	if limit == model.VisibilityInternal && v == model.VisibilityPublic {
+		return model.VisibilityInternal, nil
+	}
+	return v, nil
 }
 
 // RolesForSubject implements store.Store.
@@ -256,14 +283,8 @@ func (s *Store) CreateToken(ctx context.Context, t model.Token, roles []model.Ro
 			return err
 		}
 		for _, rb := range roles {
-			tag, err := tx.Exec(ctx, `INSERT INTO namespace_roles (namespace_id, subject, role)
-				SELECT id, $2, $3 FROM namespaces WHERE name = $1
-				ON CONFLICT (namespace_id, subject) DO UPDATE SET role = EXCLUDED.role`, rb.Namespace, "token:"+t.ID, string(rb.Role))
-			if err != nil {
+			if err := grantRole(ctx, tx, rb.Namespace, "token:"+t.ID, rb.Role); err != nil {
 				return err
-			}
-			if tag.RowsAffected() == 0 {
-				return model.ErrNotFound
 			}
 		}
 		return nil
@@ -352,14 +373,18 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		if nsUpstream != in.UpstreamID {
 			return model.ErrNamespaceManaged()
 		}
+		visibility, err := mirrorVisibility(ctx, tx, in.UpstreamID, in.Visibility)
+		if err != nil {
+			return err
+		}
 		var sourceKey *string
 		if in.SourceKey != "" {
 			sourceKey = &in.SourceKey
 		}
 		// Create the skill if missing; a concurrent creator wins and we re-read.
-		_, err := tx.Exec(ctx, `INSERT INTO skills (namespace_id, name, visibility, listed, mode, source_key)
+		_, err = tx.Exec(ctx, `INSERT INTO skills (namespace_id, name, visibility, listed, mode, source_key)
 			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (namespace_id, name) DO NOTHING`,
-			nsID, in.Name, in.Visibility, in.Listed, in.Mode, sourceKey)
+			nsID, in.Name, visibility, in.Listed, in.Mode, sourceKey)
 		if c, ok := uniqueViolation(err); ok && strings.Contains(c, "source_key") {
 			// Do not reveal which (possibly private) entry holds the source.
 			return conflict("source_already_indexed", "this source is already indexed on this registry")
@@ -498,6 +523,20 @@ func (s *Store) GetVersion(ctx context.Context, skillID int64, version string) (
 func (s *Store) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
 	var out model.Skill
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		// The upstream of a mirrored skill, read (and share-locked) before
+		// the skill row: see mirrorVisibility.
+		var upstreamID int64
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(n.upstream_id, 0) FROM skills s JOIN namespaces n ON n.id = s.namespace_id
+			WHERE s.id = $1`, skillID).Scan(&upstreamID); err != nil {
+			return notFound(err)
+		}
+		if p.Visibility != nil {
+			v, err := mirrorVisibility(ctx, tx, upstreamID, *p.Visibility)
+			if err != nil {
+				return err
+			}
+			p.Visibility = &v
+		}
 		var mode string
 		if err := tx.QueryRow(ctx, `SELECT mode FROM skills WHERE id = $1 FOR UPDATE`, skillID).Scan(&mode); err != nil {
 			return notFound(err)

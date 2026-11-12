@@ -64,6 +64,11 @@ type Upstream struct {
 	// LatestOnly mirrors only the latest version of each MCP server.
 	LatestOnly bool
 
+	// ConfigVersion counts changes to what the upstream selects and how it
+	// is shown. A sync that started under an older version does not get to
+	// store its cursor.
+	ConfigVersion int64
+
 	Cursor         string
 	SyncState      string
 	SyncStartedAt  *time.Time
@@ -90,13 +95,16 @@ type UpstreamPatch struct {
 }
 
 // UpstreamSyncResult records the outcome of one sync run. Cursor is stored
-// only when Status is SyncOK.
+// only when Status is SyncOK and ConfigVersion is still the upstream's: a run
+// that read the upstream under settings that have since changed did not see
+// what the new settings select.
 type UpstreamSyncResult struct {
-	At     time.Time
-	Status string
-	Error  string
-	Cursor string
-	Stats  map[string]int
+	ConfigVersion int64
+	At            time.Time
+	Status        string
+	Error         string
+	Cursor        string
+	Stats         map[string]int
 }
 
 // MatchNamespace reports whether ns matches one of the patterns. A pattern is

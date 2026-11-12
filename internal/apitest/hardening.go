@@ -420,6 +420,26 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("the deleted server is still listed: %d entries", len(got))
 		}
 		down.Expect(down.Do("GET", "/v0.1/servers/com.acme%2Fmulti/versions/1.0.0", "", "", nil), 404, "a change to an unmirrored version must not create it")
+
+		// A version that was the latest when it was mirrored is superseded
+		// and later deleted. The latest-only listing keeps showing the
+		// server (through its new latest version), which must not hide that
+		// the older version here is out of date.
+		up.Expect(up.publishMCP(pub, "com.acme", serverJSON("com.acme/grow", "1.0.0", "https://grow.acme.example/mcp")), 201, "publish")
+		down.sync("official")
+		up.Expect(up.publishMCP(pub, "com.acme", serverJSON("com.acme/grow", "2.0.0", "https://grow.acme.example/mcp")), 201, "publish")
+		down.sync("official")
+		up.Expect(up.Do("POST", "/v1/mcp/servers/com.acme/grow/versions/1.0.0/status", pub, "", map[string]any{"status": "deleted"}), 200, "delete old version")
+		if s := down.sync("official"); s["last_status"] != "ok" {
+			t.Fatalf("sync: %v", s)
+		}
+		r = down.Expect(down.Do("GET", "/v0.1/servers/com.acme%2Fgrow/versions/1.0.0", "", "", nil), 200, "superseded version")
+		if official(r.JSON)["status"] != "deleted" {
+			t.Fatalf("a superseded version deleted upstream is still %v here", official(r.JSON)["status"])
+		}
+		if r = down.Do("GET", "/v0.1/servers/com.acme%2Fgrow/versions/latest", "", "", nil); v0Version(r.JSON) != "2.0.0" {
+			t.Fatalf("latest: %s", r.Body)
+		}
 	})
 
 	t.Run("watermark", func(t *testing.T) {
@@ -492,6 +512,26 @@ func runLimitsAndFormats(t *testing.T, newStore func(t *testing.T) store.Store) 
 	// Native routes keep their own shape.
 	if r := private.Expect(private.Do("GET", "/v1/skills", "", "", nil), 401, "native anonymous"); errCode(r) != "unauthorized" {
 		t.Fatalf("native error body: %s", r.Body)
+	}
+
+	// Bad tokens are budgeted by address, before any lookup. Anonymous
+	// requests are not affected.
+	guarded := NewEnv(t, newStore(t), Options{AuthFailuresPerMinute: 3})
+	valid := guarded.token([]string{"skills:read"}, nil)
+	for range 3 {
+		guarded.Expect(guarded.Do("GET", "/v1/skills", "olr_aaaaaaaaaaaaaaaa_"+strings.Repeat("b", 43), "", nil), 401, "bad token")
+	}
+	r = guarded.Expect(guarded.Do("GET", "/v1/skills", "olr_aaaaaaaaaaaaaaaa_"+strings.Repeat("c", 43), "", nil), 429, "too many bad tokens")
+	if errCode(r) != "rate_limited" || r.Header.Get("Retry-After") == "" {
+		t.Fatalf("authentication failure limit: %s", r.Body)
+	}
+	guarded.Expect(guarded.Do("GET", "/v1/skills", valid, "", nil), 429, "credentialed request from a blocked address")
+	guarded.Expect(guarded.Do("GET", "/v1/skills", "", "", nil), 200, "anonymous request")
+	// Successful authentications never count.
+	calm := NewEnv(t, newStore(t), Options{AuthFailuresPerMinute: 3})
+	good := calm.token([]string{"skills:read"}, nil)
+	for range 10 {
+		calm.Expect(calm.Do("GET", "/v1/skills", good, "", nil), 200, "valid token")
 	}
 
 	// A forwarding 429 on the official API carries Retry-After too.
@@ -628,7 +668,10 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e := NewEnv(t, newStore(t), Options{Loopback: true})
 		e.Expect(e.upstream(map[string]any{"name": "mixed", "kind": "openlinker-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
 		s := e.sync("mixed")
-		if s["last_status"] != "ok" || stat(s, "skills_created") != 1 || stat(s, "mcp_created") != 1 || stat(s, "skills_skipped") < 2 {
+		// The malformed detail is skipped; the skill whose version cannot be
+		// read waits for a later run.
+		if s["last_status"] != "ok" || stat(s, "skills_created") != 1 || stat(s, "mcp_created") != 1 ||
+			stat(s, "skills_skipped") != 1 || stat(s, "skills_incomplete") != 1 {
 			t.Fatalf("sync with malformed entries: %v", s)
 		}
 		e.Expect(e.Do("GET", "/v1/skills/com.mixed/good", "", "", nil), 200, "the good skill")
@@ -640,6 +683,81 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if s := r.JSON["sync"].(map[string]any); s["last_status"] != "failed" || stat(s, "mcp_created") != 1 {
 			t.Fatalf("a failed skill listing must not keep MCP servers from syncing: %v", s)
 		}
+	})
+
+	t.Run("a version that cannot be read yet", func(t *testing.T) {
+		// The upstream lists v1 and v2 but does not serve v1 at first. v2
+		// must not be recorded without it: versions are only added after the
+		// newest one here, so v1 would be left out for good.
+		body := md("late", "Late skill", "MIT")
+		ready := false
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			version := func(v string) map[string]any {
+				return map[string]any{"namespace": "com.late", "name": "late", "version": v, "mode": "hosted",
+					"frontmatter": map[string]any{"name": "late", "description": "d"}, "license": map[string]any{"kind": "spdx", "id": "MIT"},
+					"core_compatible": true, "files": []map[string]any{{"path": "SKILL.md", "size": len(body), "sha256": strings.TrimPrefix(sha(body), "sha256:")}},
+					"artifact":       map[string]any{"type": "skill-md", "digest": sha(body), "size": len(body)},
+					"content_access": map[string]any{"full_text": true, "artifact": true}}
+			}
+			switch r.URL.Path {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[{"namespace":"com.late","name":"late"}]}`))
+			case "/v1/skills/com.late/late":
+				_ = enc.Encode(map[string]any{"namespace": "com.late", "name": "late", "status": "active", "mode": "hosted", "visibility": "public",
+					"listed": true, "latest_version": "v2", "versions": []map[string]any{{"version": "v2"}, {"version": "v1"}}})
+			case "/v1/skills/com.late/late/versions/v2":
+				_ = enc.Encode(version("v2"))
+			case "/v1/skills/com.late/late/versions/v1":
+				if ready {
+					_ = enc.Encode(version("v1"))
+					return
+				}
+				fallthrough
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not found"}}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "late", "kind": "openlinker-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("late"); s["last_status"] != "ok" || stat(s, "skills_created") != 0 || stat(s, "skills_incomplete") != 1 {
+			t.Fatalf("sync while a version is unreadable: %v", s)
+		}
+		e.Expect(e.Do("GET", "/v1/skills/com.late/late", "", "", nil), 404, "nothing recorded yet")
+		ready = true
+		if s := e.sync("late"); s["last_status"] != "ok" || stat(s, "skills_created") != 2 {
+			t.Fatalf("sync once the version is readable: %v", s)
+		}
+		r := e.Expect(e.Do("GET", "/v1/skills/com.late/late", "", "", nil), 200, "complete skill")
+		if vs := r.JSON["versions"].([]any); r.JSON["latest_version"] != "v2" || len(vs) != 2 || vs[1].(map[string]any)["version"] != "v1" {
+			t.Fatalf("versions out of order or incomplete: %s", r.Body)
+		}
+	})
+
+	t.Run("a skill yanked upstream with unseen versions", func(t *testing.T) {
+		up := NewEnv(t, newStore(t), Options{})
+		up.namespace("com.acme", "domain")
+		pub := up.publisher("com.acme")
+		up.Expect(up.Do("POST", "/v1/skills/com.acme/gone/versions?version=1", pub, "text/markdown", md("gone", "Soon yanked", "MIT")), 201, "v1")
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base, "visibility": "public"}), 201, "upstream")
+		down.sync("hub")
+		// Between two syncs the upstream publishes v2 and then yanks the skill.
+		up.Expect(up.Do("POST", "/v1/skills/com.acme/gone/versions?version=2", pub, "text/markdown", md("gone", "Soon yanked", "MIT")), 201, "v2")
+		up.Expect(up.Do("POST", "/v1/skills/com.acme/gone/yank", pub, "", nil), 200, "yank")
+		for i := range 2 {
+			s := down.sync("hub")
+			if s["last_status"] != "ok" || stat(s, "skills_conflicts") != 0 || stat(s, "skills_skipped") != 0 {
+				t.Fatalf("sync %d of a yanked skill: %v", i, s)
+			}
+		}
+		if r := down.Do("GET", "/v1/skills/com.acme/gone", "", "", nil); r.JSON["status"] != "yanked" {
+			t.Fatalf("yank did not arrive: %s", r.Body)
+		}
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/gone/versions/1/artifact", "", "", nil), 410, "yanked content")
 	})
 
 	t.Run("official registry without a usable cursor", func(t *testing.T) {

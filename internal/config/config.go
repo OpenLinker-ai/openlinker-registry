@@ -62,6 +62,8 @@ type Config struct {
 	RateLimitRead    int
 	RateLimitWrite   int
 	RateLimitForward int
+	// RateLimitAuthFailures bounds failed authentications per client address.
+	RateLimitAuthFailures int
 	// TrustedProxies are the reverse proxies whose X-Forwarded-For is used
 	// to identify clients.
 	TrustedProxies []netip.Prefix
@@ -121,6 +123,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	rlRead := fs.String("rate-limit-read", env("RATE_LIMIT_READ", "600"), "read requests per client per minute (0 = unlimited)")
 	rlWrite := fs.String("rate-limit-write", env("RATE_LIMIT_WRITE", "60"), "write requests per client per minute (0 = unlimited)")
 	rlForward := fs.String("rate-limit-forward", env("RATE_LIMIT_FORWARD", "30"), "reads forwarded to upstreams per client per minute (0 = unlimited)")
+	rlAuth := fs.String("rate-limit-auth-failures", env("RATE_LIMIT_AUTH_FAILURES", "30"), "failed authentications per client address per minute (0 = unlimited)")
 	proxies := fs.String("trusted-proxies", env("TRUSTED_PROXIES", ""), "comma-separated reverse proxy addresses or networks whose X-Forwarded-For is trusted")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -186,6 +189,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	c.RateLimitRead = parseLimit("rate-limit-read", *rlRead)
 	c.RateLimitWrite = parseLimit("rate-limit-write", *rlWrite)
 	c.RateLimitForward = parseLimit("rate-limit-forward", *rlForward)
+	c.RateLimitAuthFailures = parseLimit("rate-limit-auth-failures", *rlAuth)
 	parsePrefixes := func(name, v string) []netip.Prefix {
 		ps, perr := ratelimit.ParsePrefixes(v)
 		if perr != nil && err == nil {

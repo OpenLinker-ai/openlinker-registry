@@ -331,8 +331,10 @@ func credentialName(v any) bool {
 	return false
 }
 
-// urlKeys are the document members that hold URLs.
-var urlKeys = map[string]bool{"url": true, "src": true, "websiteUrl": true, "registryBaseUrl": true}
+// urlRe recognizes a value that is a URL, whatever member holds it: besides
+// "url" and "websiteUrl" that includes a package identifier (a download URL
+// for some package types) and anything a later schema adds.
+var urlRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*://`)
 
 // userinfoRe matches the scheme and userinfo of a URL ("https://user:pw@").
 // It works on text, not a parsed URL, so URL templates with {variables} in
@@ -383,7 +385,7 @@ func scrubURLCredentials(v any, redact bool) (path string) {
 	switch t := v.(type) {
 	case map[string]any:
 		for _, k := range slices.Sorted(maps.Keys(t)) {
-			if s, ok := t[k].(string); ok && urlKeys[k] {
+			if s, ok := t[k].(string); ok && urlRe.MatchString(s) {
 				if clean, found := urlCredentials(s); found {
 					if !redact {
 						return k
@@ -401,6 +403,15 @@ func scrubURLCredentials(v any, redact bool) (path string) {
 		}
 	case []any:
 		for i, e := range t {
+			if s, ok := e.(string); ok && urlRe.MatchString(s) {
+				if clean, found := urlCredentials(s); found {
+					if !redact {
+						return fmt.Sprintf("[%d]", i)
+					}
+					t[i] = clean
+				}
+				continue
+			}
 			if sub := scrubURLCredentials(e, redact); sub != "" {
 				if strings.HasPrefix(sub, "[") {
 					return fmt.Sprintf("[%d]%s", i, sub)
