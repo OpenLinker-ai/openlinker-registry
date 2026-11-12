@@ -599,10 +599,13 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		// deletion must be settled in this run: the watermark moves on.
 		now := time.Now().UTC().Truncate(time.Second)
 		t1, t2, t3 := now.Add(-3*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour)
+		// The upstream's latest version of "a" is 2.0.0 although 3.0.0
+		// exists: which version is latest is the upstream's decision.
 		entry := func(name, version, status string, updated time.Time) map[string]any {
+			latest := status != "deleted" && (name != "com.feed/a" || version == "2.0.0")
 			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": version,
 				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
-				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": status != "deleted",
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": latest,
 					"updatedAt": updated.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
 		}
 		later := false
@@ -613,13 +616,14 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			case "/v0.1/servers":
 				if !later {
 					_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "1.0.0", "active", t1),
-						entry("com.feed/a", "2.0.0", "active", t1), entry("com.feed/b", "1.0.0", "active", t1)}})
+						entry("com.feed/a", "2.0.0", "active", t1), entry("com.feed/a", "3.0.0", "active", t1),
+						entry("com.feed/b", "1.0.0", "active", t1)}})
 					return
 				}
 				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "1.0.0", "deleted", t2), entry("com.feed/b", "1.0.0", "deprecated", t3)}})
 			case "/v0.1/servers/com.feed%2Fa/versions":
 				// The deleted version is no longer listed at all.
-				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "2.0.0", "active", t1)}})
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "2.0.0", "active", t1), entry("com.feed/a", "3.0.0", "active", t1)}})
 			case "/v0.1/servers/com.feed%2Fb/versions/1.0.0":
 				_ = enc.Encode(entry("com.feed/b", "1.0.0", "deprecated", t3))
 			default:
@@ -642,7 +646,7 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("a deletion the upstream no longer serves by name was dropped: %s", r.Body)
 		}
 		if r = e.Do("GET", "/v0.1/servers/com.feed%2Fa/versions/latest", "", "", nil); v0Version(r.JSON) != "2.0.0" {
-			t.Fatalf("latest: %s", r.Body)
+			t.Fatalf("settling the deletion replaced the upstream's latest version: %s", r.Body)
 		}
 	})
 

@@ -708,7 +708,7 @@ func TestRegistryMetaIsStripped(t *testing.T) {
 // secretDoc places one input at every position the official schema defines.
 func secretDoc(input obj) map[string]obj {
 	variables := obj{"type": "sse", "url": "https://{tenant}.example.com/sse", "variables": obj{"tenant": input}}
-	nested := obj{"name": "Authorization", "value": "Bearer {token}", "variables": obj{"token": obj{"variables": obj{"inner": input}}}}
+	nested := obj{"name": "X-Trace", "value": "trace-{id}", "variables": obj{"id": obj{"variables": obj{"inner": input}}}}
 	stdio := func(key string, in obj) obj {
 		return obj{"registryType": "npm", "identifier": "@alice/weather", "transport": obj{"type": "stdio"}, key: arr{in}}
 	}

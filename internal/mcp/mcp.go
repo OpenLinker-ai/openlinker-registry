@@ -252,14 +252,19 @@ func stripRegistryMeta(root map[string]any) {
 // With redact set, literals are deleted in place (a literal value takes the
 // default with it) and "" is returned. Otherwise nothing is modified and the
 // path of the first literal, in key order, is returned.
-func scrubSecrets(v any, redact bool) (path string) { return scrubSecretsNamed(v, "", redact) }
+func scrubSecrets(v any, redact bool) (path string) { return scrubSecretsIn(v, "", false, redact) }
 
-// scrubSecretsNamed is scrubSecrets for a value found under the given key of
-// a "variables" object ("" elsewhere): there the key is the input's name.
-func scrubSecretsNamed(v any, key string, redact bool) (path string) {
+// scrubSecretsIn is scrubSecrets for a value found under the given key of a
+// "variables" object ("" elsewhere), where the key is the input's name.
+// inherited says the value is a variable of a secret input: what is
+// substituted into a credential ("Bearer {key}") is a credential too, so
+// such a variable may not carry a literal either.
+func scrubSecretsIn(v any, key string, inherited, redact bool) (path string) {
 	switch t := v.(type) {
 	case map[string]any:
-		if secret, _ := t["isSecret"].(bool); secret || credentialName(t["name"]) || credentialName(key) {
+		flagged, _ := t["isSecret"].(bool)
+		secret := flagged || inherited || credentialName(t["name"]) || credentialName(key)
+		if secret {
 			valueLiteral, defaultLiteral := isLiteral(t["value"]), isLiteral(t["default"])
 			switch {
 			case redact && valueLiteral:
@@ -277,13 +282,13 @@ func scrubSecretsNamed(v any, key string, redact bool) (path string) {
 			var sub string
 			if vars, ok := t[k].(map[string]any); ok && k == "variables" {
 				for _, name := range slices.Sorted(maps.Keys(vars)) {
-					if inner := scrubSecretsNamed(vars[name], name, redact); inner != "" {
+					if inner := scrubSecretsIn(vars[name], name, secret, redact); inner != "" {
 						sub = name + "." + inner
 						break
 					}
 				}
 			} else {
-				sub = scrubSecretsNamed(t[k], "", redact)
+				sub = scrubSecretsIn(t[k], "", false, redact)
 			}
 			if sub != "" {
 				if strings.HasPrefix(sub, "[") {
@@ -294,7 +299,7 @@ func scrubSecretsNamed(v any, key string, redact bool) (path string) {
 		}
 	case []any:
 		for i, e := range t {
-			if sub := scrubSecretsNamed(e, "", redact); sub != "" {
+			if sub := scrubSecretsIn(e, "", false, redact); sub != "" {
 				if strings.HasPrefix(sub, "[") {
 					return fmt.Sprintf("[%d]%s", i, sub)
 				}

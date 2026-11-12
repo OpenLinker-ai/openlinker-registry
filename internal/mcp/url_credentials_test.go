@@ -58,6 +58,13 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 		"nested variable key": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse","headers":[{"name":"X-Trace","value":"{t}",
 			"variables":{"t":{"variables":{"db_password":{"value":"` + secret + `"}}}}}]}]}`,
+		// What is substituted into a credential is a credential.
+		"variable of a secret header": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse","headers":[{"name":"Authorization","isSecret":true,
+			"value":"Bearer {key}","variables":{"key":{"default":"` + secret + `"}}}]}]}`,
+		"nested variable of a credential by name": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"stdio"},"environmentVariables":[{"name":"API_KEY",
+			"value":"{a}","variables":{"a":{"value":"{b}","variables":{"b":{"value":"` + secret + `"}}}}}]}]}`,
 		"query parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?region=eu&api_key=` + secret + `"}]}`,
 		// A package identifier is a download URL for some package types.
@@ -111,6 +118,13 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 	if p, err := Parse([]byte(plain), Options{}); err != nil || !strings.Contains(string(p.Canonical), "docs?lang=en#install") ||
 		!strings.Contains(string(p.Canonical), `"https://mcp.example.com/sse#"`) {
 		t.Fatalf("ordinary URLs must not be rewritten: %v", err)
+	}
+	// A variable of an input that is not a credential keeps its default.
+	region := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"remotes":[{"type":"sse","url":"https://mcp.example.com/sse","headers":[{"name":"X-Region","value":"{region}",
+		"variables":{"region":{"default":"eu-west-1"}}}]}]}`
+	if p, err := Parse([]byte(region), Options{Strict: true}); err != nil || !strings.Contains(string(p.Canonical), "eu-west-1") {
+		t.Fatalf("variables of ordinary inputs must pass: %v", err)
 	}
 	// Placeholders and ordinary parameters are untouched.
 	ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",

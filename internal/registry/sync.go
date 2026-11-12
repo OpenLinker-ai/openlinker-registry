@@ -331,12 +331,14 @@ func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *
 	if err != nil {
 		return "", err
 	}
-	const reason = "no longer available from the upstream registry"
-	if _, err := s.Store.SetMCPStatus(ctx, srv.ID, doc.Version, model.MCPStatusDeleted, reason, s.Now(),
-		auditEvent("upstream:"+u.Name, "mcp.status", srv.Namespace, srv.Name+"@"+doc.Version, map[string]any{"status": model.MCPStatusDeleted})); err != nil {
-		return "", err
-	}
-	return model.MirrorUpdated, nil
+	// Only this version changes. Which version is latest was just taken
+	// from the upstream's own list and is not recomputed here: the upstream
+	// decides it, and its choice need not be the highest version.
+	actor := "upstream:" + u.Name
+	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: srv.Namespace, Name: srv.Name,
+		Visibility: srv.Visibility, Listed: srv.Listed, Fresh: true, Version: model.MCPVersion{Version: v.Version, ServerJSON: v.ServerJSON,
+			Digest: v.Digest, Status: model.MCPStatusDeleted, StatusMessage: "no longer available from the upstream registry", CreatedBy: actor}},
+		auditEvent(actor, "mcp.mirror", srv.Namespace, srv.Name+"@"+v.Version, map[string]any{"status": model.MCPStatusDeleted, "upstream": u.Name}))
 }
 
 // refreshMCPServerLocked is refreshMCPServer for a caller that holds the
