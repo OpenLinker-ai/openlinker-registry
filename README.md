@@ -311,7 +311,10 @@ cookie, so downloads offered by the pages are served under `/ui/` as well. The p
   name), a URL with userinfo, or a URL query or fragment parameter named
   like a credential. A `{variable}` placeholder is fine, but the variable
   it names is then a credential too and may not carry a literal value or
-  default either.
+  default either. That is the extent of the check: free text and the values
+  of inputs that are neither flagged nor named like credentials are not
+  inspected, because the registry cannot know that an arbitrary string is a
+  secret.
 - **Names.** Skill names are slugs (`[a-z0-9]+(-[a-z0-9]+)*`, max 64).
   Namespaces are lowercase reverse-DNS: `io.github.<login>` (bound to the
   numeric GitHub id, which must be unique), `ai.openlinker.<handle>` (public
