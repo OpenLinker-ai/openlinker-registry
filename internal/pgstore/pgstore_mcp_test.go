@@ -171,10 +171,10 @@ func TestMigration0004Upgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	var ce *model.ConflictError
-	if _, err := st.EnsureUpstreamNamespace(ctx, "com.example", up.ID); !errors.As(err, &ce) || ce.Code != "namespace_upstream_managed" {
+	if _, err := st.EnsureUpstreamNamespace(ctx, "com.example", up.ID, model.AuditEvent{Actor: "test", Action: "test"}); !errors.As(err, &ce) || ce.Code != "namespace_upstream_managed" {
 		t.Fatalf("upstream claims an R1 namespace: %v", err)
 	}
-	if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID); err != nil {
+	if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID, model.AuditEvent{Actor: "test", Action: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	publishTestMCP(t, st, "com.example/server", "1.0.0")
@@ -251,7 +251,7 @@ func TestNamespaceOwnerImmutable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", ups[0].ID); err != nil {
+	if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", ups[0].ID, model.AuditEvent{Actor: "test", Action: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	conn := connSchema(t, schema)
@@ -338,6 +338,31 @@ func TestAuditIsAtomicMCPAndUpstreams(t *testing.T) {
 	}
 	if got, err := st.GetMCPServer(ctx, "com.example/server"); err != nil || got.Visibility != model.VisibilityPublic || !got.UpdatedAt.Equal(srv.UpdatedAt) {
 		t.Fatalf("server after failed mutations = %+v, %v", got, err)
+	}
+
+	// Writes on behalf of an upstream are no exception.
+	mirror := model.MCPMirrorInput{UpstreamID: up.ID, Namespace: "org.mirror", Name: "org.mirror/server", Visibility: model.VisibilityPublic,
+		Listed: true, Version: model.MCPVersion{Version: "1.0.0", ServerJSON: []byte(`{}`), Digest: "sha256:" + strings.Repeat("e", 64),
+			Status: model.MCPStatusActive, CreatedBy: "upstream:up"}}
+	if _, err := st.UpsertMirroredMCP(ctx, mirror, testAudit); err == nil {
+		t.Fatal("a mirror write must fail when the audit row cannot be written")
+	}
+	if _, err := st.GetMCPServer(ctx, "org.mirror/server"); !errors.Is(err, model.ErrNotFound) {
+		t.Fatalf("mirrored server was not rolled back: %v", err)
+	}
+	if _, err := st.EnsureUpstreamNamespace(ctx, "org.other", up.ID, testAudit); err == nil {
+		t.Fatal("namespace creation for an upstream must fail without audit")
+	}
+	for _, ns := range []string{"org.mirror", "org.other"} {
+		if _, err := st.GetNamespace(ctx, ns); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("namespace %s was not rolled back: %v", ns, err)
+		}
+	}
+	if err := st.FinishUpstreamSync(ctx, up.ID, model.UpstreamSyncResult{At: time.Now(), Status: model.SyncOK, Cursor: "c"}, testAudit); err == nil {
+		t.Fatal("recording a sync result must fail without audit")
+	}
+	if got, err := st.GetUpstream(ctx, "up"); err != nil || got.Cursor != "" || got.LastSyncAt != nil {
+		t.Fatalf("sync result was not rolled back: %+v, %v", got, err)
 	}
 
 	if _, err := st.CreateUpstream(ctx, model.Upstream{Name: "new", Kind: model.UpstreamMCP, BaseURL: "https://new.example",

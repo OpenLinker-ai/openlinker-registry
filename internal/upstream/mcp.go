@@ -13,6 +13,10 @@ import (
 // officialMeta is the key of the registry-managed block in "_meta".
 const officialMeta = "io.modelcontextprotocol.registry/official"
 
+// registryMeta is the key under which an openlinker-registry states its own
+// facts about an entry.
+const registryMeta = "ai.openlinker.registry/entry"
+
 // MCP version statuses, as in the official MCP Registry.
 const (
 	mcpActive     = "active"
@@ -30,6 +34,11 @@ type MCPDoc struct {
 	PublishedAt     time.Time
 	UpdatedAt       time.Time
 	IsLatest        bool
+	// Visibility and Unlisted come from an openlinker-registry upstream
+	// (_meta["ai.openlinker.registry/entry"]). Visibility is "" when the
+	// upstream does not state it, as the official registry never does.
+	Visibility string
+	Unlisted   bool
 }
 
 // MCPListOptions selects a page of GET /servers. Zero fields are not sent.
@@ -146,6 +155,12 @@ func parseMCPDoc(raw json.RawMessage) (doc MCPDoc, ok bool) {
 	var latest bool
 	if json.Unmarshal(official["isLatest"], &latest) == nil {
 		doc.IsLatest = latest
+	}
+	entry := rawObject(rawObject(top["_meta"])[registryMeta])
+	doc.Visibility = rawString(entry, "visibility")
+	var listed bool
+	if json.Unmarshal(entry["listed"], &listed) == nil {
+		doc.Unlisted = !listed
 	}
 	return doc, true
 }

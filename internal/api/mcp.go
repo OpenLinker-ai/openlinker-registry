@@ -77,7 +77,9 @@ func v0Response(srv model.MCPServer, v model.MCPVersion) map[string]any {
 	if v.StatusMessage != "" {
 		official["statusMessage"] = v.StatusMessage
 	}
-	entry := map[string]any{"mode": srv.Mode, "digest": v.Digest}
+	// A downstream registry mirrors visibility and listing from here so that
+	// it never shows an entry more widely than this instance does.
+	entry := map[string]any{"mode": srv.Mode, "digest": v.Digest, "visibility": srv.Visibility, "listed": srv.Listed}
 	if srv.Upstream != "" {
 		entry["upstream"] = srv.Upstream
 	}
@@ -88,7 +90,26 @@ func v0Response(srv model.MCPServer, v model.MCPVersion) map[string]any {
 // writeV0Error uses the official error body: {"error": "<message>"}.
 func writeV0Error(w http.ResponseWriter, err error) {
 	e := registry.AsError(err)
+	if e.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
+	}
 	writeJSON(w, e.Status, map[string]any{"error": e.Msg})
+}
+
+// isV0 reports whether the request is for the official MCP Registry API,
+// whose clients expect its error body from every layer, middleware included.
+func (s *Server) isV0(r *http.Request) bool {
+	p := strings.TrimPrefix(r.URL.Path, s.BasePath)
+	return strings.HasPrefix(p, "/v0/") || strings.HasPrefix(p, "/v0.1/")
+}
+
+// reject writes an error from middleware in the format of the route.
+func (s *Server) reject(w http.ResponseWriter, r *http.Request, e *registry.Error) {
+	if s.isV0(r) {
+		writeV0Error(w, e)
+		return
+	}
+	writeError(w, e)
 }
 
 func encodeMCPCursor(name, version string) string {
@@ -171,27 +192,33 @@ func (s *Server) searchMCP(r *http.Request, q model.MCPQuery, limit int) ([]mode
 	return rows, next, nil
 }
 
-// loadVisibleMCP resolves name@version for the caller. A local miss may be
-// forwarded to the upstreams; an entry the caller may not see is
-// indistinguishable from a missing one.
+// loadVisibleMCP resolves name@version for the caller. An entry the caller
+// may not see is indistinguishable from a missing one, also when the
+// forwarding budget is exhausted (see loadVisible).
 func (s *Server) loadVisibleMCP(r *http.Request, name, version string) (model.MCPServer, model.MCPVersion, error) {
-	srv, v, err := s.Svc.ResolveMCP(r.Context(), name, version, false)
-	if errors.Is(err, model.ErrNotFound) {
-		if ferr := s.allowForward(r); ferr != nil {
-			if ferr != errNoForward {
-				return srv, v, ferr
-			}
-		} else {
-			srv, v, err = s.Svc.ResolveMCP(r.Context(), name, version, true)
-		}
-	}
-	if errors.Is(err, model.ErrNotFound) {
-		return srv, v, errNotFound
-	}
-	if err != nil {
+	viewer := principal(r).Viewer()
+	srv, v, err := s.Svc.ResolveMCP(r.Context(), viewer, name, version, false)
+	missing := errors.Is(err, model.ErrNotFound)
+	if err != nil && !missing {
 		return srv, v, err
 	}
-	if !principal(r).Viewer().CanSee(srv.Namespace, srv.Visibility) {
+	visible := !missing && viewer.CanSee(srv.Namespace, srv.Visibility)
+	if !visible && s.Svc.CanForwardMCP(r.Context(), viewer, name) {
+		if err := s.chargeForward(r); err != nil {
+			return srv, v, err
+		}
+		if missing {
+			srv, v, err = s.Svc.ResolveMCP(r.Context(), viewer, name, version, true)
+			if errors.Is(err, model.ErrNotFound) {
+				return srv, v, errNotFound
+			}
+			if err != nil {
+				return srv, v, err
+			}
+			visible = viewer.CanSee(srv.Namespace, srv.Visibility)
+		}
+	}
+	if !visible {
 		return srv, v, errNotFound
 	}
 	return srv, v, nil
@@ -211,8 +238,10 @@ func serverName(r *http.Request) string {
 // accepted. A full server name always contains a slash, which tells the two
 // apart. list is true for the version listing.
 func v0Target(r *http.Request) (name, version string, list, ok bool) {
+	// The base path is already stripped, so the first "/servers/" is the
+	// route's own; a later one belongs to the name ("com.acme/servers").
 	escaped := r.URL.EscapedPath()
-	i := strings.LastIndex(escaped, "/servers/")
+	i := strings.Index(escaped, "/servers/")
 	if i < 0 {
 		return "", "", false, false
 	}

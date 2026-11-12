@@ -747,9 +747,16 @@ func TestSecretValues(t *testing.T) {
 		{"placeholder default", obj{"name": "API_KEY", "isSecret": true, "default": "{api_key}"}, false},
 		{"empty value", obj{"name": "API_KEY", "isSecret": true, "value": ""}, false},
 		{"no value", obj{"name": "API_KEY", "isSecret": true, "description": "Your key", "isRequired": true}, false},
-		{"not secret", obj{"name": "API_KEY", "isSecret": false, "value": literal, "default": literal}, false},
-		{"isSecret absent", obj{"name": "API_KEY", "value": literal}, false},
-		{"isSecret is not a boolean", obj{"name": "API_KEY", "isSecret": "true", "value": literal}, false},
+		{"not secret", obj{"name": "REGION", "isSecret": false, "value": literal, "default": literal}, false},
+		{"isSecret absent", obj{"name": "REGION", "value": literal}, false},
+		{"isSecret is not a boolean", obj{"name": "REGION", "isSecret": "true", "value": literal}, false},
+		// A credential by name is secret whatever the flag says.
+		{"credential name without the flag", obj{"name": "API_KEY", "value": literal}, true},
+		{"credential name flagged not secret", obj{"name": "GITHUB_TOKEN", "isSecret": false, "value": literal}, true},
+		{"authorization header without the flag", obj{"name": "Authorization", "value": "Bearer " + literal}, true},
+		{"credential default without the flag", obj{"name": "X-Api-Key", "default": literal}, true},
+		{"credential name with a placeholder", obj{"name": "DB_PASSWORD", "value": "{password}"}, false},
+		{"plural is not a credential", obj{"name": "MAX_TOKENS", "value": "4096"}, false},
 	}
 	for _, in := range inputs {
 		for position, doc := range secretDoc(in.input) {
@@ -784,7 +791,10 @@ func TestSecretValues(t *testing.T) {
 				if p.Digest == digest {
 					t.Errorf("%s: redaction did not change the digest", name)
 				}
-				if !bytes.Contains(p.Canonical, []byte(`"isSecret":true`)) || !bytes.Contains(p.Canonical, []byte(`"API_KEY"`)) {
+				// Only the literal goes: the input, its name and its flag stay.
+				inputName, _ := in.input["name"].(string)
+				flagged, _ := in.input["isSecret"].(bool)
+				if !bytes.Contains(p.Canonical, bytes.TrimSpace(mustJSON(t, inputName))) || (flagged && !bytes.Contains(p.Canonical, []byte(`"isSecret":true`))) {
 					t.Errorf("%s: redaction removed more than the literal: %s", name, p.Canonical)
 				}
 			} else if !bytes.Equal(p.Canonical, canonical) {

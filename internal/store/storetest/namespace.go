@@ -51,7 +51,7 @@ var namespaceTests = []testCase{
 		if got, err := st.GetNamespace(ctx, "org.local"); err != nil || got.UpstreamID != 0 || got.Kind != "domain" {
 			t.Fatalf("stored local namespace: %+v, %v", got, err)
 		}
-		if _, err := st.EnsureUpstreamNamespace(ctx, "a-b.example", up.ID); err != nil {
+		if _, err := st.EnsureUpstreamNamespace(ctx, "a-b.example", up.ID, audit); err != nil {
 			t.Fatal(err)
 		}
 		newNamespace(t, st, "ab.example")
@@ -75,21 +75,21 @@ var namespaceTests = []testCase{
 	{"ensure upstream namespace", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		up, other := newUpstream(t, st, "up"), newUpstream(t, st, "other")
-		ns, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID)
+		ns, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID, audit)
 		if err != nil || ns.ID == 0 || ns.Name != "org.mirror" || ns.Kind != model.NSKindUpstream || ns.UpstreamID != up.ID {
 			t.Fatalf("create: %+v, %v", ns, err)
 		}
-		again, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID)
+		again, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID, audit)
 		if err != nil || again.ID != ns.ID || again.UpstreamID != up.ID {
 			t.Fatalf("idempotent: %+v, %v", again, err)
 		}
 		if got, err := st.GetNamespace(ctx, "org.mirror"); err != nil || got.ID != ns.ID || got.UpstreamID != up.ID || got.Kind != model.NSKindUpstream {
 			t.Fatalf("stored: %+v, %v", got, err)
 		}
-		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", other.ID); conflictCode(err) != "namespace_upstream_managed" {
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", other.ID, audit); conflictCode(err) != "namespace_upstream_managed" {
 			t.Fatalf("namespace of another upstream: %v", err)
 		}
-		if _, err := st.EnsureUpstreamNamespace(ctx, "com.example", up.ID); conflictCode(err) != "namespace_upstream_managed" {
+		if _, err := st.EnsureUpstreamNamespace(ctx, "com.example", up.ID, audit); conflictCode(err) != "namespace_upstream_managed" {
 			t.Fatalf("local namespace: %v", err)
 		}
 		if got, _ := st.GetNamespace(ctx, "com.example"); got.UpstreamID != 0 || got.Kind != "domain" {
@@ -98,7 +98,7 @@ var namespaceTests = []testCase{
 		for _, id := range []int64{0, 1 << 40} {
 			// Upstream id 0 must never match a local namespace.
 			for _, name := range []string{"com.example", "org.fresh"} {
-				if _, err := st.EnsureUpstreamNamespace(ctx, name, id); !errors.Is(err, model.ErrNotFound) {
+				if _, err := st.EnsureUpstreamNamespace(ctx, name, id, audit); !errors.Is(err, model.ErrNotFound) {
 					t.Fatalf("upstream %d, namespace %s: %v", id, name, err)
 				}
 			}
@@ -107,7 +107,7 @@ var namespaceTests = []testCase{
 			t.Fatal("namespace created for a missing upstream")
 		}
 		for _, bad := range []string{"", "single", "Org.Upper", "org..x", "org.x-", "org.under_score", strings.Repeat("a.", 64) + "b"} {
-			if _, err := st.EnsureUpstreamNamespace(ctx, bad, up.ID); policyCode(err) != "namespace_invalid" {
+			if _, err := st.EnsureUpstreamNamespace(ctx, bad, up.ID, audit); policyCode(err) != "namespace_invalid" {
 				t.Fatalf("invalid name %q: %v", bad, err)
 			}
 		}
@@ -118,7 +118,7 @@ var namespaceTests = []testCase{
 		up := newUpstream(t, st, "up")
 		ids := make([]int64, 20)
 		for i, err := range parallel(len(ids), func(i int) error {
-			ns, err := st.EnsureUpstreamNamespace(ctx, "org.raced", up.ID)
+			ns, err := st.EnsureUpstreamNamespace(ctx, "org.raced", up.ID, audit)
 			ids[i] = ns.ID
 			return err
 		}) {
@@ -131,7 +131,7 @@ var namespaceTests = []testCase{
 	{"skill publish checks the namespace owner", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		up, other := newUpstream(t, st, "up"), newUpstream(t, st, "other")
-		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID); err != nil {
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID, audit); err != nil {
 			t.Fatal(err)
 		}
 		pub := func(ns string, upstreamID int64) (model.Skill, error) {

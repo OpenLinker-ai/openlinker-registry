@@ -79,7 +79,14 @@ CREATE TABLE mcp_server_versions (
     id                BIGSERIAL PRIMARY KEY,
     server_id         BIGINT NOT NULL REFERENCES mcp_servers (id),
     version           TEXT NOT NULL CHECK (length(version) BETWEEN 1 AND 255 AND version <> 'latest'),
-    server_json       JSONB NOT NULL CHECK (jsonb_typeof(server_json) = 'object'),
+    -- The canonical document exactly as digested. It is text, not JSONB: JSONB
+    -- would rewrite numbers ("1e2" becomes "100") and the stored bytes would
+    -- no longer match the digest.
+    server_json       TEXT NOT NULL CHECK (octet_length(server_json) <= 1048576
+                                           AND jsonb_typeof(server_json::jsonb) = 'object'),
+    -- Search text taken from the document when it is stored.
+    title             TEXT NOT NULL DEFAULT '',
+    description       TEXT NOT NULL DEFAULT '',
     digest            TEXT NOT NULL CHECK (digest ~ '^sha256:[0-9a-f]{64}$'),
     status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deprecated', 'deleted')),
     status_message    TEXT NOT NULL DEFAULT '' CHECK (length(status_message) <= 500),
@@ -103,9 +110,11 @@ BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'mcp_server_versions rows are immutable and cannot be deleted';
     END IF;
-    IF (NEW.id, NEW.server_id, NEW.version, NEW.server_json, NEW.digest, NEW.published_at, NEW.created_by)
+    IF (NEW.id, NEW.server_id, NEW.version, NEW.server_json, NEW.title, NEW.description, NEW.digest,
+        NEW.published_at, NEW.created_by)
        IS DISTINCT FROM
-       (OLD.id, OLD.server_id, OLD.version, OLD.server_json, OLD.digest, OLD.published_at, OLD.created_by) THEN
+       (OLD.id, OLD.server_id, OLD.version, OLD.server_json, OLD.title, OLD.description, OLD.digest,
+        OLD.published_at, OLD.created_by) THEN
         RAISE EXCEPTION 'mcp_server_versions content columns are immutable';
     END IF;
     RETURN NEW;

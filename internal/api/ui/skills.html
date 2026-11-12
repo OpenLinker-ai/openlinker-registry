@@ -23,6 +23,6 @@
 </tr>{{end}}
 </tbody>
 </table>
-{{if .Data.Next}}<p><a class="button" href="{{.Base}}/ui/?{{.Data.Next}}">{{.T "next"}}</a></p>{{end}}
+{{if .Data.Next}}<p><a class="button" href="{{.Data.Next}}">{{.T "next"}}</a></p>{{end}}
 {{else}}<p class="empty">{{.T "skills.empty"}}</p>{{end}}
 {{template "foot" .}}{{end}}

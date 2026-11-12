@@ -1,13 +1,13 @@
 package storetest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -17,9 +17,12 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
 )
 
+// serverJSON builds a document whose bytes a JSON normalizer would change
+// (unsorted keys, the number 1e2): stores must return exactly what was stored.
 func serverJSON(name, version, title, description string) json.RawMessage {
-	b, _ := json.Marshal(map[string]string{"name": name, "version": version, "title": title, "description": description})
-	return b
+	q := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+	return json.RawMessage(`{"version":` + q(version) + `,"name":` + q(name) + `,"title":` + q(title) +
+		`,"weight":1e2,"description":` + q(description) + `}`)
 }
 
 func digestOf(b []byte) string {
@@ -27,11 +30,9 @@ func digestOf(b []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// sameJSON compares documents by value: Postgres normalizes JSONB bytes.
-func sameJSON(a, b []byte) bool {
-	var x, y any
-	return json.Unmarshal(a, &x) == nil && json.Unmarshal(b, &y) == nil && reflect.DeepEqual(x, y)
-}
+// sameJSON reports whether a stored document is byte-identical to the one
+// published: its digest is over these exact bytes.
+func sameJSON(a, b []byte) bool { return bytes.Equal(a, b) }
 
 // mcpInput publishes name ("<namespace>/<server>") as a public, listed,
 // registered server.
@@ -55,14 +56,14 @@ func publishMCP(t *testing.T, st store.Store, in model.MCPPublishInput) (model.M
 func mirrorInput(up model.Upstream, name, version string) model.MCPMirrorInput {
 	ns, _, _ := strings.Cut(name, "/")
 	doc := serverJSON(name, version, "", "")
-	return model.MCPMirrorInput{UpstreamID: up.ID, Namespace: strings.ToLower(ns), Name: name, Visibility: up.Visibility,
+	return model.MCPMirrorInput{UpstreamID: up.ID, Namespace: strings.ToLower(ns), Name: name, Visibility: up.Visibility, Listed: true,
 		Version: model.MCPVersion{Version: version, ServerJSON: doc, Digest: digestOf(doc), Status: model.MCPStatusActive,
 			CreatedBy: "upstream:" + up.Name}}
 }
 
 func mirrorMCP(t *testing.T, st store.Store, in model.MCPMirrorInput, want string) {
 	t.Helper()
-	if got, err := st.UpsertMirroredMCP(context.Background(), in); err != nil || got != want {
+	if got, err := st.UpsertMirroredMCP(context.Background(), in, audit); err != nil || got != want {
 		t.Fatalf("mirror %s@%s = %q, %v; want %q", in.Name, in.Version.Version, got, err, want)
 	}
 }
@@ -154,7 +155,7 @@ var mcpTests = []testCase{
 		ctx := context.Background()
 		up := newUpstream(t, st, "up")
 		newNamespace(t, st, "org.other")
-		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID); err != nil {
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", up.ID, audit); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, err := st.PublishMCPVersion(ctx, mcpInput("org.missing/server", "1.0.0"), audit); !errors.Is(err, model.ErrNotFound) {
@@ -606,7 +607,7 @@ var mcpTests = []testCase{
 		forged.Version.Digest = digestOf(forged.Version.ServerJSON)
 		forged.Version.Status, forged.Version.StatusMessage = model.MCPStatusDeprecated, "forged"
 		beforeForge := mcpVersion(t, st, srv.ID, "2.0.0")
-		if _, err := st.UpsertMirroredMCP(ctx, forged); conflictCode(err) != "digest_mismatch" {
+		if _, err := st.UpsertMirroredMCP(ctx, forged, audit); conflictCode(err) != "digest_mismatch" {
 			t.Fatalf("different digest: %v", err)
 		}
 		if got := mcpVersion(t, st, srv.ID, "2.0.0"); got.Digest != v2.Version.Digest || !sameJSON(got.ServerJSON, v2.Version.ServerJSON) ||
@@ -621,18 +622,18 @@ var mcpTests = []testCase{
 			"namespace of another upstream":   mirrorInput(other, "org.mirror/Tool", "9.0.0"),
 			"new server, another upstream":    mirrorInput(other, "org.mirror/fresh", "1.0.0"),
 		} {
-			if _, err := st.UpsertMirroredMCP(ctx, in); conflictCode(err) != "namespace_upstream_managed" {
+			if _, err := st.UpsertMirroredMCP(ctx, in, audit); conflictCode(err) != "namespace_upstream_managed" {
 				t.Fatalf("%s: %v", name, err)
 			}
 		}
 		missing := mirrorInput(up, "org.mirror/Tool", "9.0.0")
 		missing.UpstreamID = 1 << 40
-		if _, err := st.UpsertMirroredMCP(ctx, missing); !errors.Is(err, model.ErrNotFound) {
+		if _, err := st.UpsertMirroredMCP(ctx, missing, audit); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("missing upstream: %v", err)
 		}
 		invalid := mirrorInput(up, "org.mirror/Tool", "9.0.0")
 		invalid.Namespace = "Not_A_Namespace"
-		if _, err := st.UpsertMirroredMCP(ctx, invalid); policyCode(err) != "namespace_invalid" {
+		if _, err := st.UpsertMirroredMCP(ctx, invalid, audit); policyCode(err) != "namespace_invalid" {
 			t.Fatalf("invalid namespace: %v", err)
 		}
 
@@ -645,7 +646,7 @@ var mcpTests = []testCase{
 		moved := mirrorInput(up, "org.mirror/Tool", "9.0.0")
 		moved.Namespace = "org.moved"
 		for name, in := range map[string]model.MCPMirrorInput{"letter case": caseDiff, "local server": localName, "other namespace": moved} {
-			if _, err := st.UpsertMirroredMCP(ctx, in); conflictCode(err) != "server_name_conflict" {
+			if _, err := st.UpsertMirroredMCP(ctx, in, audit); conflictCode(err) != "server_name_conflict" {
 				t.Fatalf("%s: %v", name, err)
 			}
 		}
@@ -678,7 +679,7 @@ var mcpTests = []testCase{
 			in := mirrorInput(up, "org.raced/tool", fmt.Sprintf("1.%d.0", i))
 			in.Version.IsLatest = true
 			var err error
-			outcomes[i], err = st.UpsertMirroredMCP(ctx, in)
+			outcomes[i], err = st.UpsertMirroredMCP(ctx, in, audit)
 			return err
 		}) {
 			if err != nil || outcomes[i] != model.MirrorCreated {
@@ -697,7 +698,7 @@ var mcpTests = []testCase{
 		created := 0
 		for i, err := range parallel(n, func(i int) error {
 			var err error
-			outcomes[i], err = st.UpsertMirroredMCP(ctx, mirrorInput(up, "org.raced/same", "1.0.0"))
+			outcomes[i], err = st.UpsertMirroredMCP(ctx, mirrorInput(up, "org.raced/same", "1.0.0"), audit)
 			return err
 		}) {
 			switch {

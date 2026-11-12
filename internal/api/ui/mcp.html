@@ -18,6 +18,6 @@
 </tr>{{end}}
 </tbody>
 </table>
-{{if .Data.Next}}<p><a class="button" href="{{.Base}}/ui/mcp?{{.Data.Next}}">{{.T "next"}}</a></p>{{end}}
+{{if .Data.Next}}<p><a class="button" href="{{.Data.Next}}">{{.T "next"}}</a></p>{{end}}
 {{else}}<p class="empty">{{.T "mcp.empty"}}</p>{{end}}
 {{template "foot" .}}{{end}}

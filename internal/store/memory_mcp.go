@@ -152,7 +152,7 @@ func (m *Memory) PublishMCPVersion(_ context.Context, in model.MCPPublishInput, 
 
 // UpsertMirroredMCP implements Store. Nothing is written unless every check
 // passes, like the single transaction of the Postgres store.
-func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput) (string, error) {
+func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ns, createNS, err := m.upstreamNS(in.Namespace, in.UpstreamID)
@@ -189,15 +189,18 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput) (
 		cur.Status, cur.StatusMessage, cur.IsLatest = status, message, latest
 		cur.StatusChangedAt, cur.UpdatedAt = orNow(in.Version.StatusChangedAt), orNow(in.Version.UpdatedAt)
 		m.mcpVers[cur.ID] = cur
+		m.appendAudit(audit)
 		return model.MirrorUpdated, nil
 	}
 
 	if createNS {
 		m.createUpstreamNS(ns)
+		m.appendAudit(model.AuditEvent{Actor: audit.Actor, Action: "namespace.mirror", Namespace: in.Namespace,
+			Details: map[string]any{"upstream_id": in.UpstreamID}})
 	}
 	if !found {
 		s = model.MCPServer{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Mode: model.MCPModeMirrored,
-			Visibility: in.Visibility, Listed: true, CreatedBy: in.Version.CreatedBy, CreatedAt: now}
+			Visibility: in.Visibility, Listed: in.Listed, CreatedBy: in.Version.CreatedBy, CreatedAt: now}
 	}
 	v := model.MCPVersion{ID: m.id(), ServerID: s.ID, Version: in.Version.Version, ServerJSON: slices.Clone(in.Version.ServerJSON),
 		Digest: in.Version.Digest, Status: status, StatusMessage: message, StatusChangedAt: orNow(in.Version.StatusChangedAt),
@@ -209,6 +212,7 @@ func (m *Memory) UpsertMirroredMCP(_ context.Context, in model.MCPMirrorInput) (
 	}
 	s.UpdatedAt = now
 	m.mcp[s.ID] = s
+	m.appendAudit(audit)
 	return model.MirrorCreated, nil
 }
 
@@ -304,9 +308,8 @@ func (m *Memory) UpdateMCPServer(_ context.Context, serverID int64, p model.MCPP
 	return m.mcpOut(s), nil
 }
 
-// jsonText is the text of a top-level server.json member as Postgres' ->>
-// yields it: the string value, the JSON text of another scalar, "" when the
-// member is missing or null.
+// jsonText is the search text of a top-level server.json member: the string
+// value, the JSON text of another value, "" when the member is missing.
 func jsonText(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
@@ -315,18 +318,25 @@ func jsonText(raw json.RawMessage) string {
 	return string(raw)
 }
 
+// MCPSearchText returns the title and description a server.json is searched
+// by. Package pgstore stores them in their own columns, so both stores match
+// the same text.
+func MCPSearchText(serverJSON json.RawMessage) (title, description string) {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(serverJSON, &doc) != nil {
+		return "", ""
+	}
+	return jsonText(doc["title"]), jsonText(doc["description"])
+}
+
 // mcpMatches reports whether the lowercase needle occurs in the server name,
 // title or description.
 func mcpMatches(name string, serverJSON json.RawMessage, needle string) bool {
 	if strings.Contains(strings.ToLower(name), needle) {
 		return true
 	}
-	var doc map[string]json.RawMessage
-	if json.Unmarshal(serverJSON, &doc) != nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(jsonText(doc["title"])), needle) ||
-		strings.Contains(strings.ToLower(jsonText(doc["description"])), needle)
+	title, description := MCPSearchText(serverJSON)
+	return strings.Contains(strings.ToLower(title), needle) || strings.Contains(strings.ToLower(description), needle)
 }
 
 // SearchMCP implements Store.

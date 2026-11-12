@@ -81,6 +81,8 @@ type Options struct {
 	UpstreamTokens map[string]string
 	// ForwardPerMinute limits forwarded misses per client (0 = unlimited).
 	ForwardPerMinute int
+	// ReadPerMinute limits reads per client (0 = unlimited).
+	ReadPerMinute int
 	// RealPublicURL makes the instance publish URLs that point at the test
 	// server instead of the fixed PublicURL, so other instances can fetch them.
 	RealPublicURL bool
@@ -129,7 +131,7 @@ func NewEnv(t *testing.T, st store.Store, o Options) *Env {
 	svc.Log = quiet
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, AdminToken), BasePath: "/registry",
 		AllowAnonRead: o.AllowAnonRead, MaxUploadBytes: 4 << 20, Log: quiet, UI: o.UI,
-		ForwardLimit: ratelimit.New(o.ForwardPerMinute)}
+		ForwardLimit: ratelimit.New(o.ForwardPerMinute), ReadLimit: ratelimit.New(o.ReadPerMinute)}
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(hs.Close)
 	if o.RealPublicURL {
@@ -219,6 +221,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("mcp servers", func(t *testing.T) { runMCP(t, NewEnv(t, newStore(t), Options{})) })
 	t.Run("upstreams", func(t *testing.T) { runUpstreams(t, newStore) })
 	t.Run("built-in pages", func(t *testing.T) { runUI(t, newStore) })
+	t.Run("hardening", func(t *testing.T) { runHardening(t, newStore) })
 }
 
 func runPublic(t *testing.T, e *Env) {

@@ -206,14 +206,26 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
 | `mcp-registry` | Any registry with the official MCP read API | MCP servers; `latest_only` keeps one version per server |
 | `agent-skills` | A site with `/.well-known/agent-skills/index.json` | Its skills, into the local `target_namespace`; each digest becomes version `sha-<12 hex>` |
 
-- **Forward on miss** (`proxy_on_miss`): a direct read of a skill or MCP
-  server that is not stored here is looked up on the upstreams, in priority
-  order, and the answer is mirrored. Listings and search only show what is
-  already here, so use a sync interval for a complete catalogue.
+- **Forward on miss** (`proxy_on_miss`): a direct read of a skill, a version
+  of a mirrored skill, or an MCP server version that is not stored here is
+  looked up on the upstreams, in priority order, and the answer is mirrored.
+  An upstream is only consulted for callers who could see what it mirrors:
+  an anonymous caller never makes the registry reach out to an upstream whose
+  entries are `internal`. Listings and search only show what is already here,
+  so use a sync interval for a complete catalogue.
 - **Sync** (`sync_interval_seconds`, or `POST …/sync`): MCP servers are synced
-  incrementally with `updated_since`; skills are listed in full and details
-  fetched only for those that changed. Status changes, yanks and deletions
-  propagate. One run per upstream is active at a time, across replicas.
+  incrementally with `updated_since` (the watermark is the newest update
+  stored, never later than the start of the run). Skills have no change feed,
+  so each run reads the detail of every listed skill. Status changes, yanks
+  of any version and deletions propagate. With `latest_only` the first run
+  takes latest versions only; later runs also apply deletions and status
+  changes to versions that are mirrored. One run per upstream is active at a
+  time, across replicas.
+- **A mirror never shows an entry more widely than its upstream does.** An
+  openlinker-registry upstream states each entry's visibility and listing:
+  `internal` entries stay `internal`, unlisted ones stay unlisted, `private`
+  ones are not mirrored, and later restrictions follow at the next sync.
+  `visibility` on the upstream is the widest a mirrored entry can be.
 - **Bytes are pulled through and verified.** Mirroring a skill records its
   metadata; the artifact is fetched from the upstream on first read, checked
   against the recorded sha256 digest and file manifest, then cached. A
@@ -229,9 +241,17 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   DNS resolution, redirects are not followed, responses are size-capped.
   Tokens are sent only to the upstream's own origin. URLs found inside an
   upstream's data are fetched under the same policy, without the token unless
-  they are on the upstream's origin.
-- **MCP documents** from upstreams are validated leniently; literal secret
-  values are removed before storing, so the stored digest is this registry's.
+  they are on the upstream's origin. A discovery entry whose URL has a query
+  string or userinfo is skipped: that is where tokens and signatures travel,
+  and the registry republishes entry URLs.
+- **Untrusted bytes.** An artifact pulled from an upstream is decoded with
+  every size checked before memory is allocated, and a tar is accepted only
+  if it is exactly the canonical tar of its files.
+- **MCP documents** from upstreams are validated leniently; credentials
+  (secret values and URL userinfo) are removed before storing, so the stored
+  digest is this registry's.
+- **Audit.** Every mirrored write is audited in the same transaction as the
+  write, like any other.
 
 ## Built-in pages
 
@@ -240,7 +260,7 @@ Private instances serve read-only pages under `/ui/`: skills, MCP servers
 English and Chinese, chosen by `Accept-Language`. No scripts and no third-party
 resources. Sign-in takes an API token and keeps it in an `HttpOnly`,
 `SameSite=Strict` cookie scoped to `/ui/`; the JSON API never reads that
-cookie. The public instance leaves pages to the site in front of it
+cookie, so downloads offered by the pages are served under `/ui/` as well. The public instance leaves pages to the site in front of it
 (`REGISTRY_UI=true` enables them when the registry has its own origin).
 
 ## Key rules
@@ -248,11 +268,14 @@ cookie. The public instance leaves pages to the site in front of it
 - **MCP servers.** Names follow the official pattern `<namespace>/<name>`; the
   namespace part (lowercased) must be a namespace of this registry, and names
   that differ only by letter case are rejected. Published documents are
-  validated against the official `server.json` rules (2025-12-11), stored in
-  canonical form, and identified by the sha256 of that form. Versions are
-  immutable; only status changes. "Latest" is the highest semantic version
-  that is not deleted, or the most recently published when versions are not
-  semantic. A document with a literal secret value is rejected.
+  validated against the official `server.json` rules (2025-12-11), stored
+  byte for byte in canonical form, and identified by the sha256 of those
+  bytes. Versions are immutable; only status changes. "Latest" is the highest
+  semantic version that is not deleted, or the most recently published when
+  versions are not semantic. A document carrying a credential is rejected: a
+  literal value on an input flagged `isSecret` or named like a credential
+  (`Authorization`, `Cookie`, names ending in `token`, `secret`, `password`,
+  `api_key`, …), or a URL with userinfo. Use a `{variable}` placeholder.
 - **Names.** Skill names are slugs (`[a-z0-9]+(-[a-z0-9]+)*`, max 64).
   Namespaces are lowercase reverse-DNS: `io.github.<login>` (bound to the
   numeric GitHub id, which must be unique), `ai.openlinker.<handle>` (public

@@ -69,11 +69,13 @@ type Store interface {
 	// UpsertMirroredMCP stores one mirrored version: it creates the
 	// upstream-managed namespace and the server when missing, inserts the
 	// version, or updates the status fields and IsLatest of an existing one.
-	// It returns MirrorCreated, MirrorUpdated or MirrorUnchanged.
+	// It returns MirrorCreated, MirrorUpdated or MirrorUnchanged; the audit
+	// event is written atomically with a created or updated version and not
+	// at all for an unchanged one.
 	// ConflictError codes: namespace_upstream_managed (the namespace is local
 	// or belongs to another upstream), server_name_conflict, digest_mismatch
 	// (the stored version has a different server.json; it is left untouched).
-	UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput) (string, error)
+	UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error)
 	// GetMCPServer looks a server up by its exact full name.
 	GetMCPServer(ctx context.Context, name string) (model.MCPServer, error)
 	// GetMCPVersion returns one version; version "latest" resolves to the
@@ -106,11 +108,13 @@ type Store interface {
 	// across processes.
 	ClaimUpstreamSync(ctx context.Context, id int64, now, staleBefore time.Time) (bool, error)
 	// FinishUpstreamSync records a sync result and returns the upstream to
-	// idle. The cursor is stored only when the result status is SyncOK.
-	FinishUpstreamSync(ctx context.Context, id int64, res model.UpstreamSyncResult) error
+	// idle, atomically with the audit event. The cursor is stored only when
+	// the result status is SyncOK.
+	FinishUpstreamSync(ctx context.Context, id int64, res model.UpstreamSyncResult, audit model.AuditEvent) error
 	// EnsureUpstreamNamespace returns the namespace managed by the upstream,
 	// creating it (kind "upstream") when missing. A namespace that is local
 	// or managed by another upstream yields ConflictError
-	// namespace_upstream_managed.
-	EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64) (model.Namespace, error)
+	// namespace_upstream_managed. The audit event is written atomically with
+	// a creation and not at all when the namespace already exists.
+	EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error)
 }

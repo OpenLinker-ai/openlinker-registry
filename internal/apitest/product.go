@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -84,6 +86,12 @@ func runMCP(t *testing.T, e *Env) {
 		if r := e.Expect(e.publishMCP(pub, "com.acme", doc), 422, code); errCode(r) != code {
 			t.Fatalf("want %s, got %s", code, r.Body)
 		}
+	}
+	// A credential is refused whether or not it is flagged as a secret.
+	unflagged := map[string]any{"name": name, "description": "d", "version": "2.0.0", "remotes": []map[string]any{{"type": "sse",
+		"url": "https://x.example/sse", "headers": []map[string]any{{"name": "Authorization", "value": "Bearer hunter2"}}}}}
+	if r := e.Expect(e.publishMCP(pub, "com.acme", unflagged), 422, "unflagged credential"); errCode(r) != "secret_value" || strings.Contains(string(r.Body), "hunter2") {
+		t.Fatalf("unflagged credential: %s", r.Body)
 	}
 	if r := e.Expect(e.publishMCP(pub, "com.acme", serverJSON(name, "1.0.0", "https://changed.example/mcp")), 409, "republish"); errCode(r) != "version_exists" {
 		t.Fatalf("got %s", r.Body)
@@ -255,6 +263,15 @@ func runMCP(t *testing.T, e *Env) {
 	if v0Version(r.JSON) != "1.0.0" || official(r.JSON)["isLatest"] != true {
 		t.Fatalf("publish response: %s", r.Body)
 	}
+	// A server may be called "servers" or "versions"; both path forms still
+	// address it.
+	for _, odd := range []string{"servers", "versions"} {
+		e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/"+odd, "1.0.0", "https://odd.example/"+odd)), 201, "publish "+odd)
+		for _, path := range []string{"/v0.1/servers/com.acme%2F" + odd + "/versions/1.0.0", "/v0.1/servers/com.acme/" + odd + "/versions/1.0.0",
+			"/v0.1/servers/com.acme%2F" + odd + "/versions", "/v0.1/servers/com.acme/" + odd + "/versions"} {
+			e.Expect(e.Do("GET", path, "", "", nil), 200, path)
+		}
+	}
 	e.Expect(e.Do("POST", "/v0.1/publish", secret, "application/json", serverJSON("com.acme/stolen", "1.0.0", "https://p.example/mcp")), 403, "publish into a foreign namespace")
 	e.Expect(e.Do("POST", "/v0.1/publish", "", "application/json", serverJSON("com.acme/anon", "1.0.0", "https://p.example/mcp")), 401, "anonymous official publish")
 
@@ -386,11 +403,18 @@ func runUpstreams(t *testing.T, newStore func(t *testing.T) store.Store) {
 
 	// --- sync ---
 	up.Expect(up.Do("POST", "/v1/skills/com.acme/hello/versions?version=1.1.0", pub, "text/markdown", md("hello", "Says hello again", "MIT")), 201, "new upstream version")
+	// A version published upstream after the skill was mirrored is fetched
+	// when it is asked for; it does not have to wait for a sync.
+	down.Expect(down.Do("GET", "/v1/skills/com.acme/hello/versions/1.1.0", reader, "", nil), 200, "forwarded new version")
+	down.Expect(down.Do("GET", "/v1/skills/com.acme/hello/versions/9.9.9", reader, "", nil), 404, "version missing everywhere")
+	if r = down.Do("GET", "/v1/skills/com.acme/hello", reader, "", nil); r.JSON["latest_version"] != "1.1.0" {
+		t.Fatalf("latest after version forward: %s", r.Body)
+	}
 	up.Expect(up.Do("POST", "/v1/skills/com.acme/later/versions?version=0.1.0", pub, "text/markdown", md("later", "Published later", "MIT")), 201, "new upstream skill")
 	up.Expect(up.publishMCP(pub, "com.acme", serverJSON("com.acme/weather", "1.1.0", "https://mcp.acme.example/mcp")), 201, "new upstream mcp version")
 	up.Expect(up.publishMCP(pub, "com.acme", serverJSON("com.acme/maps", "0.5.0", "https://maps.acme.example/sse")), 201, "new upstream mcp")
 	s1 := down.sync("hub")
-	if s1["last_status"] != "ok" || stat(s1, "skills_created") != 2 || stat(s1, "mcp_created") != 2 || stat(s1, "skills_conflicts") != 1 {
+	if s1["last_status"] != "ok" || stat(s1, "skills_created") != 1 || stat(s1, "mcp_created") != 2 || stat(s1, "skills_conflicts") != 1 {
 		t.Fatalf("first sync: %v", s1)
 	}
 	r = down.Expect(down.Do("GET", "/v1/skills?namespace=com.acme", reader, "", nil), 200, "mirrored list")
@@ -412,6 +436,9 @@ func runUpstreams(t *testing.T, newStore func(t *testing.T) store.Store) {
 	// Status changes upstream propagate.
 	up.Expect(up.Do("POST", "/v1/skills/com.acme/later/yank", pub, "", map[string]any{"reason": "withdrawn"}), 200, "upstream yank")
 	up.Expect(up.Do("POST", "/v1/mcp/servers/com.acme/maps/status", pub, "", map[string]any{"status": "deleted"}), 200, "upstream mcp delete")
+	// Yanking an old version changes neither the latest version nor the
+	// status of the skill upstream; it must still arrive.
+	up.Expect(up.Do("POST", "/v1/skills/com.acme/hello/versions/1.0.0/yank", pub, "", map[string]any{"reason": "broken"}), 200, "upstream yank of an old version")
 	s3 := down.sync("hub")
 	if s3["last_status"] != "ok" {
 		t.Fatalf("third sync: %v", s3)
@@ -420,6 +447,8 @@ func runUpstreams(t *testing.T, newStore func(t *testing.T) store.Store) {
 		t.Fatalf("yank must propagate: %s", r.Body)
 	}
 	down.Expect(down.Do("GET", "/v1/skills/com.acme/later/versions/0.1.0/artifact", reader, "", nil), 410, "yanked mirror content")
+	down.Expect(down.Do("GET", "/v1/skills/com.acme/hello/versions/1.0.0/artifact", reader, "", nil), 410, "yanked old version")
+	down.Expect(down.Do("GET", "/v1/skills/com.acme/hello/versions/1.1.0/artifact", reader, "", nil), 200, "latest version unaffected")
 	down.Expect(down.Do("GET", "/v0.1/servers/"+url.PathEscape("com.acme/maps")+"/versions/0.5.0", reader, "", nil), 200, "deleted version still addressable")
 	if got := servers(down.Do("GET", "/v0.1/servers?version=latest", reader, "", nil)); len(got) != 1 {
 		t.Fatalf("an upstream deletion must hide the server: %d", len(got))
@@ -671,6 +700,14 @@ func runUI(t *testing.T, newStore func(t *testing.T) store.Store) {
 	if strings.Contains(string(r.Body), "<script>") || !strings.Contains(string(r.Body), "SKILL.md") {
 		t.Fatal("skill page must show escaped content")
 	}
+	// Downloads work with the page session: the links stay under /ui/.
+	if !strings.Contains(string(r.Body), `href="/registry/ui/skills/internal.team/xss/versions/1/artifact"`) {
+		t.Fatalf("download link must point at the page copy of the route: %s", r.Body)
+	}
+	if dl := e.Expect(page("/ui/skills/internal.team/xss/versions/1/artifact"), 200, "download with the session"); !strings.Contains(string(dl.Body), "name: xss") {
+		t.Fatalf("download: %s", dl.Body)
+	}
+	e.Expect(e.Do("GET", "/ui/skills/internal.team/xss/versions/1/artifact", "", "", nil), 303, "download without a session")
 	e.Expect(page("/ui/skills/internal.team/nope"), 404, "missing skill page")
 	e.Expect(page("/ui/mcp"), 200, "mcp list page")
 	r = e.Expect(page("/ui/mcp/internal.team/tools"), 200, "mcp page")
@@ -678,6 +715,19 @@ func runUI(t *testing.T, newStore func(t *testing.T) store.Store) {
 		t.Fatalf("mcp page: %s", r.Body)
 	}
 	e.Expect(page("/ui/upstreams"), 403, "upstreams page needs admin")
+	// More entries than one page: the "next" link carries a usable cursor.
+	for i := range 35 {
+		e.Expect(e.publishMCP(pub, "internal.team", serverJSON(fmt.Sprintf("internal.team/bulk-%02d", i), "1.0.0", "http://bulk.internal.example/mcp")), 201, "bulk publish")
+	}
+	r = e.Expect(page("/ui/mcp"), 200, "first mcp page")
+	next := regexp.MustCompile(`href="(/registry/ui/mcp\?cursor=[A-Za-z0-9_-]+)"`).FindStringSubmatch(string(r.Body))
+	if next == nil || strings.Contains(string(r.Body), "internal.team/tools") {
+		t.Fatalf("first page must link to the next one: %s", r.Body)
+	}
+	if r = e.Expect(page(strings.TrimPrefix(next[1], "/registry")), 200, "second mcp page"); !strings.Contains(string(r.Body), "internal.team/tools") ||
+		strings.Contains(string(r.Body), "bulk-00") {
+		t.Fatalf("second page: %s", r.Body)
+	}
 
 	// The session cookie works for pages only: the JSON API ignores it, so a
 	// cross-site request cannot ride on it.

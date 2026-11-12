@@ -188,7 +188,7 @@ func (s *Service) CreateUpstream(ctx context.Context, actor string, in UpstreamI
 	}
 	s.resetForwarding()
 	if out.TargetNamespace != "" {
-		if _, err := s.Store.EnsureUpstreamNamespace(ctx, out.TargetNamespace, out.ID); err != nil {
+		if _, err := s.Store.EnsureUpstreamNamespace(ctx, out.TargetNamespace, out.ID, namespaceAudit(out, out.TargetNamespace)); err != nil {
 			_ = s.Store.DeleteUpstream(ctx, out.Name, auditEvent(actor, "upstream.delete", "", out.Name,
 				map[string]any{"reason": "target namespace unavailable"}))
 			return model.Upstream{}, err
@@ -331,10 +331,14 @@ func errUpstreamUnavailable() error {
 }
 
 // forwardTargets returns the upstreams a miss in namespace ns may be
-// forwarded to, in priority order. A namespace that exists locally is never
-// forwarded: local ownership wins, and a namespace mirrored from one upstream
-// is only ever completed from that upstream.
-func (s *Service) forwardTargets(ctx context.Context, ns string, kinds ...string) ([]model.Upstream, error) {
+// forwarded to for this caller, in priority order.
+//
+// A namespace that exists locally is never forwarded: local ownership wins,
+// and a namespace mirrored from one upstream is only ever completed from
+// that upstream. An upstream is only consulted for callers who could see
+// what it mirrors, so nobody can make this instance fetch (with its
+// credentials) or store entries that would then be hidden from them.
+func (s *Service) forwardTargets(ctx context.Context, viewer model.Viewer, ns string, kinds ...string) ([]model.Upstream, error) {
 	var owner int64 = -1
 	if n, err := s.Store.GetNamespace(ctx, ns); err == nil {
 		if n.UpstreamID == 0 {
@@ -350,25 +354,48 @@ func (s *Service) forwardTargets(ctx context.Context, ns string, kinds ...string
 	}
 	var out []model.Upstream
 	for _, u := range all {
-		if u.Enabled && u.ProxyOnMiss && slices.Contains(kinds, u.Kind) && u.Allows(ns) && (owner == -1 || owner == u.ID) {
+		if u.Enabled && u.ProxyOnMiss && slices.Contains(kinds, u.Kind) && u.Allows(ns) &&
+			(owner == -1 || owner == u.ID) && viewer.CanSee(ns, u.Visibility) {
 			out = append(out, u)
 		}
 	}
 	return out, nil
 }
 
+// CanForwardSkill reports whether a miss on a skill in ns could be forwarded
+// for this caller. The API asks before it charges the caller's forwarding
+// budget, so a caller who cannot be served by any upstream gets the same
+// answer for a hidden entry as for a missing one.
+func (s *Service) CanForwardSkill(ctx context.Context, viewer model.Viewer, ns string) bool {
+	if !skill.ValidNamespaceName(ns) || !s.Forwarding(ctx) {
+		return false
+	}
+	targets, err := s.forwardTargets(ctx, viewer, ns, model.UpstreamRegistry)
+	return err == nil && len(targets) > 0
+}
+
+// CanForwardMCP is CanForwardSkill for an MCP server name.
+func (s *Service) CanForwardMCP(ctx context.Context, viewer model.Viewer, name string) bool {
+	ns, _, ok := mcp.SplitName(name)
+	if !ok || !s.Forwarding(ctx) {
+		return false
+	}
+	targets, err := s.forwardTargets(ctx, viewer, ns, model.UpstreamMCP, model.UpstreamRegistry)
+	return err == nil && len(targets) > 0
+}
+
 // forwardMCP looks name@version up on the upstreams and mirrors the first
 // answer. It returns nil when the version is now stored locally.
-func (s *Service) forwardMCP(ctx context.Context, name, version string) error {
+func (s *Service) forwardMCP(ctx context.Context, viewer model.Viewer, name, version string) error {
 	ns, _, ok := mcp.SplitName(name)
-	if !ok || !skill.ValidNamespaceName(ns) {
+	if !ok {
 		return model.ErrNotFound
 	}
 	key := "mcp\x00" + name + "\x00" + version
 	if s.misses.recent(key, s.Now()) {
 		return model.ErrNotFound
 	}
-	targets, err := s.forwardTargets(ctx, ns, model.UpstreamMCP, model.UpstreamRegistry)
+	targets, err := s.forwardTargets(ctx, viewer, ns, model.UpstreamMCP, model.UpstreamRegistry)
 	if err != nil {
 		return err
 	}
@@ -386,7 +413,7 @@ func (s *Service) forwardMCP(ctx context.Context, name, version string) error {
 		if doc.Name != name {
 			continue
 		}
-		if _, err := s.mirrorMCP(ctx, u, doc); err != nil {
+		if _, err := s.mirrorMCP(ctx, u, doc, false); err != nil {
 			if isStoreFailure(err) {
 				return err
 			}
@@ -430,9 +457,14 @@ func clip(s string, max int) string {
 }
 
 // mirrorMCP stores one upstream MCP document as a mirrored version. The
-// document is validated leniently and secret literals are redacted; the
-// stored bytes are the canonical form, so the digest is this registry's own.
-func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.MCPDoc) (string, error) {
+// document is validated leniently and credentials are redacted; the stored
+// bytes are the canonical form, so the digest is this registry's own.
+//
+// An openlinker-registry upstream states how widely it shows each entry, and
+// the mirror never shows it more widely (see mirrorVisibility). With
+// onlyExisting the document is applied only to a version that is already
+// mirrored; the outcome is then "ignored" for anything else.
+func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.MCPDoc, onlyExisting bool) (string, error) {
 	p, err := mcp.Parse(doc.Server, mcp.Options{})
 	if err != nil {
 		return "", err
@@ -443,6 +475,33 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 	if !u.Allows(p.Namespace) {
 		return "", fail(http.StatusForbidden, "namespace_not_allowed", "namespace is not allowed for this upstream")
 	}
+	actor := "upstream:" + u.Name
+	visibility, listed, stated := u.Visibility, true, false
+	// The official registry states no visibility (everything it serves is
+	// public). An openlinker-registry always does, whichever kind it was
+	// configured as, and one that does not is not trusted to be public.
+	if u.Kind == model.UpstreamRegistry || doc.Visibility != "" {
+		var ok bool
+		if visibility, ok = mirrorVisibility(u, doc.Visibility); !ok {
+			if err := s.restrictMCP(ctx, u, p.Name); err != nil {
+				return "", err
+			}
+			return "", fail(http.StatusForbidden, "upstream_private", "the upstream does not share this entry")
+		}
+		listed, stated = !doc.Unlisted, true
+	}
+	if onlyExisting {
+		srv, err := s.Store.GetMCPServer(ctx, p.Name)
+		if err == nil {
+			_, err = s.Store.GetMCPVersion(ctx, srv.ID, p.Version)
+		}
+		if errors.Is(err, model.ErrNotFound) {
+			return "ignored", nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
 	status, msg := doc.Status, clip(doc.StatusMessage, model.MaxMCPStatusMessage)
 	if !model.ValidMCPStatus(status) {
 		status = model.MCPStatusActive
@@ -450,26 +509,97 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 	if status == model.MCPStatusActive {
 		msg = ""
 	}
-	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: p.Namespace, Name: p.Name,
-		Visibility: u.Visibility, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
+	outcome, err := s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, Namespace: p.Namespace, Name: p.Name,
+		Visibility: visibility, Listed: listed, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
 			Status: status, StatusMessage: msg, StatusChangedAt: doc.StatusChangedAt, PublishedAt: doc.PublishedAt,
-			IsLatest: doc.IsLatest && status != model.MCPStatusDeleted, CreatedBy: "upstream:" + u.Name}})
+			IsLatest: doc.IsLatest && status != model.MCPStatusDeleted, CreatedBy: actor}},
+		auditEvent(actor, "mcp.mirror", p.Namespace, p.Name+"@"+p.Version, map[string]any{"digest": p.Digest, "status": status, "upstream": u.Name}))
+	if err != nil || !stated || outcome == model.MirrorCreated {
+		return outcome, err
+	}
+	// Visibility and listing are set when the server is created; follow later
+	// changes upstream.
+	srv, err := s.Store.GetMCPServer(ctx, p.Name)
+	if err != nil {
+		return "", err
+	}
+	if srv.Visibility != visibility || srv.Listed != listed {
+		if _, err := s.Store.UpdateMCPServer(ctx, srv.ID, model.MCPPatch{Visibility: &visibility, Listed: &listed},
+			auditEvent(actor, "mcp.update", srv.Namespace, srv.Name, map[string]any{"visibility": visibility, "listed": listed})); err != nil {
+			return "", err
+		}
+		if outcome == model.MirrorUnchanged {
+			outcome = model.MirrorUpdated
+		}
+	}
+	return outcome, nil
+}
+
+// restrictMCP withdraws a mirrored server the upstream stopped sharing: it
+// leaves listings and anonymous reach and its versions are marked deleted.
+func (s *Service) restrictMCP(ctx context.Context, u model.Upstream, name string) error {
+	srv, err := s.Store.GetMCPServer(ctx, name)
+	if errors.Is(err, model.ErrNotFound) || (err == nil && srv.Upstream != u.Name) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	actor := "upstream:" + u.Name
+	const reason = "no longer shared by the upstream registry"
+	if srv.Listed || srv.Visibility == model.VisibilityPublic {
+		internal, unlisted := model.VisibilityInternal, false
+		if _, err := s.Store.UpdateMCPServer(ctx, srv.ID, model.MCPPatch{Visibility: &internal, Listed: &unlisted},
+			auditEvent(actor, "mcp.update", srv.Namespace, srv.Name, map[string]any{"visibility": internal, "listed": false, "reason": reason})); err != nil {
+			return err
+		}
+	}
+	_, err = s.Store.SetMCPStatus(ctx, srv.ID, "", model.MCPStatusDeleted, reason, s.Now(),
+		auditEvent(actor, "mcp.status", srv.Namespace, srv.Name, map[string]any{"status": model.MCPStatusDeleted, "message": reason}))
+	return err
 }
 
 // ResolveSkill returns a skill, forwarding a local miss to the upstream
-// registries that allow it. Visibility is the caller's concern.
-func (s *Service) ResolveSkill(ctx context.Context, ns, name string, forward bool) (model.Skill, error) {
+// registries that serve this caller. Visibility of the result is the caller's
+// concern.
+func (s *Service) ResolveSkill(ctx context.Context, viewer model.Viewer, ns, name string, forward bool) (model.Skill, error) {
 	sk, err := s.Store.GetSkill(ctx, ns, name)
 	if err == nil || !errors.Is(err, model.ErrNotFound) || !forward {
 		return sk, err
 	}
-	if err := s.forwardSkill(ctx, ns, name); err != nil {
+	if err := s.forwardSkill(ctx, viewer, ns, name); err != nil {
 		return model.Skill{}, err
 	}
 	return s.Store.GetSkill(ctx, ns, name)
 }
 
-func (s *Service) forwardSkill(ctx context.Context, ns, name string) error {
+// RefreshMirroredSkill re-reads a mirrored skill from its own upstream, for
+// a caller asking for a version that is not here yet: the upstream may have
+// published it since the last sync. It reports whether a refresh ran.
+func (s *Service) RefreshMirroredSkill(ctx context.Context, viewer model.Viewer, sk model.Skill, version string) (bool, error) {
+	if sk.Upstream == "" || !skill.ValidVersion(version) {
+		return false, nil
+	}
+	key := "skillversion\x00" + sk.Namespace + "\x00" + sk.Name + "\x00" + version
+	if s.misses.recent(key, s.Now()) {
+		return false, nil
+	}
+	u, err := s.Store.GetUpstream(ctx, sk.Upstream)
+	if err != nil || !u.Enabled || !u.ProxyOnMiss || u.Kind != model.UpstreamRegistry || !viewer.CanSee(sk.Namespace, u.Visibility) {
+		return false, nil
+	}
+	if err := s.refreshSkill(ctx, u, s.client(u), sk.Namespace, sk.Name, syncStats{}); err != nil {
+		if isStoreFailure(err) && !isUpstreamError(err) {
+			return false, err
+		}
+		s.Log.Warn("upstream read failed", "upstream", u.Name, "kind", "skill", "err", err.Error())
+		return false, errUpstreamUnavailable()
+	}
+	s.misses.add(key, s.Now())
+	return true, nil
+}
+
+func (s *Service) forwardSkill(ctx context.Context, viewer model.Viewer, ns, name string) error {
 	if !skill.ValidNamespaceName(ns) || !skill.ValidSkillName(name) {
 		return model.ErrNotFound
 	}
@@ -477,28 +607,18 @@ func (s *Service) forwardSkill(ctx context.Context, ns, name string) error {
 	if s.misses.recent(key, s.Now()) {
 		return model.ErrNotFound
 	}
-	targets, err := s.forwardTargets(ctx, ns, model.UpstreamRegistry)
+	targets, err := s.forwardTargets(ctx, viewer, ns, model.UpstreamRegistry)
 	if err != nil {
 		return err
 	}
 	unavailable := false
 	for _, u := range targets {
-		c := s.client(u)
-		detail, err := c.GetSkill(ctx, ns, name)
-		if errors.Is(err, upstream.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			unavailable = true
-			s.Log.Warn("upstream read failed", "upstream", u.Name, "kind", "skill", "err", err.Error())
-			continue
-		}
-		stats := syncStats{}
-		if err := s.mirrorSkill(ctx, u, c, detail, stats); err != nil {
-			if isStoreFailure(err) {
+		if err := s.refreshSkill(ctx, u, s.client(u), ns, name, syncStats{}); err != nil {
+			if isStoreFailure(err) && !isUpstreamError(err) {
 				return err
 			}
-			s.Log.Warn("upstream entry not mirrored", "upstream", u.Name, "skill", ns+"/"+name, "err", err.Error())
+			unavailable = true
+			s.Log.Warn("upstream read failed", "upstream", u.Name, "kind", "skill", "err", err.Error())
 			continue
 		}
 		if _, err := s.Store.GetSkill(ctx, ns, name); err == nil {

@@ -150,7 +150,7 @@ func (s *Store) ClaimUpstreamSync(ctx context.Context, id int64, now, staleBefor
 }
 
 // FinishUpstreamSync implements store.Store.
-func (s *Store) FinishUpstreamSync(ctx context.Context, id int64, res model.UpstreamSyncResult) error {
+func (s *Store) FinishUpstreamSync(ctx context.Context, id int64, res model.UpstreamSyncResult, audit model.AuditEvent) error {
 	stats := res.Stats
 	if stats == nil {
 		stats = map[string]int{}
@@ -159,16 +159,19 @@ func (s *Store) FinishUpstreamSync(ctx context.Context, id int64, res model.Upst
 	if err != nil {
 		return err
 	}
-	return rowsOrNotFound(s.pool.Exec(ctx, `UPDATE upstreams SET sync_state = 'idle', sync_started_at = NULL, last_sync_at = $2,
-		last_sync_status = $3, last_sync_error = $4, last_sync_stats = $5,
-		cursor = CASE WHEN $3 = 'ok' THEN $6 ELSE cursor END WHERE id = $1`,
-		id, res.At, res.Status, store.SyncError(res.Error), b, res.Cursor))
+	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		return rowsOrNotFound(tx.Exec(ctx, `UPDATE upstreams SET sync_state = 'idle', sync_started_at = NULL, last_sync_at = $2,
+			last_sync_status = $3, last_sync_error = $4, last_sync_stats = $5,
+			cursor = CASE WHEN $3 = 'ok' THEN $6 ELSE cursor END WHERE id = $1`,
+			id, res.At, res.Status, store.SyncError(res.Error), b, res.Cursor))
+	})
 }
 
 // ensureUpstreamNS returns the namespace the upstream writes into, creating
 // it when missing. Concurrent creators both succeed: the loser of the insert
 // re-reads the winner's row.
-func ensureUpstreamNS(ctx context.Context, tx pgx.Tx, name string, upstreamID int64) (model.Namespace, error) {
+// The audit event is written only when this call creates the namespace.
+func ensureUpstreamNS(ctx context.Context, tx pgx.Tx, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error) {
 	if !skill.ValidNamespaceName(name) {
 		return model.Namespace{}, store.ErrNamespaceSyntax()
 	}
@@ -191,13 +194,18 @@ func ensureUpstreamNS(ctx context.Context, tx pgx.Tx, name string, upstreamID in
 	if found {
 		return model.Namespace{}, model.ErrNamespaceManaged()
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO namespaces (name, kind, upstream_id) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING`,
+	tag, err := tx.Exec(ctx, `INSERT INTO namespaces (name, kind, upstream_id) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING`,
 		name, model.NSKindUpstream, upstreamID)
 	if foreignKeyViolation(err) {
 		return model.Namespace{}, model.ErrNotFound // the upstream was deleted meanwhile
 	}
 	if err != nil {
 		return model.Namespace{}, err
+	}
+	if tag.RowsAffected() == 1 {
+		if err := insertAudit(ctx, tx, audit); err != nil {
+			return model.Namespace{}, err
+		}
 	}
 	if ns, err = scanNamespace(tx.QueryRow(ctx, sel, name)); err != nil {
 		return model.Namespace{}, err
@@ -209,11 +217,11 @@ func ensureUpstreamNS(ctx context.Context, tx pgx.Tx, name string, upstreamID in
 }
 
 // EnsureUpstreamNamespace implements store.Store.
-func (s *Store) EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64) (model.Namespace, error) {
+func (s *Store) EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error) {
 	var ns model.Namespace
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
-		ns, err = ensureUpstreamNS(ctx, tx, name, upstreamID)
+		ns, err = ensureUpstreamNS(ctx, tx, name, upstreamID, audit)
 		return err
 	})
 	return ns, err

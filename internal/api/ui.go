@@ -67,6 +67,10 @@ func (s *Server) uiRoutes(m *http.ServeMux) {
 	m.HandleFunc("GET /ui/{$}", s.uiGate(s.uiSkills))
 	m.HandleFunc("GET /ui/skills/{ns}/{name}", s.uiGate(s.uiSkill))
 	m.HandleFunc("GET /ui/skills/{ns}/{name}/versions/{version}", s.uiGate(s.uiSkill))
+	// Downloads for signed-in visitors: the API routes do not read the
+	// session cookie, so the pages link to these copies of them.
+	m.HandleFunc("GET /ui/skills/{ns}/{name}/versions/{version}/artifact", s.uiGate(s.getArtifact))
+	m.HandleFunc("GET /ui/skills/{ns}/{name}/versions/{version}/archive.tar.gz", s.uiGate(s.getArchive))
 	m.HandleFunc("GET /ui/mcp", s.uiGate(s.uiMCPList))
 	m.HandleFunc("GET /ui/mcp/{ns}/{name}", s.uiGate(s.uiMCPServer))
 	m.HandleFunc("GET /ui/mcp/{ns}/{name}/versions/{version}", s.uiGate(s.uiMCPServer))
@@ -255,7 +259,9 @@ func (s *Server) uiSkills(w http.ResponseWriter, r *http.Request) {
 		if q.Mode != "" {
 			next.Set("mode", q.Mode)
 		}
-		data.Next = next.Encode()
+		// A complete URL: the template escapes a value placed after "?" as
+		// one query component, which would swallow the "=" and "&".
+		data.Next = s.BasePath + "/ui/?" + next.Encode()
 	}
 	for _, row := range rows {
 		data.Rows = append(data.Rows, uiSkillRow{row})
@@ -309,9 +315,11 @@ func (s *Server) uiSkill(w http.ResponseWriter, r *http.Request) {
 	v := d.Version
 	d.Access, d.SourceURL = registry.Access(v), s.Svc.SourceURL(v)
 	if d.Access.Artifact && v.YankedAt == nil && sk.Status != model.StatusYanked {
-		d.ArtifactURL = s.Svc.VersionURL(sk.Namespace, sk.Name, v.Version, "artifact")
+		base := s.BasePath + "/ui/skills/" + url.PathEscape(sk.Namespace) + "/" + url.PathEscape(sk.Name) +
+			"/versions/" + url.PathEscape(v.Version)
+		d.ArtifactURL = base + "/artifact"
 		if v.ArchiveDigest != "" {
-			d.ArchiveURL = s.Svc.VersionURL(sk.Namespace, sk.Name, v.Version, "archive.tar.gz")
+			d.ArchiveURL = base + "/archive.tar.gz"
 		}
 	}
 	if d.Access.FullText {
@@ -409,7 +417,7 @@ func (s *Server) uiMCPList(w http.ResponseWriter, r *http.Request) {
 		if q.Search != "" {
 			next.Set("q", q.Search)
 		}
-		data.Next = next.Encode()
+		data.Next = s.BasePath + "/ui/mcp?" + next.Encode()
 	}
 	for _, e := range rows {
 		var doc mcpDoc

@@ -130,12 +130,13 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 				return err
 			}
 		}
+		title, description := store.MCPSearchText(in.Version.ServerJSON)
 		ver, err = scanMCPVersion(tx.QueryRow(ctx, `INSERT INTO mcp_server_versions AS v (server_id, version, server_json, digest,
-			status_changed_at, published_at, updated_at, is_latest, created_by)
-			VALUES ($1, $2, $3, $4, COALESCE($5, now()), COALESCE($5, now()), COALESCE($5, now()), $6, $7)
+			status_changed_at, published_at, updated_at, is_latest, created_by, title, description)
+			VALUES ($1, $2, $3, $4, COALESCE($5, now()), COALESCE($5, now()), COALESCE($5, now()), $6, $7, $8, $9)
 			RETURNING `+mcpVersionCols,
-			srv.ID, in.Version.Version, []byte(in.Version.ServerJSON), in.Version.Digest, timeOrNil(in.Version.PublishedAt),
-			latest, in.Version.CreatedBy))
+			srv.ID, in.Version.Version, string(in.Version.ServerJSON), in.Version.Digest, timeOrNil(in.Version.PublishedAt),
+			latest, in.Version.CreatedBy, title, description))
 		if c, ok := uniqueViolation(err); ok && c != "mcp_server_versions_latest_key" {
 			return conflict("version_exists", "version already exists and is immutable")
 		}
@@ -151,7 +152,7 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 }
 
 // UpsertMirroredMCP implements store.Store.
-func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput) (string, error) {
+func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error) {
 	v := in.Version
 	status, message := v.Status, v.StatusMessage
 	if status == model.MCPStatusActive {
@@ -160,12 +161,13 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput) 
 	latest := v.IsLatest && status != model.MCPStatusDeleted
 	outcome := model.MirrorUnchanged
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		ns, err := ensureUpstreamNS(ctx, tx, in.Namespace, in.UpstreamID)
+		ns, err := ensureUpstreamNS(ctx, tx, in.Namespace, in.UpstreamID, model.AuditEvent{Actor: audit.Actor,
+			Action: "namespace.mirror", Namespace: in.Namespace, Details: map[string]any{"upstream_id": in.UpstreamID}})
 		if err != nil {
 			return err
 		}
 		srv, srvNS, err := lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: model.MCPModeMirrored,
-			Visibility: in.Visibility, Listed: true, CreatedBy: v.CreatedBy}, ns.ID)
+			Visibility: in.Visibility, Listed: in.Listed, CreatedBy: v.CreatedBy}, ns.ID)
 		if err != nil {
 			return err
 		}
@@ -196,18 +198,24 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput) 
 			_, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET status = $2, status_message = $3, is_latest = $4,
 				status_changed_at = COALESCE($5, now()), updated_at = COALESCE($6, now()) WHERE id = $1`,
 				cur.ID, status, message, latest, timeOrNil(v.StatusChangedAt), timeOrNil(v.UpdatedAt))
-			return err
+			if err != nil {
+				return err
+			}
+			return insertAudit(ctx, tx, audit)
 		}
 		outcome = model.MirrorCreated
+		title, description := store.MCPSearchText(v.ServerJSON)
 		if _, err := tx.Exec(ctx, `INSERT INTO mcp_server_versions (server_id, version, server_json, digest, status,
-			status_message, status_changed_at, published_at, updated_at, is_latest, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, now()), COALESCE($9, now()), $10, $11)`,
-			srv.ID, v.Version, []byte(v.ServerJSON), v.Digest, status, message, timeOrNil(v.StatusChangedAt),
-			timeOrNil(v.PublishedAt), timeOrNil(v.UpdatedAt), latest, v.CreatedBy); err != nil {
+			status_message, status_changed_at, published_at, updated_at, is_latest, created_by, title, description)
+			VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, now()), COALESCE($9, now()), $10, $11, $12, $13)`,
+			srv.ID, v.Version, string(v.ServerJSON), v.Digest, status, message, timeOrNil(v.StatusChangedAt),
+			timeOrNil(v.PublishedAt), timeOrNil(v.UpdatedAt), latest, v.CreatedBy, title, description); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE mcp_servers SET updated_at = now() WHERE id = $1`, srv.ID)
-		return err
+		if _, err = tx.Exec(ctx, `UPDATE mcp_servers SET updated_at = now() WHERE id = $1`, srv.ID); err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, audit)
 	})
 	if err != nil {
 		return "", err
@@ -335,8 +343,7 @@ func (s *Store) SearchMCP(ctx context.Context, q model.MCPQuery) ([]model.MCPEnt
 	}
 	if q.Search != "" {
 		p := arg("%" + likeEscape(strings.ToLower(q.Search)) + "%")
-		where = append(where, "(lower(m.name) LIKE "+p+" OR lower(v.server_json->>'title') LIKE "+p+
-			" OR lower(v.server_json->>'description') LIKE "+p+")")
+		where = append(where, "(lower(m.name) LIKE "+p+" OR lower(v.title) LIKE "+p+" OR lower(v.description) LIKE "+p+")")
 	}
 	if q.Namespace != "" {
 		where = append(where, "n.name = "+arg(q.Namespace))

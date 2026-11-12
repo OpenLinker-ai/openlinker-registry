@@ -124,7 +124,7 @@ var upstreamTests = []testCase{
 		}
 
 		// An upstream that manages a namespace cannot be deleted.
-		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", u.ID); err != nil {
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.mirror", u.ID, audit); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.DeleteUpstream(ctx, "official", audit); conflictCode(err) != "upstream_in_use" {
@@ -142,7 +142,7 @@ var upstreamTests = []testCase{
 		if _, err := st.GetUpstream(ctx, "a-b"); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("deleted upstream: %v", err)
 		}
-		if _, err := st.EnsureUpstreamNamespace(ctx, "org.late", skills.ID); !errors.Is(err, model.ErrNotFound) {
+		if _, err := st.EnsureUpstreamNamespace(ctx, "org.late", skills.ID, audit); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("namespace for a deleted upstream: %v", err)
 		}
 		if all, err := st.ListUpstreams(ctx); err != nil || len(all) != 4 {
@@ -158,7 +158,7 @@ var upstreamTests = []testCase{
 		if _, err := st.ClaimUpstreamSync(ctx, 1<<40, t0, t0.Add(-stale)); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("claim a missing upstream: %v", err)
 		}
-		if err := st.FinishUpstreamSync(ctx, 1<<40, model.UpstreamSyncResult{At: t0, Status: model.SyncOK}); !errors.Is(err, model.ErrNotFound) {
+		if err := st.FinishUpstreamSync(ctx, 1<<40, model.UpstreamSyncResult{At: t0, Status: model.SyncOK}, audit); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("finish a missing upstream: %v", err)
 		}
 
@@ -206,7 +206,7 @@ var upstreamTests = []testCase{
 		// A good result stores the cursor.
 		stats := map[string]int{"created": 3, "updated": 0, "failed": 1}
 		if err := st.FinishUpstreamSync(ctx, u.ID, model.UpstreamSyncResult{At: t1.Add(time.Minute), Status: model.SyncOK,
-			Cursor: "c1", Stats: stats}); err != nil {
+			Cursor: "c1", Stats: stats}, audit); err != nil {
 			t.Fatal(err)
 		}
 		stats["created"] = 99 // the caller's map is not the stored one
@@ -224,7 +224,7 @@ var upstreamTests = []testCase{
 		}
 		long := "x" + strings.Repeat("世", 400) // 1201 bytes; byte 1000 is inside a rune
 		if err := st.FinishUpstreamSync(ctx, u.ID, model.UpstreamSyncResult{At: t1.Add(2 * time.Hour), Status: model.SyncFailed,
-			Error: long, Cursor: "must-not-be-stored"}); err != nil {
+			Error: long, Cursor: "must-not-be-stored"}, audit); err != nil {
 			t.Fatal(err)
 		}
 		got = getUpstream(t, st, "up")
@@ -237,7 +237,7 @@ var upstreamTests = []testCase{
 		}
 		// Bytes Postgres text cannot hold do not lose the result.
 		if err := st.FinishUpstreamSync(ctx, u.ID, model.UpstreamSyncResult{At: t1.Add(3 * time.Hour), Status: model.SyncFailed,
-			Error: "bad \xff byte and \x00 nul"}); err != nil {
+			Error: "bad \xff byte and \x00 nul"}, audit); err != nil {
 			t.Fatal(err)
 		}
 		if got := getUpstream(t, st, "up"); got.LastSyncError != "bad � byte and  nul" {

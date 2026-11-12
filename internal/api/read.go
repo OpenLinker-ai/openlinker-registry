@@ -19,35 +19,62 @@ var errNotFound = &registry.Error{Status: http.StatusNotFound, Code: "not_found"
 
 // loadVisible returns the skill only if the caller may see it; invisible
 // skills are indistinguishable from missing ones.
+//
+// A local miss may be forwarded to upstream registries that serve this
+// caller. Forwarding has a per-caller budget, and a skill that exists but is
+// hidden from the caller draws on it exactly like a missing one, so the
+// answer (404 or, over budget, 429) never tells the two apart.
 func (s *Server) loadVisible(r *http.Request) (model.Skill, error) {
 	ns, name := r.PathValue("ns"), r.PathValue("name")
+	viewer := principal(r).Viewer()
 	sk, err := s.Svc.Store.GetSkill(r.Context(), ns, name)
-	// A local miss may be forwarded to the upstream registries.
-	if errors.Is(err, model.ErrNotFound) {
-		if ferr := s.allowForward(r); ferr == nil {
-			sk, err = s.Svc.ResolveSkill(r.Context(), ns, name, true)
-		} else if ferr != errNoForward {
-			return model.Skill{}, ferr
-		}
-	}
-	if err != nil {
-		if errors.Is(err, model.ErrNotFound) {
-			return model.Skill{}, errNotFound
-		}
+	missing := errors.Is(err, model.ErrNotFound)
+	if err != nil && !missing {
 		return model.Skill{}, err
 	}
-	if !principal(r).Viewer().CanSee(sk.Namespace, sk.Visibility) {
+	visible := !missing && viewer.CanSee(sk.Namespace, sk.Visibility)
+	if !visible && s.Svc.CanForwardSkill(r.Context(), viewer, ns) {
+		if err := s.chargeForward(r); err != nil {
+			return model.Skill{}, err
+		}
+		if missing {
+			sk, err = s.Svc.ResolveSkill(r.Context(), viewer, ns, name, true)
+			if errors.Is(err, model.ErrNotFound) {
+				return model.Skill{}, errNotFound
+			}
+			if err != nil {
+				return model.Skill{}, err
+			}
+			visible = viewer.CanSee(sk.Namespace, sk.Visibility)
+		}
+	}
+	if !visible {
 		return model.Skill{}, errNotFound
 	}
 	return sk, nil
 }
 
+// loadVisibleVersion also completes a mirrored skill from its upstream when
+// the requested version is not here yet.
 func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version, error) {
 	sk, err := s.loadVisible(r)
 	if err != nil {
 		return sk, model.Version{}, err
 	}
-	v, err := s.Svc.Store.GetVersion(r.Context(), sk.ID, r.PathValue("version"))
+	version := r.PathValue("version")
+	v, err := s.Svc.Store.GetVersion(r.Context(), sk.ID, version)
+	if errors.Is(err, model.ErrNotFound) && sk.Upstream != "" && s.Svc.CanForwardSkill(r.Context(), principal(r).Viewer(), sk.Namespace) {
+		if err := s.chargeForward(r); err != nil {
+			return sk, v, err
+		}
+		refreshed, rerr := s.Svc.RefreshMirroredSkill(r.Context(), principal(r).Viewer(), sk, version)
+		if rerr != nil {
+			return sk, v, rerr
+		}
+		if refreshed {
+			v, err = s.Svc.Store.GetVersion(r.Context(), sk.ID, version)
+		}
+	}
 	if errors.Is(err, model.ErrNotFound) {
 		return sk, v, errNotFound
 	}

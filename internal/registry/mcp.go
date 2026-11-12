@@ -118,7 +118,7 @@ func (s *Service) UpdateMCPSettings(ctx context.Context, actor string, srv model
 // ResolveMCP returns a server and one of its versions ("latest" allowed). On a
 // local miss it forwards the read to the upstreams that allow it (see
 // forwardMCP) and mirrors the answer. Visibility is the caller's concern.
-func (s *Service) ResolveMCP(ctx context.Context, name, version string, forward bool) (model.MCPServer, model.MCPVersion, error) {
+func (s *Service) ResolveMCP(ctx context.Context, viewer model.Viewer, name, version string, forward bool) (model.MCPServer, model.MCPVersion, error) {
 	srv, err := s.Store.GetMCPServer(ctx, name)
 	if err == nil {
 		v, verr := s.Store.GetMCPVersion(ctx, srv.ID, version)
@@ -132,7 +132,7 @@ func (s *Service) ResolveMCP(ctx context.Context, name, version string, forward 
 	} else if !errors.Is(err, model.ErrNotFound) || !forward {
 		return srv, model.MCPVersion{}, err
 	}
-	if err := s.forwardMCP(ctx, name, version); err != nil {
+	if err := s.forwardMCP(ctx, viewer, name, version); err != nil {
 		return model.MCPServer{}, model.MCPVersion{}, err
 	}
 	srv, err = s.Store.GetMCPServer(ctx, name)

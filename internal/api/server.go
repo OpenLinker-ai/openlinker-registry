@@ -195,18 +195,18 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		}
 		scheme, tok, ok := strings.Cut(hdr, " ")
 		if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(tok) == "" {
-			writeError(w, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid authorization header"})
+			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid authorization header"})
 			return
 		}
 		p, err := s.Auth.Authenticate(r.Context(), strings.TrimSpace(tok))
 		if err != nil {
 			if !errors.Is(err, auth.ErrInvalidToken) {
 				s.Log.Error("authentication backend error", "err", err.Error())
-				writeError(w, &registry.Error{Status: http.StatusServiceUnavailable, Code: "unavailable", Msg: "authentication unavailable"})
+				s.reject(w, r, &registry.Error{Status: http.StatusServiceUnavailable, Code: "unavailable", Msg: "authentication unavailable"})
 				return
 			}
 			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-			writeError(w, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid or expired token"})
+			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid or expired token"})
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, p)))
@@ -219,7 +219,7 @@ func (s *Server) read(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !principal(r).Authenticated && !s.AllowAnonRead {
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeError(w, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "authentication required"})
+			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "authentication required"})
 			return
 		}
 		h(w, r)

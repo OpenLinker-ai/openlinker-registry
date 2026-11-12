@@ -90,6 +90,7 @@ type MCPMirrorInput struct {
 	Namespace  string
 	Name       string
 	Visibility string // used only when creating the server
+	Listed     bool   // used only when creating the server
 	Version    MCPVersion
 }
 

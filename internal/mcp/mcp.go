@@ -153,6 +153,13 @@ func Parse(data []byte, o Options) (*Parsed, error) {
 		if err := checkStrict(root, o); err != nil {
 			return nil, err
 		}
+		// After the field rules, which report userinfo in the URLs they know
+		// under their own codes; this catches every other position.
+		if path := scrubURLCredentials(root, false); path != "" {
+			return nil, errf(codeSecretValue, "%s: URLs must not embed credentials", shortPath(path))
+		}
+	} else {
+		scrubURLCredentials(root, true)
 	}
 
 	p := &Parsed{Name: name, Namespace: namespace, Server: server, Version: version}
@@ -232,7 +239,9 @@ func stripRegistryMeta(root map[string]any) {
 }
 
 // scrubSecrets enforces that no secret input carries a literal. An input is
-// any object with "isSecret": true, wherever it sits: that covers the
+// secret when it says so ("isSecret": true) or when its name is one that
+// carries credentials (see credentialName), since publishers routinely forget
+// the flag. It is recognized wherever it sits: that covers the
 // official positions (headers, environmentVariables, runtimeArguments,
 // packageArguments and the values of every variables object, recursively)
 // and any position a later schema adds. On such an object "value" and
@@ -245,7 +254,7 @@ func stripRegistryMeta(root map[string]any) {
 func scrubSecrets(v any, redact bool) (path string) {
 	switch t := v.(type) {
 	case map[string]any:
-		if secret, _ := t["isSecret"].(bool); secret {
+		if secret, _ := t["isSecret"].(bool); secret || credentialName(t["name"]) {
 			valueLiteral, defaultLiteral := isLiteral(t["value"]), isLiteral(t["default"])
 			switch {
 			case redact && valueLiteral:
@@ -270,6 +279,75 @@ func scrubSecrets(v any, redact bool) (path string) {
 	case []any:
 		for i, e := range t {
 			if sub := scrubSecrets(e, redact); sub != "" {
+				if strings.HasPrefix(sub, "[") {
+					return fmt.Sprintf("[%d]%s", i, sub)
+				}
+				return fmt.Sprintf("[%d].%s", i, sub)
+			}
+		}
+	}
+	return ""
+}
+
+// credentialSuffixes end the names of inputs that hold credentials, after
+// lowercasing and reading "-" as "_". They are suffixes on purpose:
+// "GITHUB_TOKEN" is a credential, "MAX_TOKENS" is not.
+var credentialSuffixes = []string{"token", "secret", "password", "passwd", "api_key", "apikey", "access_key",
+	"private_key", "credentials"}
+
+// credentialName reports whether an input name (a header or environment
+// variable name) denotes a credential whatever its isSecret flag says.
+func credentialName(v any) bool {
+	name, ok := v.(string)
+	if !ok {
+		return false
+	}
+	name = strings.ReplaceAll(strings.ToLower(name), "-", "_")
+	switch name {
+	case "authorization", "proxy_authorization", "cookie":
+		return true
+	}
+	for _, suffix := range credentialSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// urlKeys are the document members that hold URLs.
+var urlKeys = map[string]bool{"url": true, "src": true, "websiteUrl": true, "registryBaseUrl": true}
+
+// userinfoRe matches the scheme and userinfo of a URL ("https://user:pw@").
+// It works on text, not a parsed URL, so URL templates with {variables} in
+// the host are covered too.
+var userinfoRe = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@\s]*@`)
+
+// scrubURLCredentials enforces that no URL in the document embeds userinfo
+// ("https://user:password@host/"), which is how access tokens end up in
+// published metadata. With redact set the userinfo is removed in place and
+// "" is returned; otherwise the path of the first such URL is returned.
+func scrubURLCredentials(v any, redact bool) (path string) {
+	switch t := v.(type) {
+	case map[string]any:
+		for _, k := range slices.Sorted(maps.Keys(t)) {
+			if s, ok := t[k].(string); ok && urlKeys[k] && userinfoRe.MatchString(s) {
+				if !redact {
+					return k
+				}
+				t[k] = userinfoRe.ReplaceAllString(s, "$1")
+				continue
+			}
+			if sub := scrubURLCredentials(t[k], redact); sub != "" {
+				if strings.HasPrefix(sub, "[") {
+					return k + sub
+				}
+				return k + "." + sub
+			}
+		}
+	case []any:
+		for i, e := range t {
+			if sub := scrubURLCredentials(e, redact); sub != "" {
 				if strings.HasPrefix(sub, "[") {
 					return fmt.Sprintf("[%d]%s", i, sub)
 				}

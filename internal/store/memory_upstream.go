@@ -204,7 +204,7 @@ func (m *Memory) ClaimUpstreamSync(_ context.Context, id int64, now, staleBefore
 }
 
 // FinishUpstreamSync implements Store.
-func (m *Memory) FinishUpstreamSync(_ context.Context, id int64, res model.UpstreamSyncResult) error {
+func (m *Memory) FinishUpstreamSync(_ context.Context, id int64, res model.UpstreamSyncResult, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	u, ok := m.upstreams[id]
@@ -217,6 +217,7 @@ func (m *Memory) FinishUpstreamSync(_ context.Context, id int64, res model.Upstr
 		u.Cursor = res.Cursor
 	}
 	m.upstreams[id] = u
+	m.appendAudit(audit)
 	return nil
 }
 
@@ -247,7 +248,7 @@ func (m *Memory) createUpstreamNS(ns model.Namespace) model.Namespace {
 }
 
 // EnsureUpstreamNamespace implements Store.
-func (m *Memory) EnsureUpstreamNamespace(_ context.Context, name string, upstreamID int64) (model.Namespace, error) {
+func (m *Memory) EnsureUpstreamNamespace(_ context.Context, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ns, create, err := m.upstreamNS(name, upstreamID)
@@ -256,6 +257,7 @@ func (m *Memory) EnsureUpstreamNamespace(_ context.Context, name string, upstrea
 	}
 	if create {
 		ns = m.createUpstreamNS(ns)
+		m.appendAudit(audit)
 	}
 	return ns, nil
 }

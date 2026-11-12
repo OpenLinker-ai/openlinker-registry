@@ -2,11 +2,9 @@ package api
 
 import (
 	"context"
-	"errors"
 	"math"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
@@ -42,11 +40,12 @@ func tooManyRequests(wait time.Duration) *registry.Error {
 		RetryAfter: int(math.Ceil(wait.Seconds()))}
 }
 
-// limit applies the read or write limit of the caller. Health probes are
-// exempt.
+// limit applies the read or write limit of the caller. Only the health
+// probes themselves are exempt.
 func (s *Server) limit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/healthz") || strings.HasSuffix(r.URL.Path, "/readyz") {
+		switch r.URL.Path {
+		case "/healthz", s.BasePath + "/healthz", s.BasePath + "/readyz":
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -55,23 +54,16 @@ func (s *Server) limit(next http.Handler) http.Handler {
 			l = s.ReadLimit
 		}
 		if ok, wait := l.Allow(s.clientKey(r)); !ok {
-			writeError(w, tooManyRequests(wait))
+			s.reject(w, r, tooManyRequests(wait))
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// errNoForward means forwarding is not configured; the miss stays a miss.
-var errNoForward = errors.New("forwarding disabled")
-
-// allowForward decides whether a local miss by this caller may become
-// outbound requests to upstreams. It returns nil to forward, errNoForward
-// when no upstream forwards, or a 429 when the caller exhausted its budget.
-func (s *Server) allowForward(r *http.Request) error {
-	if !s.Svc.Forwarding(r.Context()) {
-		return errNoForward
-	}
+// chargeForward draws one forwarded read from the caller's budget. Callers
+// first establish that an upstream could serve this caller at all.
+func (s *Server) chargeForward(r *http.Request) error {
 	if ok, wait := s.ForwardLimit.Allow(s.clientKey(r)); !ok {
 		return tooManyRequests(wait)
 	}
