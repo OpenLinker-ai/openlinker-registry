@@ -106,6 +106,11 @@ func rawTime(m map[string]json.RawMessage, key string) time.Time {
 	if err != nil {
 		return time.Time{}
 	}
+	// A time is stored and served in UTC, where an offset can take it out
+	// of the years a timestamp can be written with. Such a time is unusable.
+	if t = t.UTC(); t.Year() < 1 || t.Year() > 9999 {
+		return time.Time{}
+	}
 	return t
 }
 

@@ -2067,6 +2067,65 @@ func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fok/versions/1.0.0", "", "", nil), 200, "the entry after the odd ones")
 	})
 
+	t.Run("an upstream timestamp out of range", func(t *testing.T) {
+		// A valid RFC 3339 time whose offset takes it past the year 9999 in
+		// UTC cannot be written in a response. The entry is mirrored
+		// without that time instead of breaking every read of it.
+		entry := map[string]any{"server": map[string]any{"name": "com.feed/late", "description": "d", "version": "1.0.0",
+			"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+			"_meta": map[string]any{metaOfficial: map[string]any{"status": "deprecated", "statusMessage": "old", "isLatest": true,
+				"publishedAt": "9999-12-31T23:59:59-23:00", "statusChangedAt": "9999-12-31T23:59:59-23:00", "updatedAt": "9999-12-31T23:59:59-23:00"}}}
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{entry}})
+			case "/v0.1/servers/com.feed%2Flate/versions/1.0.0":
+				_ = json.NewEncoder(w).Encode(entry)
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_created") != 1 {
+			t.Fatalf("sync: %v", s)
+		}
+		for _, path := range []string{"/v0.1/servers/com.feed%2Flate/versions/1.0.0", "/v0.1/servers", "/v0.1/servers/com.feed%2Flate/versions",
+			"/v1/mcp/servers/com.feed/late", "/v1/mcp/servers", "/v0.1/servers?updated_since=2000-01-01T00:00:00Z"} {
+			e.Expect(e.Do("GET", path, "", "", nil), 200, "GET "+path)
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers?updated_since=9999-12-31T23:59:59-23:00", "", "", nil), 400, "a filter time out of range")
+		if s := e.sync("feed"); s["last_status"] != "ok" {
+			t.Fatalf("second sync: %v", s)
+		}
+	})
+
+	t.Run("a forwarded read of a version no server can have", func(t *testing.T) {
+		// Nothing is asked upstream for it, and nothing is remembered.
+		var asked atomic.Int64
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			asked.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fs/versions/"+strings.Repeat("v", 256), "", "", nil), 404, "a version of 256 characters")
+		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fs/versions/"+strings.Repeat("v", 60000), "", "", nil), 404, "a very long version")
+		if n := asked.Load(); n != 0 {
+			t.Fatalf("the upstream was asked %d times for versions no server can have", n)
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fs/versions/"+strings.Repeat("v", 255), "", "", nil), 404, "a version of 255 characters")
+		if n := asked.Load(); n == 0 {
+			t.Fatal("a version a server can have must be forwarded")
+		}
+	})
+
 	t.Run("requests with text no entry can have", func(t *testing.T) {
 		e := NewEnv(t, newStore(t), Options{})
 		e.namespace("com.acme", "domain")

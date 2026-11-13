@@ -149,7 +149,7 @@ func (s *Server) mcpQuery(r *http.Request, searchParam string, defaultLimit int)
 	}
 	if v := qv.Get("updated_since"); v != "" {
 		t, err := time.Parse(time.RFC3339Nano, v)
-		if err != nil {
+		if t = t.UTC(); err != nil || t.Year() < 1 || t.Year() > 9999 {
 			return q, 0, badQuery("updated_since must be an RFC 3339 timestamp")
 		}
 		// Incremental sync must see deletions (official registry behavior).

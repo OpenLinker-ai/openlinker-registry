@@ -17,6 +17,17 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 		"repository": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"repository":{"url":"https://` + secret + `@github.com/alice/w","source":"github"},
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		// A template may take the scheme, with its colon or with the
+		// slashes too, from a variable. What follows is still an authority.
+		"scheme and colon from a variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{scheme}//alice:` + secret + `@mcp.example.com/sse","variables":{"scheme":{"default":"https:"}}}]}`,
+		"origin prefix from a variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{origin}alice:` + secret + `@mcp.example.com/sse","variables":{"origin":{"default":"https://"}}}]}`,
+		"two leading variables": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{scheme}{slashes}alice:` + secret + `@mcp.example.com/sse",
+			"variables":{"scheme":{"default":"https:"},"slashes":{"default":"//"}}}]}`,
+		"template authority in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-alt":"{scheme}//alice:` + secret + `@alt.example.com/sse","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 	}
 	for name, doc := range docs {
 		// Known URL fields report it under their own code; the rest as a secret.
@@ -47,6 +58,15 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 	if err != nil || !strings.Contains(string(p.Canonical), "/users/@alice/sse?to=a@b.example") {
 		t.Fatalf("path and query may contain @: %v", err)
 	}
+	// Nor in a template, after its first slash.
+	for _, url := range []string{"{base}/users/@alice/sse", "{base}/a//b@c/sse", "{scheme}://mcp.example.com/a//b@c"} {
+		ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0","remotes":[{"type":"sse","url":"` + url + `",
+			"variables":{"base":{"default":"https://mcp.example.com"},"scheme":{"default":"https"}}}]}`
+		p, err := Parse([]byte(ok), Options{Strict: true})
+		if err != nil || !strings.Contains(string(p.Canonical), url) {
+			t.Fatalf("%s: a template path may contain @: %v", url, err)
+		}
+	}
 }
 
 func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
@@ -70,6 +90,9 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 		"variable of a fragment credential": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"x-app":{"url":"https://app.example.com/start#access_token={t}","variables":{"t":{"value":"{u}","variables":{"u":{"default":"` + secret + `"}}}}},
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"variable in the userinfo of a template": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}],
+			"x-source":{"url":"{scheme}//{who}@git.example/w","variables":{"scheme":{"default":"https:"},"who":{"default":"` + secret + `"}}}}`,
 		"variable in the userinfo": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"sse","url":"http://localhost:{port}/sse",
 			"variables":{"port":{"default":"3000"}}}}],

@@ -200,6 +200,15 @@ var (
 // A server part of "." or ".." is refused although the official pattern
 // allows it: names are used as URL path segments, where dot segments are
 // rewritten by clients and proxies.
+// ValidVersion reports whether version can be the version of a server: 1 to
+// 255 characters of valid UTF-8 without NUL, and not "latest".
+func ValidVersion(version string) bool {
+	if n := utf8.RuneCountInString(version); n < 1 || n > 255 || version == "latest" {
+		return false
+	}
+	return utf8.ValidString(version) && !strings.ContainsRune(version, 0)
+}
+
 func SplitName(name string) (namespace, server string, ok bool) {
 	namespace, server, code := splitName(name)
 	return namespace, server, code == ""
@@ -328,7 +337,9 @@ func credentialRefs(t map[string]any) map[string]bool {
 		if !ok || !isURLValue(k, s) {
 			continue
 		}
-		add(userinfoRe.FindString(s))
+		if m := userinfoRe.FindStringSubmatch(s); m != nil {
+			add(strings.TrimPrefix(m[0], m[1]))
+		}
 		base, fragment, _ := strings.Cut(s, "#")
 		_, query, _ := strings.Cut(base, "?")
 		for _, params := range []string{query, fragment} {
@@ -392,9 +403,12 @@ func isURLValue(key, value string) bool { return urlKeys[key] || urlRe.MatchStri
 // colon, so the scheme may be missing ("//user:pw@host"), a {variable}, or
 // compound ("jdbc:postgresql://user:pw@host").
 // It works on text, not a parsed URL, so URL templates are covered too: with
-// {variables} in the host, and with the scheme itself a {variable}
-// ("{scheme}://user:pw@host").
-var userinfoRe = regexp.MustCompile(`((?:^|:)//)[^/?#\s]*@`)
+// {variables} in the host, and with the scheme a {variable}, with or without
+// its colon ("{scheme}://user:pw@host", "{scheme}//user:pw@host"). A value
+// that begins with {variables} may get scheme and slashes from them, so
+// what follows them up to an "@" is userinfo as well ("{origin}user:pw@host").
+// Group 1 is what precedes the userinfo.
+var userinfoRe = regexp.MustCompile(`((?:^|:|\})//|^(?:\{[a-zA-Z_][a-zA-Z0-9_]*\})+)[^/?#\s]*@`)
 
 // urlCredentials reports whether a URL carries credentials: userinfo, or a
 // query parameter named like a credential with a literal value

@@ -302,9 +302,14 @@ func (s *Service) client(u model.Upstream) *upstream.Client {
 
 // missCache remembers recent upstream misses so repeated reads of a name
 // that exists nowhere do not turn into repeated outbound requests.
+//
+// Keys are names and versions an entry can have, so they are bounded;
+// expired ones are dropped once per TTL, and the map never holds more than
+// maxMisses.
 type missCache struct {
-	mu sync.Mutex
-	m  map[string]time.Time
+	mu    sync.Mutex
+	m     map[string]time.Time
+	swept time.Time
 }
 
 func (c *missCache) recent(key string, now time.Time) bool {
@@ -321,7 +326,18 @@ func (c *missCache) recent(key string, now time.Time) bool {
 func (c *missCache) add(key string, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.m == nil || len(c.m) >= maxMisses {
+	if c.m == nil {
+		c.m = map[string]time.Time{}
+	}
+	if now.Sub(c.swept) >= missTTL || len(c.m) >= maxMisses {
+		for k, until := range c.m {
+			if now.After(until) {
+				delete(c.m, k)
+			}
+		}
+		c.swept = now
+	}
+	if len(c.m) >= maxMisses {
 		c.m = map[string]time.Time{}
 	}
 	c.m[key] = now.Add(missTTL)
@@ -389,7 +405,9 @@ func (s *Service) CanForwardMCP(ctx context.Context, viewer model.Viewer, name s
 // answer. It returns nil when the version is now stored locally.
 func (s *Service) forwardMCP(ctx context.Context, viewer model.Viewer, name, version string) error {
 	ns, _, ok := mcp.SplitName(name)
-	if !ok {
+	// No server has such a name or version: nothing is asked upstream and
+	// nothing is remembered for it.
+	if !ok || (version != "latest" && !mcp.ValidVersion(version)) {
 		return model.ErrNotFound
 	}
 	key := "mcp\x00" + name + "\x00" + version
@@ -593,10 +611,7 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 func (s *Service) recordedMCP(ctx context.Context, u model.Upstream, name, version string) (*mcp.Parsed, bool, error) {
 	// Name and version come from an upstream document that could not be
 	// used: only an identity an entry can have is looked up.
-	if _, _, ok := mcp.SplitName(name); !ok || version == "latest" || !utf8.ValidString(version) || strings.ContainsRune(version, 0) {
-		return nil, false, nil
-	}
-	if n := utf8.RuneCountInString(version); n < 1 || n > 255 {
+	if _, _, ok := mcp.SplitName(name); !ok || !mcp.ValidVersion(version) {
 		return nil, false, nil
 	}
 	srv, err := s.Store.GetMCPServer(ctx, name)
