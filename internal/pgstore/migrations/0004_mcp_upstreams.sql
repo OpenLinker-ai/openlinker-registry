@@ -141,3 +141,7 @@ CREATE TRIGGER mcp_server_versions_no_truncate_trg
 -- immutable columns: the upstream may start serving it later (a license is
 -- approved there).
 ALTER TABLE skill_versions ADD COLUMN mirror_served BOOLEAN;
+
+-- The version a skill's source names as its current one when that is not the
+-- newest ('' otherwise): a discovery index may return to earlier content.
+ALTER TABLE skills ADD COLUMN current_version TEXT NOT NULL DEFAULT '';

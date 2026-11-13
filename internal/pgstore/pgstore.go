@@ -378,7 +378,8 @@ func rowsOrNotFound(tag pgconn.CommandTag, err error) error {
 }
 
 const skillCols = `s.id, n.name, s.name, s.description, s.visibility, s.listed, s.status, s.status_reason,
-	s.mode, COALESCE(s.source_key, ''), COALESCE(s.global_alias, ''), COALESCE(u.name, ''), s.created_at, s.updated_at`
+	s.mode, COALESCE(s.source_key, ''), COALESCE(s.global_alias, ''), COALESCE(u.name, ''), s.current_version,
+	s.created_at, s.updated_at`
 
 // skillFrom joins what skillCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -387,7 +388,7 @@ const skillFrom = ` FROM skills s JOIN namespaces n ON n.id = s.namespace_id LEF
 func scanSkill(row pgx.Row, extra ...any) (model.Skill, error) {
 	var k model.Skill
 	dest := append([]any{&k.ID, &k.Namespace, &k.Name, &k.Description, &k.Visibility, &k.Listed, &k.Status,
-		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.Upstream, &k.CreatedAt, &k.UpdatedAt}, extra...)
+		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.Upstream, &k.CurrentVersion, &k.CreatedAt, &k.UpdatedAt}, extra...)
 	err := row.Scan(dest...)
 	return k, err
 }
@@ -500,11 +501,11 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 			return err
 		}
 		v.SkillID, v.Mode = k.ID, in.Mode
-		if err := tx.QueryRow(ctx, `UPDATE skills SET description = $2, updated_at = now() WHERE id = $1 RETURNING updated_at`,
-			k.ID, v.FrontmatterDescription).Scan(&k.UpdatedAt); err != nil {
+		if err := tx.QueryRow(ctx, `UPDATE skills SET description = $2, current_version = '', updated_at = now()
+			WHERE id = $1 RETURNING updated_at`, k.ID, v.FrontmatterDescription).Scan(&k.UpdatedAt); err != nil {
 			return err
 		}
-		k.Description = v.FrontmatterDescription
+		k.Description, k.CurrentVersion = v.FrontmatterDescription, ""
 		outSkill, outVer = k, v
 		return nil
 	})
@@ -688,14 +689,42 @@ func (s *Store) ApproveLicense(ctx context.Context, id int64, audit model.AuditE
 	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET license_approved = true WHERE id = $1`, id)
 }
 
+// SetSkillCurrentVersion implements store.Store.
+func (s *Store) SetSkillCurrentVersion(ctx context.Context, skillID int64, version string, audit model.AuditEvent) (model.Skill, error) {
+	var out model.Skill
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		// The skill row is locked first, as PublishVersion does, so the two
+		// cannot interleave.
+		var locked int64
+		if err := tx.QueryRow(ctx, `SELECT id FROM skills WHERE id = $1 FOR UPDATE`, skillID).Scan(&locked); err != nil {
+			return notFound(err)
+		}
+		tag, err := tx.Exec(ctx, `UPDATE skills s SET current_version = v.version, description = v.frontmatter_description,
+			updated_at = now() FROM skill_versions v WHERE s.id = $1 AND v.skill_id = s.id AND v.version = $2`, skillID, version)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return model.ErrNotFound
+		}
+		out, err = s.getSkillByID(ctx, tx, skillID)
+		return err
+	})
+	return out, err
+}
+
 // SetVersionCheck implements store.Store.
 func (s *Store) SetVersionCheck(ctx context.Context, id int64, result string, at time.Time) error {
 	return s.execVersion(ctx, `UPDATE skill_versions SET check_result = $2, checked_at = $3 WHERE id = $1`, id, result, at)
 }
 
-// latestJoin selects the newest non-yanked version of each skill.
-const latestJoin = `LEFT JOIN LATERAL (SELECT * FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL
-	ORDER BY v.id DESC LIMIT 1) lv ON true`
+// latestOrder is model.LatestVersion as the ORDER BY of a lateral subquery
+// over the non-yanked versions v of skill s.
+const latestOrder = `ORDER BY (v.version = s.current_version) DESC, v.id DESC LIMIT 1`
+
+// latestJoin selects the latest version of each skill.
+const latestJoin = `LEFT JOIN LATERAL (SELECT * FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL ` +
+	latestOrder + `) lv ON true`
 
 // visibleSQL is model.Viewer.CanSee as a SQL condition over the visibility
 // column col and the namespace name n.name; it is "" for admins, who see
@@ -769,7 +798,7 @@ func likeEscape(s string) string {
 // IndexCandidates implements store.Store.
 func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly bool) ([]model.IndexCandidate, error) {
 	rows, err := s.pool.Query(ctx, `SELECT s.id, v.version FROM skills s JOIN namespaces n ON n.id = s.namespace_id
-		JOIN LATERAL (SELECT version FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL ORDER BY v.id DESC LIMIT 1) v ON true
+		JOIN LATERAL (SELECT version FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL `+latestOrder+`) v ON true
 		WHERE s.visibility = 'public' AND s.listed AND s.status = 'active'
 		AND ($1 = '' OR n.name = $1) AND (NOT $2 OR s.global_alias IS NOT NULL)
 		ORDER BY n.name, s.name`, namespace, aliasOnly)

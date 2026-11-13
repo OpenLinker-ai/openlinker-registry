@@ -220,7 +220,7 @@ func TestMCPPrefixFallbackIsRemembered(t *testing.T) {
 	if _, _, err := c.ListMCP(ctx, upstream.MCPListOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.ListMCPVersions(ctx, "io.github.x/missing")
+	_, _, err = c.ListMCPVersions(ctx, "io.github.x/missing")
 	wantNotFound(t, "versions of a missing server", err)
 	if got := cur.uris(); len(got) != 2 || got[1] != "/v0.1/servers/io.github.x%2Fmissing/versions" {
 		t.Fatalf("requests = %v", got)
@@ -333,9 +333,9 @@ func TestListMCPVersions(t *testing.T) {
 		}
 	})
 	c := newClient(f.URL)
-	docs, err := c.ListMCPVersions(ctx, "io.github.a/b")
-	if err != nil || len(docs) != 2 {
-		t.Fatalf("%+v %v", docs, err)
+	docs, complete, err := c.ListMCPVersions(ctx, "io.github.a/b")
+	if err != nil || len(docs) != 2 || complete {
+		t.Fatalf("%+v complete=%v %v (the list has entries that cannot be read)", docs, complete, err)
 	}
 	if docs[0].Version != "2.0.0" || !docs[0].IsLatest || docs[1].Version != "1.0.0" || docs[1].Status != "deprecated" {
 		t.Fatalf("docs = %+v", docs)
@@ -343,12 +343,12 @@ func TestListMCPVersions(t *testing.T) {
 	if got := f.uris()[0]; got != "/v0.1/servers/io.github.a%2Fb/versions" {
 		t.Fatalf("request = %q", got)
 	}
-	if docs, err = c.ListMCPVersions(ctx, "io.github.a/empty"); err != nil || len(docs) != 0 {
-		t.Fatalf("%+v %v", docs, err)
+	if docs, complete, err = c.ListMCPVersions(ctx, "io.github.a/empty"); err != nil || len(docs) != 0 || !complete {
+		t.Fatalf("%+v complete=%v %v", docs, complete, err)
 	}
-	if _, err = c.ListMCPVersions(ctx, "io.github.a/bad"); ucode(err) != upstream.CodeBadResponse {
+	if _, _, err = c.ListMCPVersions(ctx, "io.github.a/bad"); ucode(err) != upstream.CodeBadResponse {
 		t.Fatalf("err = %v, want bad_response", err)
 	}
-	_, err = c.ListMCPVersions(ctx, "io.github.a/missing")
+	_, _, err = c.ListMCPVersions(ctx, "io.github.a/missing")
 	wantNotFound(t, "ListMCPVersions", err)
 }

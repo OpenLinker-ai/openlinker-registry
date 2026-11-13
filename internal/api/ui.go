@@ -307,8 +307,11 @@ func (s *Server) uiSkill(w http.ResponseWriter, r *http.Request) {
 	d := uiSkillDetail{Skill: sk, Versions: versions}
 	want := r.PathValue("version")
 	found := false
+	if want == "" {
+		d.Version, found = model.LatestVersion(sk.CurrentVersion, versions)
+	}
 	for _, v := range versions {
-		if (want == "" && v.YankedAt == nil) || (want != "" && v.Version == want) {
+		if want != "" && v.Version == want {
 			d.Version, found = v, true
 			break
 		}

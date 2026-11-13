@@ -49,6 +49,11 @@ type Store interface {
 	GetVersion(ctx context.Context, skillID int64, version string) (model.Version, error)
 	UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error)
 	SetSkillStatus(ctx context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error)
+	// SetSkillCurrentVersion makes an existing version (ErrNotFound
+	// otherwise) the one the skill presents as its latest (see
+	// model.LatestVersion) and gives the skill that version's description.
+	// Publishing a version afterwards makes the new version the latest again.
+	SetSkillCurrentVersion(ctx context.Context, skillID int64, version string, audit model.AuditEvent) (model.Skill, error)
 	SetAlias(ctx context.Context, skillID int64, alias string, audit model.AuditEvent) error
 	YankVersion(ctx context.Context, versionID int64, reason string, at time.Time, audit model.AuditEvent) error
 	ApproveLicense(ctx context.Context, versionID int64, audit model.AuditEvent) error

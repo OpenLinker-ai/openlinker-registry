@@ -238,11 +238,11 @@ func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	latest := ""
+	if v, ok := model.LatestVersion(sk.CurrentVersion, versions); ok {
+		latest = v.Version
+	}
 	list := make([]map[string]any, 0, len(versions))
 	for _, v := range versions {
-		if latest == "" && v.YankedAt == nil {
-			latest = v.Version
-		}
 		// "servable" and "license_approved" can change after publication; a
 		// mirror follows them from here without reading every version.
 		list = append(list, map[string]any{"version": v.Version, "created_at": v.CreatedAt, "artifact_digest": v.ArtifactDigest,

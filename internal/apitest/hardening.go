@@ -828,6 +828,70 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a version list with an unreadable entry", func(t *testing.T) {
+		// v1 arrived by a forwarded read. A latest-only full sync lists v2
+		// and asks for the server's version list, in which the entry of v1
+		// cannot be read this once. That list does not say v1 is gone: v1
+		// must not be marked deleted, and the run must not store a
+		// watermark that would end full runs before v1 is settled.
+		now := time.Now().UTC().Truncate(time.Second)
+		t1 := now.Add(-time.Hour)
+		entry := func(version, status string, latest bool) map[string]any {
+			return map[string]any{"server": map[string]any{"name": "com.feed/tool", "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": latest,
+					"updatedAt": t1.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
+		}
+		phase := 1 // 1: only v1; 2: v2 is latest, v1's list entry is broken; 3: v1 is deprecated
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("2.0.0", "active", true)}})
+			case "/v0.1/servers/com.feed%2Ftool/versions":
+				old := entry("1.0.0", "deprecated", false)
+				if phase == 2 {
+					old = map[string]any{"server": map[string]any{"name": "com.feed/tool"}}
+				}
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("2.0.0", "active", true), old}})
+			case "/v0.1/servers/com.feed%2Ftool/versions/1.0.0":
+				_ = enc.Encode(entry("1.0.0", map[bool]string{true: "active", false: "deprecated"}[phase == 1], phase == 1))
+			case "/v0.1/servers/com.feed%2Ftool/versions/2.0.0":
+				_ = enc.Encode(entry("2.0.0", "active", true))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "proxy_on_miss": true,
+			"latest_only": true, "visibility": "public"}), 201, "upstream")
+		status := func() any {
+			return official(e.Do("GET", "/v0.1/servers/com.feed%2Ftool/versions/1.0.0", "", "", nil).JSON)["status"]
+		}
+		if status() != "active" {
+			t.Fatal("v1 was not forwarded")
+		}
+		phase = 2
+		s := e.sync("feed")
+		if s["last_status"] != "ok" || stat(s, "mcp_pending") != 1 || status() != "active" {
+			t.Fatalf("an unreadable list entry was taken for a removed version (v1 is %v): %v", status(), s)
+		}
+		if cursor, _ := s["cursor"].(string); cursor != "" {
+			t.Fatalf("the run stored the watermark %q before v1 was settled", cursor)
+		}
+		if r := e.Do("GET", "/v0.1/servers/com.feed%2Ftool/versions/latest", "", "", nil); v0Version(r.JSON) != "2.0.0" {
+			t.Fatalf("the readable part of the list was not applied: %s", r.Body)
+		}
+		phase = 3
+		s = e.sync("feed")
+		if cursor, _ := s["cursor"].(string); s["last_status"] != "ok" || stat(s, "mcp_pending") != 0 || cursor == "" || status() != "deprecated" {
+			t.Fatalf("after the list recovered (v1 is %v): %v", status(), s)
+		}
+	})
+
 	t.Run("a listing page larger than the response cap", func(t *testing.T) {
 		// Large documents make a full page exceed what one response may
 		// carry, although each document is fine. The sync asks for smaller
@@ -1415,6 +1479,82 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.sync("site")
 		if a, b := read("beta", ""), e.Do("GET", betaArtifact, "", "", nil).Status; a != 200 || b != 200 {
 			t.Fatalf("an entry that returned to the index: metadata %d, artifact %d", a, b)
+		}
+	})
+
+	t.Run("a discovery index that goes back to earlier content", func(t *testing.T) {
+		// An index entry has no versions: each digest becomes one here. When
+		// the site serves earlier content again, that digest is already
+		// recorded, but it is what the site offers now and must be what this
+		// registry presents as the latest version, everywhere. A registry
+		// that mirrors this one follows.
+		contents := map[string][]byte{"a": md("tool", "First", "MIT"), "b": md("tool", "Second", "MIT"), "c": md("tool", "Third", "MIT")}
+		current := "a"
+		var site *httptest.Server
+		site = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/.well-known/agent-skills/index.json":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"skills": []map[string]any{{"name": "tool", "type": "skill-md",
+					"description": "d", "url": site.URL + "/tool/SKILL.md", "digest": sha(contents[current])}}})
+			case "/tool/SKILL.md":
+				_, _ = w.Write(contents[current])
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		t.Cleanup(site.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "site", "kind": "agent-skills", "base_url": site.URL, "target_namespace": "mirror.site", "visibility": "public"}), 201, "upstream")
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": e.Base, "visibility": "public"}), 201, "upstream")
+		versionOf := func(key string) string { return "sha-" + strings.TrimPrefix(sha(contents[key]), "sha256:")[:12] }
+		check := func(step, key, description string) {
+			t.Helper()
+			want := versionOf(key)
+			for _, side := range []struct {
+				name, upstream string
+				env            *Env
+			}{{"mirror", "site", e}, {"mirror of the mirror", "hub", down}} {
+				name, env := side.name, side.env
+				if st := env.sync(side.upstream); st["last_status"] != "ok" {
+					t.Fatalf("%s: %s: sync: %v", step, name, st)
+				}
+				r := env.Expect(env.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, step+": "+name+": detail")
+				if r.JSON["latest_version"] != want || r.JSON["description"] != description {
+					t.Fatalf("%s: %s: detail presents %v (%v), the site serves %s (%s)", step, name, r.JSON["latest_version"], r.JSON["description"], want, description)
+				}
+				r = env.Expect(env.Do("GET", "/v1/skills?namespace=mirror.site", "", "", nil), 200, step+": "+name+": search")
+				if found, _ := r.JSON["skills"].([]any); len(found) != 1 || found[0].(map[string]any)["latest_version"] != want {
+					t.Fatalf("%s: %s: search presents %s", step, name, r.Body)
+				}
+				r = env.Expect(env.Do("GET", "/ns/mirror.site/.well-known/agent-skills/index.json", "", "", nil), 200, step+": "+name+": discovery index")
+				if !strings.Contains(string(r.Body), sha(contents[key])) {
+					t.Fatalf("%s: %s: the discovery index does not advertise the digest the site serves: %s", step, name, r.Body)
+				}
+				r = env.Expect(env.Do("GET", "/v1/skills/mirror.site/tool/versions/"+want+"/artifact", "", "", nil), 200, step+": "+name+": artifact")
+				if string(r.Body) != string(contents[key]) {
+					t.Fatalf("%s: %s: artifact of the latest version is not what the site serves", step, name)
+				}
+			}
+		}
+		check("first content", "a", "First")
+		current = "b"
+		check("new content", "b", "Second")
+		current = "a"
+		check("earlier content again", "a", "First")
+		if st := e.sync("site"); stat(st, "skills_unchanged") != 1 || stat(st, "skills_updated") != 0 {
+			t.Fatalf("a sync without changes: %v", st)
+		}
+		current = "b"
+		check("forward again", "b", "Second")
+		current = "a"
+		check("and back", "a", "First")
+		current = "c"
+		check("content never seen", "c", "Third")
+		r := e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "detail")
+		if versions, _ := r.JSON["versions"].([]any); len(versions) != 3 {
+			t.Fatalf("each digest is one version: %s", r.Body)
 		}
 	})
 

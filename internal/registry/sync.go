@@ -325,7 +325,7 @@ func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *
 		if isUpstreamError(err) {
 			return "", errUnconfirmed
 		}
-		return "", err
+		return "", err // errUnconfirmed included
 	}
 	return model.MirrorUpdated, nil
 }
@@ -343,7 +343,7 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 	if err != nil {
 		return nil, err
 	}
-	docs, err := c.ListMCPVersions(ctx, srv.Name)
+	docs, complete, err := c.ListMCPVersions(ctx, srv.Name)
 	switch {
 	case errors.Is(err, upstream.ErrNotFound):
 		return nil, s.withdrawMCP(ctx, u, srv, stats)
@@ -376,6 +376,11 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 	for _, v := range local {
 		if served[v.Version] || v.Status == model.MCPStatusDeleted {
 			continue
+		}
+		if !complete {
+			// The list had an entry that could not be read, and that entry
+			// may be this version: nothing is known about it.
+			return nil, errUnconfirmed
 		}
 		// Status only: the versions applied above may just have changed who
 		// sees the server, and that must stand.
@@ -804,9 +809,17 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 	if created {
 		// A skill created just now took its visibility and listing from the
 		// first version; its status is still to be set.
-		if _, _, err = s.applySkillSettings(ctx, actor, local, d, visibility); err != nil {
+		if local, _, err = s.applySkillSettings(ctx, actor, local, d, visibility); err != nil {
 			return err
 		}
+	}
+	if exists {
+		// Which version is the latest is the upstream's statement too.
+		followed, err := s.followLatest(ctx, actor, local, d.LatestVersion)
+		if err != nil {
+			return err
+		}
+		changed = changed || followed
 	}
 	if changed {
 		stats.add("skills_updated")
@@ -999,7 +1012,13 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 				return err
 			}
 			if _, err := s.Store.GetVersion(ctx, local.ID, version); err == nil {
-				if restored {
+				// The index may have named another version in between and
+				// now names this one again: it is the current one again.
+				followed, err := s.followLatest(ctx, actor, local, version)
+				if err != nil {
+					return err
+				}
+				if restored || followed {
 					stats.add("skills_updated")
 				} else {
 					stats.add("skills_unchanged")
@@ -1088,6 +1107,37 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 			return nil
 		}
 	}
+}
+
+// followLatest makes the version the upstream names as its latest the one
+// the mirrored skill presents as latest here. Usually that is the newest
+// version and nothing is written; it is not when the upstream went back to
+// an earlier version (a discovery index that serves earlier content again).
+// A version that is not recorded here, or is yanked, changes nothing. It
+// reports whether anything changed.
+func (s *Service) followLatest(ctx context.Context, actor string, local model.Skill, version string) (bool, error) {
+	if version == "" || local.Status == model.StatusYanked {
+		return false, nil
+	}
+	versions, err := s.Store.ListVersions(ctx, local.ID)
+	if err != nil {
+		return false, err
+	}
+	if latest, ok := model.LatestVersion(local.CurrentVersion, versions); ok && latest.Version == version {
+		return false, nil
+	}
+	for _, v := range versions {
+		if v.Version != version {
+			continue
+		}
+		if v.YankedAt != nil {
+			return false, nil
+		}
+		_, err := s.Store.SetSkillCurrentVersion(ctx, local.ID, version,
+			auditEvent(actor, "skill.current", local.Namespace, local.Name+"@"+version, map[string]any{"reason": "named as latest by the upstream"}))
+		return err == nil, err
+	}
+	return false, nil
 }
 
 // restoreIndexSkill gives a skill that the discovery index lists the

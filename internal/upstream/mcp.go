@@ -237,24 +237,28 @@ func (c *Client) GetMCP(ctx context.Context, name, version string) (MCPDoc, erro
 }
 
 // ListMCPVersions returns every version of a server, in upstream order.
-// Malformed entries and entries for another server name are skipped.
-func (c *Client) ListMCPVersions(ctx context.Context, name string) ([]MCPDoc, error) {
+// Malformed entries and entries for another server name are skipped;
+// complete is false when there was one, because the list then does not tell
+// which versions the upstream has.
+func (c *Client) ListMCPVersions(ctx context.Context, name string) (docs []MCPDoc, complete bool, err error) {
 	if err := checkSegs("server name", name); err != nil {
-		return nil, wrapOp("mcp versions", err)
+		return nil, false, wrapOp("mcp versions", err)
 	}
 	body, err := c.mcpGet(ctx, "/servers/"+seg(name)+"/versions", nil)
 	if err != nil {
-		return nil, wrapOp("mcp versions", err)
+		return nil, false, wrapOp("mcp versions", err)
 	}
 	items, _, err := listField(body, "servers", "version list")
 	if err != nil {
-		return nil, wrapOp("mcp versions", err)
+		return nil, false, wrapOp("mcp versions", err)
 	}
-	var docs []MCPDoc
+	complete = true
 	for _, it := range items {
 		if d, ok := parseMCPDoc(it); ok && d.Name == name {
 			docs = append(docs, d)
+		} else {
+			complete = false
 		}
 	}
-	return docs, nil
+	return docs, complete, nil
 }

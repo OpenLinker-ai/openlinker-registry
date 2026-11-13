@@ -115,6 +115,89 @@ var mirrorTests = []testCase{
 			t.Fatalf("versions = %+v", vs)
 		}
 	}},
+	{"a skill's current version", func(t *testing.T, st store.Store) {
+		// A source may name a version recorded earlier as its current one.
+		// Detail, search and the discovery index then present that version.
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		put := func(ver, description string) {
+			t.Helper()
+			v := version(ver, "spdx")
+			v.FrontmatterDescription = description
+			v.Source, v.Locator = nil, &model.Locator{Kind: "url", Upstream: "up"}
+			if _, _, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "org.site", Name: "tool", Mode: "indexed",
+				SourceKey: "upstream:up:tool", Visibility: model.VisibilityPublic, Listed: true, UpstreamID: up.ID,
+				UpstreamConfigVersion: up.ConfigVersion, Version: v}, audit); err != nil {
+				t.Fatal(err)
+			}
+		}
+		latest := func() (string, string, string) {
+			t.Helper()
+			found, err := st.Search(ctx, model.SearchQuery{Namespace: "org.site"})
+			if err != nil || len(found) != 1 {
+				t.Fatalf("search: %d rows, %v", len(found), err)
+			}
+			cands, err := st.IndexCandidates(ctx, "org.site", false)
+			if err != nil || len(cands) != 1 {
+				t.Fatalf("index candidates: %d rows, %v", len(cands), err)
+			}
+			return found[0].LatestVersion, cands[0].Version.Version, found[0].Skill.Description
+		}
+		put("sha-a", "first")
+		put("sha-b", "second")
+		if s, c, d := latest(); s != "sha-b" || c != "sha-b" || d != "second" {
+			t.Fatalf("latest = %s / %s (%s)", s, c, d)
+		}
+		sk, _ := st.GetSkill(ctx, "org.site", "tool")
+		events := auditCount(t, st, "test")
+		out, err := st.SetSkillCurrentVersion(ctx, sk.ID, "sha-a", audit)
+		if err != nil || out.CurrentVersion != "sha-a" || out.Description != "first" || out.Upstream != "up" {
+			t.Fatalf("set current version: %+v, %v", out, err)
+		}
+		if n := auditCount(t, st, "test"); n != events+1 {
+			t.Fatalf("audit events: %d", n-events)
+		}
+		if s, c, d := latest(); s != "sha-a" || c != "sha-a" || d != "first" {
+			t.Fatalf("after going back: latest = %s / %s (%s)", s, c, d)
+		}
+		if got, _ := st.GetSkill(ctx, "org.site", "tool"); got.CurrentVersion != "sha-a" {
+			t.Fatalf("stored skill = %+v", got)
+		}
+		if vs, _ := st.ListVersions(ctx, sk.ID); len(vs) != 2 || vs[0].Version != "sha-b" {
+			t.Fatalf("the version history changed: %+v", vs)
+		}
+		if _, err := st.SetSkillCurrentVersion(ctx, sk.ID, "sha-zz", audit); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a version that is not recorded: %v", err)
+		}
+		if _, err := st.SetSkillCurrentVersion(ctx, sk.ID+1000, "sha-a", audit); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a skill that does not exist: %v", err)
+		}
+		// A change of the upstream's settings stops it like any mirror write.
+		changed, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{NamespaceDeny: &[]string{"org.other"}}, audit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.SetSkillCurrentVersion(model.WithUpstreamGuard(ctx, up.ID, up.ConfigVersion), sk.ID, "sha-b", audit); conflictCode(err) != "upstream_config_changed" {
+			t.Fatalf("under settings that changed: %v", err)
+		}
+		up = changed
+		// A yanked current version is not presented.
+		vs, _ := st.ListVersions(ctx, sk.ID)
+		if err := st.YankVersion(ctx, vs[1].ID, "bad", time.Now(), audit); err != nil {
+			t.Fatal(err)
+		}
+		if s, c, _ := latest(); s != "sha-b" || c != "sha-b" {
+			t.Fatalf("with the current version yanked: latest = %s / %s", s, c)
+		}
+		// A new version is the latest again.
+		put("sha-c", "third")
+		if got, _ := st.GetSkill(ctx, "org.site", "tool"); got.CurrentVersion != "" {
+			t.Fatalf("publishing kept the current version: %+v", got)
+		}
+		if s, c, d := latest(); s != "sha-c" || c != "sha-c" || d != "third" {
+			t.Fatalf("after a new version: latest = %s / %s (%s)", s, c, d)
+		}
+	}},
 	{"every mirrored entry can be enumerated", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		up, other := newUpstream(t, st, "up"), newUpstream(t, st, "other")

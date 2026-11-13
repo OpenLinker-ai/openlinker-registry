@@ -139,9 +139,38 @@ type Skill struct {
 	GlobalAlias  string // empty when unset
 	// Upstream is the name of the upstream that manages the namespace ("" for
 	// local entries). Read-only.
-	Upstream  string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Upstream string
+	// CurrentVersion is the version the skill's source names as its current
+	// one, when that is not simply the newest ("" otherwise). A discovery
+	// index that returns to earlier content names a version recorded before
+	// the newest one. See LatestVersion.
+	CurrentVersion string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// LatestVersion picks the version a skill presents as its latest: the one
+// its source names as current (Skill.CurrentVersion) unless that is yanked
+// or missing, else the newest version that is not yanked. versions is
+// newest first.
+func LatestVersion(current string, versions []Version) (Version, bool) {
+	var newest *Version
+	for i := range versions {
+		v := &versions[i]
+		if v.YankedAt != nil {
+			continue
+		}
+		if current != "" && v.Version == current {
+			return *v, true
+		}
+		if newest == nil {
+			newest = v
+		}
+	}
+	if newest == nil {
+		return Version{}, false
+	}
+	return *newest, true
 }
 
 // Source describes where hosted bytes came from.
@@ -305,7 +334,9 @@ type PublishInput struct {
 	// concurrent refreshes cannot interleave and leave versions out of the
 	// upstream's order; a mismatch is ConflictError version_order.
 	ExpectNewest *string
-	Version      Version
+	// A published version becomes the skill's latest: publishing clears
+	// Skill.CurrentVersion.
+	Version Version
 }
 
 // SkillPatch updates mutable skill settings.

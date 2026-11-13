@@ -441,7 +441,7 @@ func (s *Service) forwardMCPTo(ctx context.Context, u model.Upstream, name, vers
 		// the whole server: look, so that it does not stay readable here
 		// until a sync that may never be scheduled.
 		if srv, lerr := s.Store.GetMCPServer(ctx, name); lerr == nil && srv.Upstream == u.Name {
-			if _, rerr := s.refreshMCPServerLocked(ctx, u, c, name, syncStats{}); rerr != nil && !isUpstreamError(rerr) {
+			if _, rerr := s.refreshMCPServerLocked(ctx, u, c, name, syncStats{}); rerr != nil && !isUpstreamError(rerr) && !errors.Is(rerr, errUnconfirmed) {
 				return false, rerr
 			}
 		}

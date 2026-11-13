@@ -299,7 +299,7 @@ func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audi
 	v.ID, v.SkillID, v.CreatedAt, v.Mode = m.id(), s.ID, now, in.Mode
 	v.Files = slices.Clone(v.Files)
 	m.versions[v.ID] = v
-	s.Description, s.UpdatedAt = v.FrontmatterDescription, now
+	s.Description, s.CurrentVersion, s.UpdatedAt = v.FrontmatterDescription, "", now
 	m.skills[s.ID] = s
 	m.appendAudit(audit)
 	return m.withUpstream(s), v, nil
@@ -324,12 +324,7 @@ func (m *Memory) versionsOf(skillID int64) []model.Version {
 }
 
 func (m *Memory) latest(skillID int64) (model.Version, bool) {
-	for _, v := range m.versionsOf(skillID) {
-		if v.YankedAt == nil {
-			return v, true
-		}
-	}
-	return model.Version{}, false
+	return model.LatestVersion(m.skills[skillID].CurrentVersion, m.versionsOf(skillID))
 }
 
 // GetVersion implements Store.
@@ -392,6 +387,28 @@ func (m *Memory) SetSkillStatus(ctx context.Context, skillID int64, status, reas
 	m.skills[skillID] = s
 	m.appendAudit(audit)
 	return m.withUpstream(s), nil
+}
+
+// SetSkillCurrentVersion implements Store.
+func (m *Memory) SetSkillCurrentVersion(ctx context.Context, skillID int64, version string, audit model.AuditEvent) (model.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, err
+	}
+	s, ok := m.skills[skillID]
+	if !ok {
+		return model.Skill{}, model.ErrNotFound
+	}
+	for _, v := range m.versionsOf(skillID) {
+		if v.Version == version {
+			s.CurrentVersion, s.Description, s.UpdatedAt = version, v.FrontmatterDescription, time.Now().UTC()
+			m.skills[skillID] = s
+			m.appendAudit(audit)
+			return m.withUpstream(s), nil
+		}
+	}
+	return model.Skill{}, model.ErrNotFound
 }
 
 // SetAlias implements Store.
