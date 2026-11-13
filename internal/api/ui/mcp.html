@@ -1,0 +1,23 @@
+{{define "mcp"}}{{template "head" .}}
+<h1>{{.T "mcp.title"}}</h1>
+<form class="search" method="get" action="{{.Base}}/ui/mcp">
+  <input type="search" name="q" value="{{.Query}}" placeholder="{{.T "search.placeholder"}}" maxlength="200">
+  <button type="submit">{{.T "search"}}</button>
+</form>
+{{if .Data.Rows}}
+<table>
+<thead><tr><th>{{.T "col.name"}}</th><th>{{.T "col.description"}}</th><th>{{.T "col.kind"}}</th><th>{{.T "col.version"}}</th></tr></thead>
+<tbody>
+{{range .Data.Rows}}<tr>
+  <td><a href="{{$.Base}}/ui/mcp/{{.Path}}">{{.Server.Name}}</a>{{if .Title}}<br><span class="muted">{{.Title}}</span>{{end}}
+    {{if ne .Version.Status "active"}}{{template "status" .Version.Status}}{{end}}</td>
+  <td>{{.Description}}</td>
+  <td>{{if eq .Server.Mode "mirrored"}}<span class="tag">{{$.T "kind.mirrored"}} · {{.Server.Upstream}}</span>{{else if eq .Server.Mode "registered"}}<span class="tag ok">{{$.T "kind.registered"}}</span>{{else}}<span class="tag">{{$.T "kind.indexed"}}</span>{{end}}
+    {{if ne .Server.Visibility "public"}}<span class="tag">{{.Server.Visibility}}</span>{{end}}</td>
+  <td class="mono">{{.Version.Version}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{if .Data.Next}}<p><a class="button" href="{{.Data.Next}}">{{.T "next"}}</a></p>{{end}}
+{{else}}<p class="empty">{{.T "mcp.empty"}}</p>{{end}}
+{{template "foot" .}}{{end}}

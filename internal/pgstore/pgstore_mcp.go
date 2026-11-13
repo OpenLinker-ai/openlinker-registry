@@ -1,0 +1,482 @@
+package pgstore
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
+)
+
+const mcpServerCols = `m.id, n.name, m.name, m.mode, m.visibility, m.listed, COALESCE(u.name, ''), m.created_by,
+	m.created_at, m.updated_at`
+
+// mcpServerFrom joins what mcpServerCols reads: the namespace and, for an
+// upstream-managed namespace, its upstream.
+const mcpServerFrom = ` FROM mcp_servers m JOIN namespaces n ON n.id = m.namespace_id
+	LEFT JOIN upstreams u ON u.id = n.upstream_id `
+
+const mcpVersionCols = `v.id, v.server_id, v.version, v.server_json, v.digest, v.status, v.status_message,
+	v.status_changed_at, v.published_at, v.updated_at, v.is_latest, v.created_by`
+
+func mcpServerDest(s *model.MCPServer) []any {
+	return []any{&s.ID, &s.Namespace, &s.Name, &s.Mode, &s.Visibility, &s.Listed, &s.Upstream, &s.CreatedBy,
+		&s.CreatedAt, &s.UpdatedAt}
+}
+
+func mcpVersionDest(v *model.MCPVersion) []any {
+	return []any{&v.ID, &v.ServerID, &v.Version, (*[]byte)(&v.ServerJSON), &v.Digest, &v.Status, &v.StatusMessage,
+		&v.StatusChangedAt, &v.PublishedAt, &v.UpdatedAt, &v.IsLatest, &v.CreatedBy}
+}
+
+func scanMCPServer(row pgx.Row) (model.MCPServer, error) {
+	var s model.MCPServer
+	err := row.Scan(mcpServerDest(&s)...)
+	return s, err
+}
+
+func scanMCPVersion(row pgx.Row) (model.MCPVersion, error) {
+	var v model.MCPVersion
+	err := row.Scan(mcpVersionDest(&v)...)
+	return v, err
+}
+
+func errServerName() error {
+	return conflict("server_name_conflict", "another server already uses this name")
+}
+
+// timeOrNil encodes a zero time as NULL so the statement can default it.
+func timeOrNil(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// lockMCPServer returns the server holding this name in any letter case with
+// its row locked, creating it from the given settings when there is none (a
+// concurrent creator wins the insert and its row is returned). Every version
+// write and IsLatest decision of a server happens under this lock. nsID is
+// the namespace of the returned server, which the caller must compare with
+// its own along with the exact name and mode.
+func lockMCPServer(ctx context.Context, tx pgx.Tx, create model.MCPServer, createNS int64) (srv model.MCPServer, nsID int64, created bool, err error) {
+	sel := `SELECT ` + mcpServerCols + `, m.namespace_id` + mcpServerFrom + `WHERE lower(m.name) = lower($1) FOR UPDATE OF m`
+	dest := append(mcpServerDest(&srv), &nsID)
+	err = tx.QueryRow(ctx, sel, create.Name).Scan(dest...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		tag, ierr := tx.Exec(ctx, `INSERT INTO mcp_servers (namespace_id, name, mode, visibility, listed, created_by)
+			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (lower(name)) DO NOTHING`,
+			createNS, create.Name, create.Mode, create.Visibility, create.Listed, create.CreatedBy)
+		if ierr != nil {
+			return srv, 0, false, ierr
+		}
+		created = tag.RowsAffected() == 1
+		err = tx.QueryRow(ctx, sel, create.Name).Scan(dest...)
+	}
+	return srv, nsID, created, err
+}
+
+// clearMCPLatest drops IsLatest from every version of the server except
+// keepID. The partial unique index allows one latest row per server, so this
+// runs before another row takes the flag. The cleared rows are stamped
+// because readers that sync incrementally by updated_at must see the flip.
+func clearMCPLatest(ctx context.Context, tx pgx.Tx, serverID, keepID int64, at *time.Time) error {
+	_, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET is_latest = false, updated_at = COALESCE($3, now())
+		WHERE server_id = $1 AND is_latest AND id <> $2`, serverID, keepID, at)
+	return err
+}
+
+// PublishMCPVersion implements store.Store.
+func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput, audit model.AuditEvent) (model.MCPServer, model.MCPVersion, error) {
+	var srv model.MCPServer
+	var ver model.MCPVersion
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		var nsID, nsUpstream int64
+		if err := tx.QueryRow(ctx, `SELECT id, COALESCE(upstream_id, 0) FROM namespaces WHERE name = $1`, in.Namespace).
+			Scan(&nsID, &nsUpstream); err != nil {
+			return notFound(err)
+		}
+		if nsUpstream != 0 {
+			return model.ErrNamespaceManaged()
+		}
+		var srvNS int64
+		var err error
+		srv, srvNS, _, err = lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
+			Listed: in.Listed, CreatedBy: in.Version.CreatedBy}, nsID)
+		if err != nil {
+			return err
+		}
+		switch {
+		case srv.Name != in.Name:
+			return errServerName()
+		case srv.Mode != in.Mode:
+			return conflict("mode_mismatch", "server exists with a different mode")
+		case srvNS != nsID:
+			return errServerName()
+		}
+		// Under the server lock: the new version takes the flag unless the
+		// current latest is a higher semantic version.
+		var curVersion string
+		err = tx.QueryRow(ctx, `SELECT version FROM mcp_server_versions WHERE server_id = $1 AND is_latest`, srv.ID).Scan(&curVersion)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		latest := err != nil || model.CompareVersions(in.Version.Version, curVersion) >= 0
+		if latest {
+			if err := clearMCPLatest(ctx, tx, srv.ID, 0, nil); err != nil {
+				return err
+			}
+		}
+		title, description := store.MCPSearchText(in.Version.ServerJSON)
+		ver, err = scanMCPVersion(tx.QueryRow(ctx, `INSERT INTO mcp_server_versions AS v (server_id, version, server_json, digest,
+			status_changed_at, published_at, updated_at, is_latest, created_by, title, description)
+			VALUES ($1, $2, $3, $4, COALESCE($5, now()), COALESCE($5, now()), COALESCE($5, now()), $6, $7, $8, $9)
+			RETURNING `+mcpVersionCols,
+			srv.ID, in.Version.Version, string(in.Version.ServerJSON), in.Version.Digest, timeOrNil(in.Version.PublishedAt),
+			latest, in.Version.CreatedBy, title, description))
+		if c, ok := uniqueViolation(err); ok && c != "mcp_server_versions_latest_key" {
+			return conflict("version_exists", "version already exists and is immutable")
+		}
+		if err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `UPDATE mcp_servers SET updated_at = now() WHERE id = $1 RETURNING updated_at`, srv.ID).Scan(&srv.UpdatedAt)
+	})
+	if err != nil {
+		return model.MCPServer{}, model.MCPVersion{}, err
+	}
+	return srv, ver, nil
+}
+
+// UpsertMirroredMCP implements store.Store.
+func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error) {
+	v := in.Version
+	status, message := v.Status, v.StatusMessage
+	if status == model.MCPStatusActive {
+		message = ""
+	}
+	latest := v.IsLatest && status != model.MCPStatusDeleted
+	outcome, stale := model.MirrorUnchanged, false
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := contextGuard(ctx, tx); err != nil {
+			return err
+		}
+		if in.StatusOnly {
+			// Ask the guard for the widest visibility the upstream allows.
+			in.Visibility = model.VisibilityPublic
+		}
+		visibility, err := mirrorGuard(ctx, tx, in.UpstreamID, in.ConfigVersion, in.Visibility)
+		if err != nil {
+			return err
+		}
+		in.Visibility = visibility
+		ns, err := ensureUpstreamNS(ctx, tx, in.Namespace, in.UpstreamID, model.AuditEvent{Actor: audit.Actor,
+			Action: "namespace.mirror", Namespace: in.Namespace, Details: map[string]any{"upstream_id": in.UpstreamID}})
+		if err != nil {
+			return err
+		}
+		srv, srvNS, created, err := lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: model.MCPModeMirrored,
+			Visibility: in.Visibility, Listed: in.Listed, CreatedBy: v.CreatedBy}, ns.ID)
+		if err != nil {
+			return err
+		}
+		if srv.Name != in.Name || srv.Mode != model.MCPModeMirrored || srvNS != ns.ID {
+			return errServerName()
+		}
+		if in.StatusOnly {
+			if created {
+				return model.ErrNotFound // rolls the new server back
+			}
+			// The server row is locked: its settings are the current ones,
+			// and they stay (never wider than the upstream allows).
+			in.Visibility, in.Listed = model.NarrowerVisibility(srv.Visibility, in.Visibility), srv.Listed
+		}
+		// A document that is not fresh may only narrow who sees an existing
+		// server; a widening is withheld and reported.
+		if !created && !in.Fresh {
+			vis, listed := model.NarrowerVisibility(srv.Visibility, in.Visibility), srv.Listed && in.Listed
+			stale = vis != in.Visibility || listed != in.Listed
+			in.Visibility, in.Listed = vis, listed
+		}
+		var cur model.MCPVersion
+		err = tx.QueryRow(ctx, `SELECT id, digest, status, status_message, is_latest FROM mcp_server_versions
+			WHERE server_id = $1 AND version = $2`, srv.ID, v.Version).
+			Scan(&cur.ID, &cur.Digest, &cur.Status, &cur.StatusMessage, &cur.IsLatest)
+		missing := errors.Is(err, pgx.ErrNoRows)
+		if err != nil && !missing {
+			return err
+		}
+		if missing && in.StatusOnly {
+			return model.ErrNotFound
+		}
+		if !missing && cur.Digest != v.Digest {
+			return conflict("digest_mismatch", "the stored version has a different server.json")
+		}
+		// The upstream's visibility and listing apply to an existing server
+		// too, together with the version (a server created just above already
+		// has them).
+		settings := srv.Visibility != in.Visibility || srv.Listed != in.Listed
+		if settings {
+			if err := setMCPSettings(ctx, tx, srv.ID, &in.Visibility, &in.Listed); err != nil {
+				return err
+			}
+		}
+		same := !missing && cur.Status == status && cur.StatusMessage == message && cur.IsLatest == latest
+		if !missing && !same && !in.Fresh {
+			// Nor may it change the state of a version that is already here.
+			stale, same = true, true
+		}
+		if same {
+			if !settings {
+				return nil
+			}
+			outcome = model.MirrorUpdated
+			return insertAudit(ctx, tx, audit)
+		}
+		if missing && !created && !in.Fresh && latest {
+			// Nor may a version it adds take "latest" away from one that
+			// is already here: a fresh read may have recorded a newer one.
+			var taken bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM mcp_server_versions WHERE server_id = $1 AND is_latest)`,
+				srv.ID).Scan(&taken); err != nil {
+				return err
+			}
+			if taken {
+				stale, latest = true, false
+			}
+		}
+		if latest {
+			if err := clearMCPLatest(ctx, tx, srv.ID, cur.ID, nil); err != nil {
+				return err
+			}
+		}
+		if !missing {
+			outcome = model.MirrorUpdated
+			_, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET status = $2, status_message = $3, is_latest = $4,
+				status_changed_at = COALESCE($5, now()), updated_at = COALESCE($6, now()) WHERE id = $1`,
+				cur.ID, status, message, latest, timeOrNil(v.StatusChangedAt), timeOrNil(v.UpdatedAt))
+			if err != nil {
+				return err
+			}
+			return insertAudit(ctx, tx, audit)
+		}
+		outcome = model.MirrorCreated
+		title, description := store.MCPSearchText(v.ServerJSON)
+		if _, err := tx.Exec(ctx, `INSERT INTO mcp_server_versions (server_id, version, server_json, digest, status,
+			status_message, status_changed_at, published_at, updated_at, is_latest, created_by, title, description)
+			VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, now()), COALESCE($9, now()), $10, $11, $12, $13)`,
+			srv.ID, v.Version, string(v.ServerJSON), v.Digest, status, message, timeOrNil(v.StatusChangedAt),
+			timeOrNil(v.PublishedAt), timeOrNil(v.UpdatedAt), latest, v.CreatedBy, title, description); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE mcp_servers SET updated_at = now() WHERE id = $1`, srv.ID); err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, audit)
+	})
+	if err != nil {
+		return "", err
+	}
+	if stale {
+		return model.MirrorStale, nil
+	}
+	return outcome, nil
+}
+
+// GetMCPServer implements store.Store. The lower(name) condition only
+// selects the unique index; the match itself is exact.
+func (s *Store) GetMCPServer(ctx context.Context, name string) (model.MCPServer, error) {
+	srv, err := scanMCPServer(s.pool.QueryRow(ctx, `SELECT `+mcpServerCols+mcpServerFrom+
+		`WHERE lower(m.name) = lower($1) AND m.name = $1`, name))
+	if err != nil {
+		return model.MCPServer{}, notFound(err)
+	}
+	return srv, nil
+}
+
+// GetMCPVersion implements store.Store.
+func (s *Store) GetMCPVersion(ctx context.Context, serverID int64, version string) (model.MCPVersion, error) {
+	sql, args := `SELECT `+mcpVersionCols+` FROM mcp_server_versions v WHERE v.server_id = $1 AND v.version = $2`, []any{serverID, version}
+	if version == "latest" {
+		sql, args = `SELECT `+mcpVersionCols+` FROM mcp_server_versions v WHERE v.server_id = $1 AND v.is_latest`, args[:1]
+	}
+	v, err := scanMCPVersion(s.pool.QueryRow(ctx, sql, args...))
+	if err != nil {
+		return model.MCPVersion{}, notFound(err)
+	}
+	return v, nil
+}
+
+// ListMCPVersions implements store.Store (newest first).
+func (s *Store) ListMCPVersions(ctx context.Context, serverID int64) ([]model.MCPVersion, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+mcpVersionCols+` FROM mcp_server_versions v WHERE v.server_id = $1
+		ORDER BY v.published_at DESC, v.id DESC`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPVersion, error) { return scanMCPVersion(row) })
+}
+
+// SetMCPStatus implements store.Store.
+func (s *Store) SetMCPStatus(ctx context.Context, serverID int64, version, status, message string, at time.Time, audit model.AuditEvent) (int, error) {
+	if status == model.MCPStatusActive {
+		message = ""
+	}
+	var changed int
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT true FROM mcp_servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&exists); err != nil {
+			return notFound(err)
+		}
+		if version != "" {
+			if err := tx.QueryRow(ctx, `SELECT true FROM mcp_server_versions WHERE server_id = $1 AND version = $2`,
+				serverID, version).Scan(&exists); err != nil {
+				return notFound(err)
+			}
+		}
+		// A deleted version may not keep the flag (schema CHECK), so it
+		// drops in the same statement; the flag is reassigned below.
+		tag, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET status = $3, status_message = $4, status_changed_at = $5,
+			updated_at = $5, is_latest = is_latest AND $3 <> 'deleted'
+			WHERE server_id = $1 AND ($2::text = '' OR version = $2) AND (status <> $3 OR status_message <> $4)`,
+			serverID, version, status, message, at)
+		if err != nil {
+			return err
+		}
+		changed = int(tag.RowsAffected())
+
+		rows, err := tx.Query(ctx, `SELECT id, version, published_at FROM mcp_server_versions
+			WHERE server_id = $1 AND status <> 'deleted'`, serverID)
+		if err != nil {
+			return err
+		}
+		live, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPVersion, error) {
+			var v model.MCPVersion
+			err := row.Scan(&v.ID, &v.Version, &v.PublishedAt)
+			return v, err
+		})
+		if err != nil {
+			return err
+		}
+		latest, ok := store.LatestMCPVersion(live)
+		if err := clearMCPLatest(ctx, tx, serverID, latest, &at); err != nil {
+			return err
+		}
+		if ok {
+			_, err = tx.Exec(ctx, `UPDATE mcp_server_versions SET is_latest = true, updated_at = $2 WHERE id = $1 AND NOT is_latest`, latest, at)
+		}
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return changed, nil
+}
+
+// UpdateMCPServer implements store.Store.
+func (s *Store) UpdateMCPServer(ctx context.Context, serverID int64, p model.MCPPatch, audit model.AuditEvent) (model.MCPServer, error) {
+	var out model.MCPServer
+	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		if err := setMCPSettings(ctx, tx, serverID, p.Visibility, p.Listed); err != nil {
+			return err
+		}
+		var err error
+		out, err = scanMCPServer(tx.QueryRow(ctx, `SELECT `+mcpServerCols+mcpServerFrom+`WHERE m.id = $1`, serverID))
+		return err
+	})
+	if err != nil {
+		return model.MCPServer{}, err
+	}
+	return out, nil
+}
+
+// SearchMCP implements store.Store. Ordering and the cursor use the "C"
+// collation: byte order, identical to the in-memory store and independent of
+// the database locale.
+func (s *Store) SearchMCP(ctx context.Context, q model.MCPQuery) ([]model.MCPEntry, error) {
+	where := []string{"m.listed"}
+	args := []any{}
+	arg := func(v any) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
+	if vis := visibleSQL("m.visibility", q.Viewer, arg); vis != "" {
+		where = append(where, vis)
+	}
+	if q.Search != "" {
+		p := arg("%" + likeEscape(strings.ToLower(q.Search)) + "%")
+		where = append(where, "(lower(m.name) LIKE "+p+" OR lower(v.title) LIKE "+p+" OR lower(v.description) LIKE "+p+")")
+	}
+	if q.Namespace != "" {
+		where = append(where, "n.name = "+arg(q.Namespace))
+	}
+	if q.Mode != "" {
+		where = append(where, "m.mode = "+arg(q.Mode))
+	}
+	switch q.Version {
+	case "":
+	case "latest":
+		where = append(where, "v.is_latest")
+	default:
+		where = append(where, "v.version = "+arg(q.Version))
+	}
+	if q.UpdatedSince != nil {
+		where = append(where, "v.updated_at >= "+arg(*q.UpdatedSince))
+	}
+	if !q.IncludeDeleted {
+		where = append(where, "v.status <> 'deleted'")
+	}
+	if q.AfterName != "" {
+		where = append(where, `(m.name COLLATE "C", v.version COLLATE "C") > (`+arg(q.AfterName)+", "+arg(q.AfterVersion)+")")
+	}
+	sql := `SELECT ` + mcpServerCols + `, ` + mcpVersionCols + mcpServerFrom + `JOIN mcp_server_versions v ON v.server_id = m.id
+		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY m.name COLLATE "C", v.version COLLATE "C"`
+	if q.Limit > 0 {
+		sql += " LIMIT " + arg(q.Limit)
+	}
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPEntry, error) {
+		var e model.MCPEntry
+		err := row.Scan(append(mcpServerDest(&e.Server), mcpVersionDest(&e.Version)...)...)
+		return e, err
+	})
+}
+
+// setMCPSettings changes visibility and listing of a server. When either
+// really changes, every version is stamped: who may see the server changes
+// what each version's listing entry says, and readers that sync
+// incrementally by updated_at must see it.
+func setMCPSettings(ctx context.Context, tx pgx.Tx, serverID int64, visibility *string, listed *bool) error {
+	var changed bool
+	err := tx.QueryRow(ctx, `UPDATE mcp_servers m SET visibility = COALESCE($2, m.visibility), listed = COALESCE($3, m.listed),
+		updated_at = now() FROM mcp_servers old WHERE m.id = $1 AND old.id = m.id
+		RETURNING (m.visibility, m.listed) IS DISTINCT FROM (old.visibility, old.listed)`, serverID, visibility, listed).Scan(&changed)
+	if err != nil {
+		return notFound(err)
+	}
+	if changed {
+		_, err = tx.Exec(ctx, `UPDATE mcp_server_versions SET updated_at = now() WHERE server_id = $1`, serverID)
+	}
+	return err
+}
+
+// ListMirroredMCP implements store.Store.
+func (s *Store) ListMirroredMCP(ctx context.Context, upstreamID int64, afterName string, limit int) ([]model.MCPServer, error) {
+	sql := `SELECT ` + mcpServerCols + mcpServerFrom + `WHERE n.upstream_id = $1 AND m.name COLLATE "C" > $2
+		ORDER BY m.name COLLATE "C"`
+	args := []any{upstreamID, afterName}
+	if limit > 0 {
+		sql += " LIMIT $3"
+		args = append(args, limit)
+	}
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPServer, error) { return scanMCPServer(row) })
+}

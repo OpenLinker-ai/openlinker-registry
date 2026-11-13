@@ -40,6 +40,12 @@ const (
 	NSKindDomain     = "domain"     // reverse DNS, verification not implemented in R1
 )
 
+// ValidNamespaceName reports whether name has the namespace syntax (lowercase
+// reverse-DNS labels, at most 128 bytes), whatever its kind.
+func ValidNamespaceName(name string) bool {
+	return len(name) <= 128 && namespaceRe.MatchString(name)
+}
+
 // NamespaceError describes why a namespace name was rejected.
 type NamespaceError struct{ Msg string }
 
@@ -48,7 +54,7 @@ func (e *NamespaceError) Error() string { return e.Msg }
 // ValidateNamespace checks the reverse-DNS name syntax and that the name is
 // consistent with its kind and the instance mode ("public" or "private").
 func ValidateNamespace(name, kind, mode string) error {
-	if len(name) > 128 || !namespaceRe.MatchString(name) {
+	if !ValidNamespaceName(name) {
 		return &NamespaceError{"namespace must be lowercase reverse-DNS labels, e.g. io.github.alice"}
 	}
 	labels := strings.Split(name, ".")

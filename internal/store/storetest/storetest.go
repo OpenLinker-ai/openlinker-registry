@@ -35,6 +35,51 @@ func isPolicy(err error) bool {
 	return errors.As(err, &pe) && pe.Code == model.CodeLicenseRequired
 }
 
+// conflictCode is the code of a ConflictError, "" for any other error.
+func conflictCode(err error) string {
+	var ce *model.ConflictError
+	if errors.As(err, &ce) {
+		return ce.Code
+	}
+	return ""
+}
+
+// policyCode is the code of a PolicyError, "" for any other error.
+func policyCode(err error) string {
+	var pe *model.PolicyError
+	if errors.As(err, &pe) {
+		return pe.Code
+	}
+	return ""
+}
+
+// sameTime compares at the precision every store keeps (microseconds).
+func sameTime(a, b time.Time) bool {
+	return a.Truncate(time.Microsecond).Equal(b.Truncate(time.Microsecond))
+}
+
+// parallel runs f n times concurrently and returns the errors by index.
+func parallel(n int, f func(i int) error) []error {
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = f(i)
+		}()
+	}
+	wg.Wait()
+	return errs
+}
+
+// testCase is one conformance test; run receives a store that holds only the
+// local namespace com.example.
+type testCase struct {
+	name string
+	run  func(t *testing.T, st store.Store)
+}
+
 // Run executes the conformance tests; newStore must return an empty store.
 func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	setup := func(t *testing.T) store.Store {
@@ -148,4 +193,10 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 			}
 		}
 	})
+
+	for _, cases := range [][]testCase{namespaceTests, mcpTests, upstreamTests, auditTests, mirrorTests} {
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) { c.run(t, setup(t)) })
+		}
+	}
 }

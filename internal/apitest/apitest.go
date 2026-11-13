@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,7 +30,9 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/blobstore"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/github"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/github/githubtest"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/ratelimit"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/registry"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/safehttp"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
 )
@@ -57,12 +60,37 @@ type Env struct {
 	BlobDir string
 	Base    string
 	Svc     *registry.Service
+	// Headers are added to every request sent with Do.
+	Headers map[string]string
 }
+
+// noRedirect reports redirects instead of following them.
+var noRedirect = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 // Options tweak the environment.
 type Options struct {
 	Mode          string
 	AllowAnonRead bool
+	// UI serves the built-in pages.
+	UI bool
+	// Loopback lets the instance reach upstreams on this machine over http
+	// (other test registries). Without it the production outbound policy
+	// applies.
+	Loopback bool
+	// UpstreamTokens are bearer tokens by upstream name.
+	UpstreamTokens map[string]string
+	// ForwardPerMinute limits forwarded misses per client (0 = unlimited).
+	ForwardPerMinute int
+	// ReadPerMinute limits reads per client (0 = unlimited).
+	ReadPerMinute int
+	// AuthFailuresPerMinute limits failed authentications per address.
+	AuthFailuresPerMinute int
+	// RealPublicURL makes the instance publish URLs that point at the test
+	// server instead of the fixed PublicURL, so other instances can fetch them.
+	RealPublicURL bool
+	// VerifyInterval overrides how long verified indexed content is served
+	// from the cache (default one hour; negative means verify every read).
+	VerifyInterval time.Duration
 }
 
 // NewEnv starts a registry over st.
@@ -91,11 +119,27 @@ func NewEnv(t *testing.T, st store.Store, o Options) *Env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := registry.New(st, blobs, gh, registry.Config{Mode: o.Mode, AllowPublic: true, PublicURL: PublicURL, VerifyInterval: time.Hour})
+	var policy safehttp.Policy
+	if o.Loopback {
+		policy = safehttp.Policy{AllowHTTP: true, AllowCIDRs: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")}}
+	}
+	verify := time.Hour
+	if o.VerifyInterval != 0 {
+		verify = max(o.VerifyInterval, 0)
+	}
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := registry.New(st, blobs, gh, registry.Config{Mode: o.Mode, AllowPublic: true, PublicURL: PublicURL, VerifyInterval: verify,
+		UpstreamPolicy: policy, UpstreamToken: func(name string) string { return o.UpstreamTokens[name] }})
+	svc.Log = quiet
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, AdminToken), BasePath: "/registry",
-		AllowAnonRead: o.AllowAnonRead, MaxUploadBytes: 4 << 20, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		AllowAnonRead: o.AllowAnonRead, MaxUploadBytes: 4 << 20, Log: quiet, UI: o.UI,
+		ForwardLimit: ratelimit.New(o.ForwardPerMinute), ReadLimit: ratelimit.New(o.ReadPerMinute),
+		AuthFailLimit: ratelimit.New(o.AuthFailuresPerMinute)}
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(hs.Close)
+	if o.RealPublicURL {
+		svc.Cfg.PublicURL = hs.URL + "/registry"
+	}
 	return &Env{T: t, Srv: hs, Fake: f, Store: st, BlobDir: dir, Base: hs.URL + "/registry", Svc: svc}
 }
 
@@ -131,7 +175,10 @@ func (e *Env) Do(method, path, token, contentType string, body any) Resp {
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	res, err := http.DefaultClient.Do(req)
+	for k, v := range e.Headers {
+		req.Header.Set(k, v)
+	}
+	res, err := noRedirect.Do(req)
 	if err != nil {
 		e.T.Fatal(err)
 	}
@@ -174,6 +221,10 @@ var digestRe = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("public instance", func(t *testing.T) { runPublic(t, NewEnv(t, newStore(t), Options{})) })
 	t.Run("private instance", func(t *testing.T) { runPrivate(t, NewEnv(t, newStore(t), Options{Mode: "private"})) })
+	t.Run("mcp servers", func(t *testing.T) { runMCP(t, NewEnv(t, newStore(t), Options{})) })
+	t.Run("upstreams", func(t *testing.T) { runUpstreams(t, newStore) })
+	t.Run("built-in pages", func(t *testing.T) { runUI(t, newStore) })
+	t.Run("hardening", func(t *testing.T) { runHardening(t, newStore) })
 }
 
 func runPublic(t *testing.T, e *Env) {

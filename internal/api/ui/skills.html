@@ -1,0 +1,28 @@
+{{define "skills"}}{{template "head" .}}
+<h1>{{.T "skills.title"}}</h1>
+<form class="search" method="get" action="{{.Base}}/ui/">
+  <input type="search" name="q" value="{{.Query}}" placeholder="{{.T "search.placeholder"}}" maxlength="200">
+  <select name="mode" aria-label="{{.T "col.kind"}}">
+    <option value="">{{.T "filter.all"}}</option>
+    <option value="hosted"{{if eq .Data.Mode "hosted"}} selected{{end}}>{{.T "kind.hosted"}}</option>
+    <option value="indexed"{{if eq .Data.Mode "indexed"}} selected{{end}}>{{.T "kind.indexed"}}</option>
+  </select>
+  <button type="submit">{{.T "search"}}</button>
+</form>
+{{if .Data.Rows}}
+<table>
+<thead><tr><th>{{.T "col.name"}}</th><th>{{.T "col.description"}}</th><th>{{.T "col.kind"}}</th><th>{{.T "col.version"}}</th></tr></thead>
+<tbody>
+{{range .Data.Rows}}<tr>
+  <td><a href="{{$.Base}}/ui/skills/{{esc .Namespace}}/{{esc .Name}}"><span class="muted">{{.Namespace}}/</span>{{.Name}}</a>
+    {{if ne .Status "active"}}{{template "status" .Status}}{{end}}</td>
+  <td>{{.Description}}</td>
+  <td>{{if .Upstream}}<span class="tag">{{$.T "kind.mirrored"}} · {{.Upstream}}</span>{{else if eq .Mode "hosted"}}<span class="tag ok">{{$.T "kind.hosted"}}</span>{{else}}<span class="tag">{{$.T "kind.indexed"}}</span>{{end}}
+    {{if ne .Visibility "public"}}<span class="tag">{{.Visibility}}</span>{{end}}</td>
+  <td class="mono">{{.LatestVersion}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{if .Data.Next}}<p><a class="button" href="{{.Data.Next}}">{{.T "next"}}</a></p>{{end}}
+{{else}}<p class="empty">{{.T "skills.empty"}}</p>{{end}}
+{{template "foot" .}}{{end}}

@@ -12,14 +12,19 @@ import (
 
 // Memory is an in-memory Store with the same semantics as the Postgres store.
 type Memory struct {
-	mu       sync.Mutex
-	nextID   int64
-	ns       map[string]model.Namespace
-	roles    map[string]map[string]model.Role // subject -> namespace -> role
-	tokens   map[string]model.Token
-	skills   map[int64]model.Skill
-	versions map[int64]model.Version
-	audit    []model.AuditEvent
+	mu        sync.Mutex
+	nextID    int64
+	ns        map[string]model.Namespace
+	roles     map[string]map[string]model.Role // subject -> namespace -> role
+	tokens    map[string]model.Token
+	tokenIDs  []string // creation order
+	skills    map[int64]model.Skill
+	versions  map[int64]model.Version
+	audit     []model.AuditEvent
+	locks     keyLocks
+	upstreams map[int64]model.Upstream
+	mcp       map[int64]model.MCPServer
+	mcpVers   map[int64]model.MCPVersion
 }
 
 // NewMemory returns an empty in-memory store.
@@ -27,6 +32,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		ns: map[string]model.Namespace{}, roles: map[string]map[string]model.Role{},
 		tokens: map[string]model.Token{}, skills: map[int64]model.Skill{}, versions: map[int64]model.Version{},
+		upstreams: map[int64]model.Upstream{}, mcp: map[int64]model.MCPServer{}, mcpVers: map[int64]model.MCPVersion{},
 	}
 }
 
@@ -39,8 +45,13 @@ func conflict(code, msg string) error { return &model.ConflictError{Code: code, 
 // Ping implements Store.
 func (m *Memory) Ping(context.Context) error { return nil }
 
-// CreateNamespace implements Store.
+// CreateNamespace implements Store. It only creates local namespaces;
+// upstream-managed ones come from EnsureUpstreamNamespace.
 func (m *Memory) CreateNamespace(_ context.Context, ns model.Namespace, audit model.AuditEvent) (model.Namespace, error) {
+	if ns.Kind == model.NSKindUpstream {
+		return model.Namespace{}, ErrNamespaceKind()
+	}
+	ns.UpstreamID = 0
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.ns[ns.Name]; ok {
@@ -70,12 +81,28 @@ func (m *Memory) GetNamespace(_ context.Context, name string) (model.Namespace, 
 	return ns, nil
 }
 
+// ListNamespaces implements Store.
+func (m *Memory) ListNamespaces(context.Context) ([]model.Namespace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]model.Namespace, 0, len(m.ns))
+	for _, ns := range m.ns {
+		out = append(out, ns)
+	}
+	slices.SortFunc(out, func(a, b model.Namespace) int { return strings.Compare(a.Name, b.Name) })
+	return out, nil
+}
+
 // SetRole implements Store.
 func (m *Memory) SetRole(_ context.Context, namespace, subject string, role model.Role, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.ns[namespace]; !ok {
+	ns, ok := m.ns[namespace]
+	if !ok {
 		return model.ErrNotFound
+	}
+	if ns.UpstreamID != 0 {
+		return model.ErrNamespaceManaged()
 	}
 	if m.roles[subject] == nil {
 		m.roles[subject] = map[string]model.Role{}
@@ -104,13 +131,18 @@ func (m *Memory) CreateToken(_ context.Context, t model.Token, roles []model.Rol
 		return conflict("token_exists", "token id collision")
 	}
 	for _, rb := range roles {
-		if _, ok := m.ns[rb.Namespace]; !ok {
+		ns, ok := m.ns[rb.Namespace]
+		if !ok {
 			return model.ErrNotFound
+		}
+		if ns.UpstreamID != 0 {
+			return model.ErrNamespaceManaged()
 		}
 	}
 	t.CreatedAt = time.Now().UTC()
 	t.Scopes = slices.Clone(t.Scopes)
 	m.tokens[t.ID] = t
+	m.tokenIDs = append(m.tokenIDs, t.ID)
 	subject := "token:" + t.ID
 	for _, rb := range roles {
 		if m.roles[subject] == nil {
@@ -133,6 +165,19 @@ func (m *Memory) GetToken(_ context.Context, id string) (model.Token, error) {
 	return t, nil
 }
 
+// ListTokens implements Store.
+func (m *Memory) ListTokens(context.Context) ([]model.Token, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]model.Token, 0, len(m.tokenIDs))
+	for _, id := range slices.Backward(m.tokenIDs) {
+		t := m.tokens[id]
+		t.SecretHash, t.Scopes = nil, slices.Clone(t.Scopes)
+		out = append(out, t)
+	}
+	return out, nil
+}
+
 // RevokeToken implements Store.
 func (m *Memory) RevokeToken(_ context.Context, id string, at time.Time, audit model.AuditEvent) error {
 	m.mu.Lock()
@@ -147,6 +192,13 @@ func (m *Memory) RevokeToken(_ context.Context, id string, at time.Time, audit m
 	}
 	m.appendAudit(audit)
 	return nil
+}
+
+// withUpstream fills the read-only Upstream field of a skill that is about to
+// leave the store; stored skills never carry it.
+func (m *Memory) withUpstream(s model.Skill) model.Skill {
+	s.Upstream = m.upstreamName(s.Namespace)
+	return s
 }
 
 func (m *Memory) findSkill(namespace, name string) (model.Skill, bool) {
@@ -166,15 +218,31 @@ func (m *Memory) GetSkill(_ context.Context, namespace, name string) (model.Skil
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
 	}
-	return s, nil
+	return m.withUpstream(s), nil
 }
 
 // PublishVersion implements Store.
-func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error) {
+func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.ns[in.Namespace]; !ok {
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, model.Version{}, err
+	}
+	ns, ok := m.ns[in.Namespace]
+	createNS := false
+	if in.UpstreamID != 0 {
+		if err := m.upstreamCurrent(in.UpstreamID, in.UpstreamConfigVersion); err != nil {
+			return model.Skill{}, model.Version{}, err
+		}
+		var err error
+		if ns, createNS, err = m.upstreamNS(in.Namespace, in.UpstreamID); err != nil {
+			return model.Skill{}, model.Version{}, err
+		}
+	} else if !ok {
 		return model.Skill{}, model.Version{}, model.ErrNotFound
+	}
+	if ns.UpstreamID != in.UpstreamID {
+		return model.Skill{}, model.Version{}, model.ErrNamespaceManaged()
 	}
 	now := time.Now().UTC()
 	s, ok := m.findSkill(in.Namespace, in.Name)
@@ -207,17 +275,34 @@ func (m *Memory) PublishVersion(_ context.Context, in model.PublishInput, audit 
 		if in.Mode == "hosted" && in.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
 			return model.Skill{}, model.Version{}, &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
 		}
-		s = model.Skill{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Visibility: in.Visibility, Listed: in.Listed,
+		s = model.Skill{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Visibility: m.mirrorVisibility(in.UpstreamID, in.Visibility), Listed: in.Listed,
 			Status: model.StatusActive, Mode: in.Mode, SourceKey: in.SourceKey, CreatedAt: now}
+	}
+	if in.ExpectNewest != nil {
+		newest := ""
+		if ok {
+			if vs := m.versionsOf(s.ID); len(vs) > 0 {
+				newest = vs[0].Version
+			}
+		}
+		if newest != *in.ExpectNewest {
+			return model.Skill{}, model.Version{}, conflict("version_order", "the newest version is not the expected one")
+		}
+	}
+	if createNS {
+		// Created last: by now nothing can refuse the publish any more.
+		m.createUpstreamNS(ns)
+		m.appendAudit(model.AuditEvent{Actor: audit.Actor, Action: "namespace.mirror", Namespace: in.Namespace,
+			Details: map[string]any{"upstream_id": in.UpstreamID}})
 	}
 	v := in.Version
 	v.ID, v.SkillID, v.CreatedAt, v.Mode = m.id(), s.ID, now, in.Mode
 	v.Files = slices.Clone(v.Files)
 	m.versions[v.ID] = v
-	s.Description, s.UpdatedAt = v.FrontmatterDescription, now
+	s.Description, s.CurrentVersion, s.UpdatedAt = v.FrontmatterDescription, "", now
 	m.skills[s.ID] = s
 	m.appendAudit(audit)
-	return s, v, nil
+	return m.withUpstream(s), v, nil
 }
 
 // ListVersions implements Store (newest first).
@@ -239,12 +324,7 @@ func (m *Memory) versionsOf(skillID int64) []model.Version {
 }
 
 func (m *Memory) latest(skillID int64) (model.Version, bool) {
-	for _, v := range m.versionsOf(skillID) {
-		if v.YankedAt == nil {
-			return v, true
-		}
-	}
-	return model.Version{}, false
+	return model.LatestVersion(m.skills[skillID].CurrentVersion, m.versionsOf(skillID))
 }
 
 // GetVersion implements Store.
@@ -260,9 +340,12 @@ func (m *Memory) GetVersion(_ context.Context, skillID int64, version string) (m
 }
 
 // UpdateSkill implements Store.
-func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
+func (m *Memory) UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, err
+	}
 	s, ok := m.skills[skillID]
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
@@ -275,7 +358,7 @@ func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatc
 		}
 	}
 	if p.Visibility != nil {
-		s.Visibility = *p.Visibility
+		s.Visibility = m.mirrorVisibility(m.ns[s.Namespace].UpstreamID, *p.Visibility)
 	}
 	if p.Listed != nil {
 		s.Listed = *p.Listed
@@ -283,13 +366,16 @@ func (m *Memory) UpdateSkill(_ context.Context, skillID int64, p model.SkillPatc
 	s.UpdatedAt = time.Now().UTC()
 	m.skills[skillID] = s
 	m.appendAudit(audit)
-	return s, nil
+	return m.withUpstream(s), nil
 }
 
 // SetSkillStatus implements Store.
-func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error) {
+func (m *Memory) SetSkillStatus(ctx context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, err
+	}
 	s, ok := m.skills[skillID]
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
@@ -300,7 +386,29 @@ func (m *Memory) SetSkillStatus(_ context.Context, skillID int64, status, reason
 	s.Status, s.StatusReason, s.UpdatedAt = status, reason, time.Now().UTC()
 	m.skills[skillID] = s
 	m.appendAudit(audit)
-	return s, nil
+	return m.withUpstream(s), nil
+}
+
+// SetSkillCurrentVersion implements Store.
+func (m *Memory) SetSkillCurrentVersion(ctx context.Context, skillID int64, version string, audit model.AuditEvent) (model.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return model.Skill{}, err
+	}
+	s, ok := m.skills[skillID]
+	if !ok {
+		return model.Skill{}, model.ErrNotFound
+	}
+	for _, v := range m.versionsOf(skillID) {
+		if v.Version == version {
+			s.CurrentVersion, s.Description, s.UpdatedAt = version, v.FrontmatterDescription, time.Now().UTC()
+			m.skills[skillID] = s
+			m.appendAudit(audit)
+			return m.withUpstream(s), nil
+		}
+	}
+	return model.Skill{}, model.ErrNotFound
 }
 
 // SetAlias implements Store.
@@ -324,9 +432,16 @@ func (m *Memory) SetAlias(_ context.Context, skillID int64, alias string, audit 
 	return nil
 }
 
-func (m *Memory) mutateVersion(id int64, audit *model.AuditEvent, f func(*model.Version)) error {
+func (m *Memory) mutateVersion(ctx context.Context, id int64, audit *model.AuditEvent, f func(*model.Version)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Audited mutations are the ones a mirror makes on purpose; recording a
+	// source check (no audit) is not one of them.
+	if audit != nil {
+		if err := m.guard(ctx); err != nil {
+			return err
+		}
+	}
 	v, ok := m.versions[id]
 	if !ok {
 		return model.ErrNotFound
@@ -339,9 +454,28 @@ func (m *Memory) mutateVersion(id int64, audit *model.AuditEvent, f func(*model.
 	return nil
 }
 
+// SetVersionLocatorURL implements Store.
+func (m *Memory) SetVersionLocatorURL(ctx context.Context, id int64, url string, audit model.AuditEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return err
+	}
+	v, ok := m.versions[id]
+	if !ok || v.Locator == nil || v.Locator.Kind != "url" {
+		return model.ErrNotFound
+	}
+	moved := *v.Locator
+	moved.URL = url
+	v.Locator = &moved
+	m.versions[id] = v
+	m.appendAudit(audit)
+	return nil
+}
+
 // YankVersion implements Store.
-func (m *Memory) YankVersion(_ context.Context, id int64, reason string, at time.Time, audit model.AuditEvent) error {
-	return m.mutateVersion(id, &audit, func(v *model.Version) {
+func (m *Memory) YankVersion(ctx context.Context, id int64, reason string, at time.Time, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) {
 		if v.YankedAt == nil {
 			v.YankedAt, v.YankReason = &at, reason
 		}
@@ -349,13 +483,13 @@ func (m *Memory) YankVersion(_ context.Context, id int64, reason string, at time
 }
 
 // ApproveLicense implements Store.
-func (m *Memory) ApproveLicense(_ context.Context, id int64, audit model.AuditEvent) error {
-	return m.mutateVersion(id, &audit, func(v *model.Version) { v.LicenseApproved = true })
+func (m *Memory) ApproveLicense(ctx context.Context, id int64, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.LicenseApproved = true })
 }
 
 // SetVersionCheck implements Store.
-func (m *Memory) SetVersionCheck(_ context.Context, id int64, result string, at time.Time) error {
-	return m.mutateVersion(id, nil, func(v *model.Version) { v.CheckResult, v.CheckedAt = result, &at })
+func (m *Memory) SetVersionCheck(ctx context.Context, id int64, result string, at time.Time) error {
+	return m.mutateVersion(ctx, id, nil, func(v *model.Version) { v.CheckResult, v.CheckedAt = result, &at })
 }
 
 // Search implements Store.
@@ -382,7 +516,7 @@ func (m *Memory) Search(_ context.Context, q model.SearchQuery) ([]model.SkillSu
 		if q.AfterNS != "" && (s.Namespace < q.AfterNS || s.Namespace == q.AfterNS && s.Name <= q.AfterName) {
 			continue
 		}
-		out = append(out, model.SkillSummary{Skill: s, LatestVersion: lv.Version})
+		out = append(out, model.SkillSummary{Skill: m.withUpstream(s), LatestVersion: lv.Version})
 	}
 	slices.SortFunc(out, func(a, b model.SkillSummary) int {
 		if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
@@ -409,7 +543,7 @@ func (m *Memory) IndexCandidates(_ context.Context, namespace string, aliasOnly 
 			continue
 		}
 		if v, ok := m.latest(s.ID); ok {
-			out = append(out, model.IndexCandidate{Skill: s, Version: v})
+			out = append(out, model.IndexCandidate{Skill: m.withUpstream(s), Version: v})
 		}
 	}
 	slices.SortFunc(out, func(a, b model.IndexCandidate) int {
@@ -461,4 +595,75 @@ func (m *Memory) ListAudit(_ context.Context, limit int) ([]model.AuditEvent, er
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// ListMirroredSkills implements Store.
+func (m *Memory) ListMirroredSkills(_ context.Context, upstreamID int64, afterNS, afterName string, limit int) ([]model.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []model.Skill
+	for _, s := range m.skills {
+		if upstreamID == 0 || m.ns[s.Namespace].UpstreamID != upstreamID {
+			continue
+		}
+		if s.Namespace < afterNS || (s.Namespace == afterNS && s.Name <= afterName) {
+			continue
+		}
+		out = append(out, m.withUpstream(s))
+	}
+	slices.SortFunc(out, func(a, b model.Skill) int {
+		if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// keyLocks is a set of named locks.
+type keyLocks struct {
+	mu sync.Mutex
+	m  map[string]*keyLock
+}
+
+type keyLock struct {
+	held chan struct{}
+	refs int
+}
+
+// LockMirror implements Store.
+func (m *Memory) LockMirror(ctx context.Context, key string) (func(), error) {
+	m.locks.mu.Lock()
+	if m.locks.m == nil {
+		m.locks.m = map[string]*keyLock{}
+	}
+	l := m.locks.m[key]
+	if l == nil {
+		l = &keyLock{held: make(chan struct{}, 1)}
+		m.locks.m[key] = l
+	}
+	l.refs++
+	m.locks.mu.Unlock()
+	drop := func() {
+		m.locks.mu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(m.locks.m, key)
+		}
+		m.locks.mu.Unlock()
+	}
+	select {
+	case l.held <- struct{}{}:
+		return func() { <-l.held; drop() }, nil
+	case <-ctx.Done():
+		drop()
+		return nil, ctx.Err()
+	}
+}
+
+// SetVersionMirrorServed implements Store.
+func (m *Memory) SetVersionMirrorServed(ctx context.Context, id int64, served bool, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.MirrorServed = &served })
 }

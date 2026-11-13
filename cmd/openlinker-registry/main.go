@@ -1,4 +1,4 @@
-// Command openlinker-registry serves the OpenLinker Skill registry.
+// Command openlinker-registry serves the OpenLinker Skill and MCP registry.
 //
 // Usage:
 //
@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,7 +24,9 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/config"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/github"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/pgstore"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/ratelimit"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/registry"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/safehttp"
 )
 
 func main() {
@@ -70,9 +73,30 @@ func run(args []string, log *slog.Logger) error {
 		return err
 	}
 	svc := registry.New(st, blobs, gh, registry.Config{Mode: cfg.Mode, AllowPublic: cfg.AllowPublic, Limits: cfg.Limits,
-		PublicURL: cfg.PublicURL, VerifyInterval: cfg.VerifyInterval})
+		PublicURL: cfg.PublicURL, VerifyInterval: cfg.VerifyInterval, UpstreamToken: cfg.UpstreamToken,
+		UpstreamPolicy: safehttp.Policy{AllowHTTP: cfg.UpstreamAllowHTTP, AllowCIDRs: cfg.UpstreamAllowCIDRs, Timeout: cfg.UpstreamTimeout}})
+	svc.Log = log
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, cfg.AdminToken), BasePath: cfg.BasePath,
-		AllowAnonRead: cfg.AllowAnonRead, MaxUploadBytes: cfg.MaxUploadBytes, Log: log}
+		AllowAnonRead: cfg.AllowAnonRead, MaxUploadBytes: cfg.MaxUploadBytes, Log: log,
+		ReadLimit: ratelimit.New(cfg.RateLimitRead), WriteLimit: ratelimit.New(cfg.RateLimitWrite),
+		ForwardLimit: ratelimit.New(cfg.RateLimitForward), AuthFailLimit: ratelimit.New(cfg.RateLimitAuthFailures),
+		Clients: ratelimit.ClientAddr{Trusted: cfg.TrustedProxies},
+		UI:      cfg.UI, SecureCookies: strings.HasPrefix(cfg.PublicURL, "https://"), Background: ctx}
+
+	if cfg.BackgroundSync {
+		go func() {
+			t := time.NewTicker(time.Minute)
+			defer t.Stop()
+			for {
+				svc.SyncDue(ctx)
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+			}
+		}()
+	}
 
 	go func() {
 		t := time.NewTicker(time.Hour)
@@ -107,7 +131,7 @@ func run(args []string, log *slog.Logger) error {
 	}
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", cfg.Listen, "base_path", cfg.BasePath, "mode", cfg.Mode)
+		log.Info("listening", "addr", cfg.Listen, "base_path", cfg.BasePath, "mode", cfg.Mode, "ui", cfg.UI)
 		errc <- hs.ListenAndServe()
 	}()
 	select {

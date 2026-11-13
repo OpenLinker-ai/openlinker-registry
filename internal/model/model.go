@@ -32,6 +32,19 @@ const (
 	MsgLicenseRequired  = "public hosted skills need a license on every non-yanked version"
 )
 
+// ErrNamespaceManaged is returned when a write targets a namespace owned by a
+// different party: local publishing into an upstream-managed namespace, or a
+// mirror write into a local namespace or another upstream's namespace.
+func ErrNamespaceManaged() error {
+	return &ConflictError{Code: "namespace_upstream_managed", Msg: "this namespace is managed by a different source"}
+}
+
+// ErrUpstreamConfigChanged is returned when a write on behalf of an upstream
+// was prepared under settings that have changed since.
+func ErrUpstreamConfigChanged() error {
+	return &ConflictError{Code: "upstream_config_changed", Msg: "the upstream's settings changed; the sync has to start again"}
+}
+
 // ErrSkillYanked is returned when a yanked skill would change status.
 func ErrSkillYanked() error {
 	return &ConflictError{Code: "skill_yanked", Msg: "a yanked skill cannot change status"}
@@ -87,7 +100,10 @@ type Namespace struct {
 	Kind        string
 	GitHubID    *int64
 	DisplayName string
-	CreatedAt   time.Time
+	// UpstreamID is the upstream that manages this namespace (0 for local
+	// namespaces). Kind is NSKindUpstream exactly when it is set.
+	UpstreamID int64
+	CreatedAt  time.Time
 }
 
 // Token is a stored API token (only the secret hash is persisted).
@@ -121,8 +137,40 @@ type Skill struct {
 	Mode         string
 	SourceKey    string // indexed only
 	GlobalAlias  string // empty when unset
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// Upstream is the name of the upstream that manages the namespace ("" for
+	// local entries). Read-only.
+	Upstream string
+	// CurrentVersion is the version the skill's source names as its current
+	// one, when that is not simply the newest ("" otherwise). A discovery
+	// index that returns to earlier content names a version recorded before
+	// the newest one. See LatestVersion.
+	CurrentVersion string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// LatestVersion picks the version a skill presents as its latest: the one
+// its source names as current (Skill.CurrentVersion) unless that is yanked
+// or missing, else the newest version that is not yanked. versions is
+// newest first.
+func LatestVersion(current string, versions []Version) (Version, bool) {
+	var newest *Version
+	for i := range versions {
+		v := &versions[i]
+		if v.YankedAt != nil {
+			continue
+		}
+		if current != "" && v.Version == current {
+			return *v, true
+		}
+		if newest == nil {
+			newest = v
+		}
+	}
+	if newest == nil {
+		return Version{}, false
+	}
+	return *newest, true
 }
 
 // Source describes where hosted bytes came from.
@@ -138,7 +186,7 @@ type Source struct {
 
 // Locator identifies indexed content without storing it.
 type Locator struct {
-	Kind string `json:"kind"` // github | url
+	Kind string `json:"kind"` // github | url | registry
 	// GitHub
 	Owner      string `json:"owner,omitempty"`
 	Repo       string `json:"repo,omitempty"`
@@ -146,9 +194,18 @@ type Locator struct {
 	Path       string `json:"path,omitempty"`
 	TreeSHA    string `json:"tree_sha,omitempty"`
 	SingleFile bool   `json:"single_file,omitempty"`
-	// URL (schema only in R1; no importer yet)
-	URL    string `json:"url,omitempty"`
-	Digest string `json:"digest,omitempty"`
+	// URL: an entry of an external agent-skills discovery index. Digest is
+	// the sha256 of the bytes at URL; EntryType is "skill-md" or "archive".
+	URL       string `json:"url,omitempty"`
+	Digest    string `json:"digest,omitempty"`
+	EntryType string `json:"entry_type,omitempty"`
+	// Registry: a version mirrored from an upstream registry. Upstream is
+	// the upstream name (also set for URL locators created by a sync);
+	// Namespace/Name/Version address the version there.
+	Upstream  string `json:"upstream,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Version   string `json:"version,omitempty"`
 }
 
 // Version is an immutable published or indexed version. Only the review,
@@ -173,12 +230,18 @@ type Version struct {
 	Source                 *Source
 	Locator                *Locator
 	IndexedBy              string
-	CheckResult            string
-	CheckedAt              *time.Time
-	YankedAt               *time.Time
-	YankReason             string
-	CreatedBy              string
-	CreatedAt              time.Time
+	// MirrorServed is set for a version mirrored from an upstream registry:
+	// whether that registry serves the version's content. This instance
+	// never redistributes more than its source does. Unlike the content it
+	// can change (the upstream approves a license), so it is not part of the
+	// immutable version.
+	MirrorServed *bool
+	CheckResult  string
+	CheckedAt    *time.Time
+	YankedAt     *time.Time
+	YankReason   string
+	CreatedBy    string
+	CreatedAt    time.Time
 }
 
 // SkillSummary is a list/search row.
@@ -255,7 +318,25 @@ type PublishInput struct {
 	SourceKey  string
 	Visibility string // used only when creating the skill
 	Listed     bool   // used only when creating the skill
-	Version    Version
+	// UpstreamID must equal the namespace's UpstreamID (0 for local
+	// publishing); otherwise the store rejects the publish with the
+	// ConflictError code namespace_upstream_managed.
+	UpstreamID int64
+	// UpstreamConfigVersion is the upstream's ConfigVersion the caller read
+	// its settings (allow and deny lists, visibility) under. The store
+	// refuses the write (ErrUpstreamConfigChanged) when the settings have
+	// changed since, in the same transaction, so a sync that is still running
+	// under old settings cannot write by them. For a write on behalf of an
+	// upstream the namespace is created when missing.
+	UpstreamConfigVersion int64
+	// ExpectNewest, when set, is the version that must currently be the
+	// newest of the skill ("" for none). A mirror uses it so that two
+	// concurrent refreshes cannot interleave and leave versions out of the
+	// upstream's order; a mismatch is ConflictError version_order.
+	ExpectNewest *string
+	// A published version becomes the skill's latest: publishing clears
+	// Skill.CurrentVersion.
+	Version Version
 }
 
 // SkillPatch updates mutable skill settings.

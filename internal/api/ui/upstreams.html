@@ -1,0 +1,21 @@
+{{define "upstreams"}}{{template "head" .}}
+<h1>{{.T "upstreams.title"}}</h1>
+<p class="muted">{{.T "upstreams.note"}}</p>
+{{if .Data}}
+<table>
+<thead><tr><th>{{.T "col.name"}}</th><th>{{.T "col.kind"}}</th><th>URL</th><th>{{.T "col.forward"}}</th><th>{{.T "col.sync"}}</th><th>{{.T "col.lastsync"}}</th></tr></thead>
+<tbody>
+{{range .Data}}<tr>
+  <td>{{.Name}} {{if not .Enabled}}<span class="tag bad">{{$.T "disabled"}}</span>{{end}}<br><span class="muted">{{$.T "col.priority"}} {{.Priority}} · {{.Visibility}}</span></td>
+  <td><span class="tag">{{.Kind}}</span>{{if .TargetNamespace}}<br><span class="muted">→ {{.TargetNamespace}}</span>{{end}}</td>
+  <td class="mono">{{.BaseURL}}</td>
+  <td>{{if .ProxyOnMiss}}<span class="tag ok">{{$.T "on"}}</span>{{else}}<span class="tag">{{$.T "off"}}</span>{{end}}</td>
+  <td>{{if .SyncInterval}}{{.SyncInterval}}{{else}}{{$.T "manual"}}{{end}}{{if eq .SyncState "running"}} <span class="tag warn">{{$.T "running"}}</span>{{end}}</td>
+  <td>{{if .LastSyncAt}}{{datep .LastSyncAt}} {{if eq .LastSyncStatus "ok"}}<span class="tag ok">ok</span>{{else}}<span class="tag bad">{{.LastSyncStatus}}</span>{{end}}
+    {{if .LastSyncError}}<br><span class="muted">{{.LastSyncError}}</span>{{end}}
+    {{range $k, $v := .LastSyncStats}}<br><span class="muted mono">{{$k}}={{$v}}</span>{{end}}{{else}}—{{end}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{else}}<p class="empty">{{.T "upstreams.empty"}}</p>{{end}}
+{{template "foot" .}}{{end}}

@@ -19,26 +19,71 @@ var errNotFound = &registry.Error{Status: http.StatusNotFound, Code: "not_found"
 
 // loadVisible returns the skill only if the caller may see it; invisible
 // skills are indistinguishable from missing ones.
+//
+// A local miss may be forwarded to upstream registries that serve this
+// caller. Forwarding has a per-caller budget, and a skill that exists but is
+// hidden from the caller draws on it exactly like a missing one, so the
+// answer (404 or, over budget, 429) never tells the two apart.
 func (s *Server) loadVisible(r *http.Request) (model.Skill, error) {
-	sk, err := s.Svc.Store.GetSkill(r.Context(), r.PathValue("ns"), r.PathValue("name"))
-	if err != nil {
-		if errors.Is(err, model.ErrNotFound) {
-			return model.Skill{}, errNotFound
-		}
+	ns, name := r.PathValue("ns"), r.PathValue("name")
+	viewer := principal(r).Viewer()
+	sk, err := s.Svc.Store.GetSkill(r.Context(), ns, name)
+	missing := errors.Is(err, model.ErrNotFound)
+	if err != nil && !missing {
 		return model.Skill{}, err
 	}
-	if !principal(r).Viewer().CanSee(sk.Namespace, sk.Visibility) {
+	visible := !missing && viewer.CanSee(sk.Namespace, sk.Visibility)
+	if !visible && s.Svc.CanForwardSkill(r.Context(), viewer, ns) {
+		if err := s.chargeForward(r); err != nil {
+			return model.Skill{}, err
+		}
+		if missing {
+			sk, err = s.Svc.ResolveSkill(r.Context(), viewer, ns, name, true)
+			if errors.Is(err, model.ErrNotFound) {
+				return model.Skill{}, errNotFound
+			}
+			if err != nil {
+				return model.Skill{}, err
+			}
+			visible = viewer.CanSee(sk.Namespace, sk.Visibility)
+		}
+	}
+	if !visible {
 		return model.Skill{}, errNotFound
 	}
 	return sk, nil
 }
 
+// loadVisibleVersion also completes a mirrored skill from its upstream when
+// the requested version is not here yet.
 func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version, error) {
 	sk, err := s.loadVisible(r)
 	if err != nil {
 		return sk, model.Version{}, err
 	}
-	v, err := s.Svc.Store.GetVersion(r.Context(), sk.ID, r.PathValue("version"))
+	version := r.PathValue("version")
+	v, err := s.Svc.Store.GetVersion(r.Context(), sk.ID, version)
+	if errors.Is(err, model.ErrNotFound) && sk.Upstream != "" && s.Svc.CanForwardSkill(r.Context(), principal(r).Viewer(), sk.Namespace) {
+		if err := s.chargeForward(r); err != nil {
+			return sk, v, err
+		}
+		refreshed, rerr := s.Svc.RefreshMirroredSkill(r.Context(), principal(r).Viewer(), sk, version)
+		if rerr != nil {
+			return sk, v, rerr
+		}
+		if refreshed {
+			// The refresh applies what the upstream says now, which may be
+			// that the caller can no longer see the skill at all.
+			if sk, err = s.Svc.Store.GetSkill(r.Context(), sk.Namespace, sk.Name); errors.Is(err, model.ErrNotFound) ||
+				(err == nil && !principal(r).Viewer().CanSee(sk.Namespace, sk.Visibility)) {
+				return model.Skill{}, model.Version{}, errNotFound
+			}
+			if err != nil {
+				return sk, v, err
+			}
+			v, err = s.Svc.Store.GetVersion(r.Context(), sk.ID, version)
+		}
+	}
 	if errors.Is(err, model.ErrNotFound) {
 		return sk, v, errNotFound
 	}
@@ -56,6 +101,9 @@ func skillJSON(sk model.Skill, latest string) map[string]any {
 	}
 	if sk.GlobalAlias != "" {
 		out["global_alias"] = sk.GlobalAlias
+	}
+	if sk.Upstream != "" {
+		out["upstream"] = sk.Upstream
 	}
 	return out
 }
@@ -120,7 +168,7 @@ func decodeCursor(c string) (string, string, bool) {
 		return "", "", false
 	}
 	ns, name, ok := strings.Cut(string(b), "\x00")
-	return ns, name, ok && utf8.ValidString(ns) && utf8.ValidString(name)
+	return ns, name, ok && storable(ns) && storable(name)
 }
 
 func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
@@ -190,13 +238,16 @@ func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	latest := ""
+	if v, ok := model.LatestVersion(sk.CurrentVersion, versions); ok {
+		latest = v.Version
+	}
 	list := make([]map[string]any, 0, len(versions))
 	for _, v := range versions {
-		if latest == "" && v.YankedAt == nil {
-			latest = v.Version
-		}
+		// "servable" and "license_approved" can change after publication; a
+		// mirror follows them from here without reading every version.
 		list = append(list, map[string]any{"version": v.Version, "created_at": v.CreatedAt, "artifact_digest": v.ArtifactDigest,
-			"yanked": v.YankedAt != nil, "core_compatible": v.CoreCompatible, "license_kind": v.LicenseKind})
+			"yanked": v.YankedAt != nil, "core_compatible": v.CoreCompatible, "license_kind": v.LicenseKind,
+			"license_approved": v.LicenseApproved, "servable": registry.Access(v).Artifact})
 	}
 	out := skillJSON(sk, latest)
 	out["versions"] = list

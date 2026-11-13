@@ -14,11 +14,19 @@ import (
 // Store is the registry persistence boundary. Every mutating method takes the
 // audit event describing it and must persist both atomically: if the audit
 // row cannot be written, the mutation is rolled back.
+//
+// A context from model.WithUpstreamGuard makes every audited mutation
+// conditional on the upstream's settings being unchanged, checked in the
+// mutation's own transaction (ConflictError upstream_config_changed).
 type Store interface {
 	Ping(ctx context.Context) error
 
 	CreateNamespace(ctx context.Context, ns model.Namespace, audit model.AuditEvent) (model.Namespace, error)
 	GetNamespace(ctx context.Context, name string) (model.Namespace, error)
+	// SetRole and the roles of CreateToken apply to local namespaces only:
+	// an upstream-managed namespace has no members (ConflictError
+	// namespace_upstream_managed), so an entry withdrawn there is visible to
+	// administrators alone.
 	SetRole(ctx context.Context, namespace, subject string, role model.Role, audit model.AuditEvent) error
 	RolesForSubject(ctx context.Context, subject string) (map[string]model.Role, error)
 
@@ -27,6 +35,12 @@ type Store interface {
 	RevokeToken(ctx context.Context, id string, at time.Time, audit model.AuditEvent) error
 
 	GetSkill(ctx context.Context, namespace, name string) (model.Skill, error)
+	// Writes on behalf of an upstream (PublishVersion and UpdateSkill in an
+	// upstream-managed namespace, UpsertMirroredMCP) never make an entry
+	// public while the upstream's mirror visibility is internal: the store
+	// reads that setting in the transaction of the write, so a write racing
+	// with an administrator lowering it cannot undo the change.
+	//
 	// PublishVersion creates the skill if needed and appends an immutable
 	// version atomically. It returns ConflictError codes: mode_mismatch,
 	// source_mismatch, source_already_indexed, version_exists, skill_yanked.
@@ -35,10 +49,24 @@ type Store interface {
 	GetVersion(ctx context.Context, skillID int64, version string) (model.Version, error)
 	UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error)
 	SetSkillStatus(ctx context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error)
+	// SetSkillCurrentVersion makes an existing version (ErrNotFound
+	// otherwise) the one the skill presents as its latest (see
+	// model.LatestVersion) and gives the skill that version's description.
+	// Publishing a version afterwards makes the new version the latest again.
+	SetSkillCurrentVersion(ctx context.Context, skillID int64, version string, audit model.AuditEvent) (model.Skill, error)
 	SetAlias(ctx context.Context, skillID int64, alias string, audit model.AuditEvent) error
 	YankVersion(ctx context.Context, versionID int64, reason string, at time.Time, audit model.AuditEvent) error
 	ApproveLicense(ctx context.Context, versionID int64, audit model.AuditEvent) error
 	SetVersionCheck(ctx context.Context, versionID int64, result string, at time.Time) error
+	// SetVersionMirrorServed records whether the upstream of a mirrored
+	// version serves its content (see model.Version.MirrorServed).
+	SetVersionMirrorServed(ctx context.Context, versionID int64, served bool, audit model.AuditEvent) error
+
+	// SetVersionLocatorURL records where the content of a URL-indexed
+	// version is served now (ErrNotFound for any other version). Versions
+	// are read with that URL in their locator from then on; nothing else
+	// about the version changes.
+	SetVersionLocatorURL(ctx context.Context, versionID int64, url string, audit model.AuditEvent) error
 
 	Search(ctx context.Context, q model.SearchQuery) ([]model.SkillSummary, error)
 	// IndexCandidates returns public, listed, active skills with their latest
@@ -52,4 +80,94 @@ type Store interface {
 
 	AppendAudit(ctx context.Context, e model.AuditEvent) error
 	ListAudit(ctx context.Context, limit int) ([]model.AuditEvent, error)
+
+	// ListNamespaces returns every namespace ordered by name.
+	ListNamespaces(ctx context.Context) ([]model.Namespace, error)
+	// ListTokens returns every token (newest first). SecretHash is not set.
+	ListTokens(ctx context.Context) ([]model.Token, error)
+
+	// ListMirroredSkills pages through every skill in the namespaces of an
+	// upstream, in (namespace, name) byte order, whatever its listing,
+	// visibility or status: a mirror reconciles all of them, not only the
+	// ones a listing would show.
+	ListMirroredSkills(ctx context.Context, upstreamID int64, afterNS, afterName string, limit int) ([]model.Skill, error)
+	// ListMirroredMCP is ListMirroredSkills for MCP servers, in name order.
+	ListMirroredMCP(ctx context.Context, upstreamID int64, afterName string, limit int) ([]model.MCPServer, error)
+
+	// LockMirror takes the mirror lock of one entry (key names it, for
+	// example "skill:<namespace>/<name>") and returns the function that
+	// releases it. Reading an entry from its upstream and applying what was
+	// read happens under this lock, in every registry process, so an older
+	// answer can never be applied after a newer one.
+	LockMirror(ctx context.Context, key string) (release func(), err error)
+
+	// --- MCP servers ---
+
+	// PublishMCPVersion creates the server if needed and appends an immutable
+	// version atomically, deciding IsLatest under the server row lock. The
+	// namespace must be local (not upstream-managed). ConflictError codes:
+	// namespace_upstream_managed, mode_mismatch, version_exists,
+	// server_name_conflict (another server differs only by letter case).
+	PublishMCPVersion(ctx context.Context, in model.MCPPublishInput, audit model.AuditEvent) (model.MCPServer, model.MCPVersion, error)
+	// UpsertMirroredMCP stores one mirrored version: it creates the
+	// upstream-managed namespace and the server when missing, inserts the
+	// version, or updates the status fields and IsLatest of an existing one.
+	// The input's visibility and listing are applied to an existing server
+	// in the same transaction (which counts as an update).
+	// With StatusOnly the server's settings are left alone instead, and only
+	// the state of an existing version changes.
+	// It returns MirrorCreated, MirrorUpdated or MirrorUnchanged; the audit
+	// event is written atomically with a created or updated version and not
+	// at all for an unchanged one.
+	// ConflictError codes: namespace_upstream_managed (the namespace is local
+	// or belongs to another upstream), server_name_conflict, digest_mismatch
+	// (the stored version has a different server.json; it is left untouched).
+	UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, audit model.AuditEvent) (string, error)
+	// GetMCPServer looks a server up by its exact full name.
+	GetMCPServer(ctx context.Context, name string) (model.MCPServer, error)
+	// GetMCPVersion returns one version; version "latest" resolves to the
+	// version flagged IsLatest.
+	GetMCPVersion(ctx context.Context, serverID int64, version string) (model.MCPVersion, error)
+	// ListMCPVersions returns every version of a server, newest first.
+	ListMCPVersions(ctx context.Context, serverID int64) ([]model.MCPVersion, error)
+	// SetMCPStatus changes the status of one version, or of every version
+	// when version is "". It returns the number of versions changed. When the
+	// latest version is deleted, IsLatest moves to the best remaining
+	// non-deleted version (and back when a better version is restored).
+	SetMCPStatus(ctx context.Context, serverID int64, version, status, message string, at time.Time, audit model.AuditEvent) (int, error)
+	UpdateMCPServer(ctx context.Context, serverID int64, p model.MCPPatch, audit model.AuditEvent) (model.MCPServer, error)
+	// SearchMCP lists (server, version) rows; see model.MCPQuery.
+	SearchMCP(ctx context.Context, q model.MCPQuery) ([]model.MCPEntry, error)
+
+	// --- upstreams ---
+
+	// CreateUpstream stores a new upstream (ConflictError upstream_exists).
+	CreateUpstream(ctx context.Context, u model.Upstream, audit model.AuditEvent) (model.Upstream, error)
+	GetUpstream(ctx context.Context, name string) (model.Upstream, error)
+	// ListUpstreams returns upstreams ordered by priority, then name.
+	ListUpstreams(ctx context.Context) ([]model.Upstream, error)
+	// UpdateUpstream changes settings. A change to what is selected or how
+	// it is shown (base URL, visibility, allow and deny lists, latest only)
+	// clears the sync cursor, so the next sync reads everything again.
+	// Lowering visibility to internal takes effect at once: every public
+	// entry in the upstream's namespaces becomes internal in the same
+	// transaction.
+	UpdateUpstream(ctx context.Context, name string, p model.UpstreamPatch, audit model.AuditEvent) (model.Upstream, error)
+	// DeleteUpstream removes an upstream that manages no namespace
+	// (ConflictError upstream_in_use otherwise).
+	DeleteUpstream(ctx context.Context, name string, audit model.AuditEvent) error
+	// ClaimUpstreamSync marks the upstream as syncing and returns true unless
+	// a sync that started after staleBefore is still running. It is atomic
+	// across processes.
+	ClaimUpstreamSync(ctx context.Context, id int64, now, staleBefore time.Time) (bool, error)
+	// FinishUpstreamSync records a sync result and returns the upstream to
+	// idle, atomically with the audit event. The cursor is stored only when
+	// the result status is SyncOK.
+	FinishUpstreamSync(ctx context.Context, id int64, res model.UpstreamSyncResult, audit model.AuditEvent) error
+	// EnsureUpstreamNamespace returns the namespace managed by the upstream,
+	// creating it (kind "upstream") when missing. A namespace that is local
+	// or managed by another upstream yields ConflictError
+	// namespace_upstream_managed. The audit event is written atomically with
+	// a creation and not at all when the namespace already exists.
+	EnsureUpstreamNamespace(ctx context.Context, name string, upstreamID int64, audit model.AuditEvent) (model.Namespace, error)
 }

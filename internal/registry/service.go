@@ -7,6 +7,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"path"
 	"strings"
@@ -16,7 +17,9 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/archive"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/blobstore"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/github"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/mcp"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/safehttp"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
 )
@@ -28,6 +31,8 @@ type Error struct {
 	Msg    string
 	// SourceURL is set when content is withheld but a source link exists.
 	SourceURL string
+	// RetryAfter is the number of seconds a rate-limited caller should wait.
+	RetryAfter int
 }
 
 func (e *Error) Error() string { return e.Msg }
@@ -51,6 +56,10 @@ func AsError(err error) *Error {
 	var ge *github.Error
 	if errors.As(err, &ge) {
 		return &Error{Status: ge.Status, Code: ge.Code, Msg: ge.Msg}
+	}
+	var me *mcp.Error
+	if errors.As(err, &me) {
+		return &Error{Status: http.StatusUnprocessableEntity, Code: me.Code, Msg: me.Msg}
 	}
 	var pe *model.PolicyError
 	if errors.As(err, &pe) {
@@ -84,6 +93,11 @@ type Config struct {
 	// VerifyInterval bounds how long cached indexed content is served
 	// without re-verifying the source. Zero re-verifies on every read.
 	VerifyInterval time.Duration
+	// UpstreamPolicy says where requests to upstream registries may go.
+	UpstreamPolicy safehttp.Policy
+	// UpstreamToken returns the bearer token for an upstream by name ("" for
+	// none). Tokens come from the environment and are never stored.
+	UpstreamToken func(name string) string
 }
 
 // Service implements the use cases.
@@ -93,8 +107,14 @@ type Service struct {
 	GitHub *github.Client
 	Cfg    Config
 	Now    func() time.Time
+	// HTTP is the outbound client for upstream registries.
+	HTTP *http.Client
+	Log  *slog.Logger
 
-	locks digestLocks
+	locks      digestLocks
+	clients    clientCache
+	misses     missCache
+	forwarding forwardingCache
 	// Test hooks for deterministic concurrency tests; nil in production.
 	afterArtifactPut func(digest string)
 	gcBeforeLock     func(digest string)
@@ -107,7 +127,8 @@ func New(st store.Store, blobs blobstore.Store, gh *github.Client, cfg Config) *
 		cfg.Limits = skill.DefaultLimits
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
-	return &Service{Store: st, Blobs: blobs, GitHub: gh, Cfg: cfg, Now: func() time.Time { return time.Now().UTC() }}
+	return &Service{Store: st, Blobs: blobs, GitHub: gh, Cfg: cfg, Now: func() time.Time { return time.Now().UTC() },
+		HTTP: safehttp.NewClient(cfg.UpstreamPolicy), Log: slog.Default()}
 }
 
 // DefaultVisibility is public on the public instance and internal otherwise.
