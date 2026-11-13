@@ -166,6 +166,10 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 		if err := contextGuard(ctx, tx); err != nil {
 			return err
 		}
+		if in.StatusOnly {
+			// Ask the guard for the widest visibility the upstream allows.
+			in.Visibility = model.VisibilityPublic
+		}
 		visibility, err := mirrorGuard(ctx, tx, in.UpstreamID, in.ConfigVersion, in.Visibility)
 		if err != nil {
 			return err
@@ -184,6 +188,14 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 		if srv.Name != in.Name || srv.Mode != model.MCPModeMirrored || srvNS != ns.ID {
 			return errServerName()
 		}
+		if in.StatusOnly {
+			if created {
+				return model.ErrNotFound // rolls the new server back
+			}
+			// The server row is locked: its settings are the current ones,
+			// and they stay (never wider than the upstream allows).
+			in.Visibility, in.Listed = model.NarrowerVisibility(srv.Visibility, in.Visibility), srv.Listed
+		}
 		// A document that is not fresh may only narrow who sees an existing
 		// server; a widening is withheld and reported.
 		if !created && !in.Fresh {
@@ -198,6 +210,9 @@ func (s *Store) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput, 
 		missing := errors.Is(err, pgx.ErrNoRows)
 		if err != nil && !missing {
 			return err
+		}
+		if missing && in.StatusOnly {
+			return model.ErrNotFound
 		}
 		if !missing && cur.Digest != v.Digest {
 			return conflict("digest_mismatch", "the stored version has a different server.json")

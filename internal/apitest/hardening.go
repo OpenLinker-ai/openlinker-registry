@@ -694,6 +694,140 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a removed version does not undo a restriction", func(t *testing.T) {
+		// A public v1 is mirrored. The upstream then serves only v2, to its
+		// own users. Applying that marks v1 deleted; doing so must not put
+		// back the visibility the server had before v2 was read.
+		entry := func(version, visibility string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": "com.swap/tool", "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true},
+					metaEntry: map[string]any{"visibility": visibility, "listed": true}}}
+		}
+		replaced := false
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			current := entry("1.0.0", "public")
+			if replaced {
+				current = entry("2.0.0", "internal")
+			}
+			version := current["server"].(map[string]any)["version"].(string)
+			switch r.URL.EscapedPath() {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[]}`))
+			case "/v0.1/servers", "/v0.1/servers/com.swap%2Ftool/versions":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{current}})
+			case "/v0.1/servers/com.swap%2Ftool/versions/" + version, "/v0.1/servers/com.swap%2Ftool/versions/latest":
+				_ = enc.Encode(current)
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		for _, how := range []string{"forwarded read", "sync"} {
+			replaced = false
+			e := NewEnv(t, newStore(t), Options{Loopback: true})
+			e.Expect(e.upstream(map[string]any{"name": "swap", "kind": "openlinker-registry", "base_url": fake.URL,
+				"proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+			e.Expect(e.Do("GET", "/v0.1/servers/com.swap%2Ftool/versions/1.0.0", "", "", nil), 200, how+": public v1")
+			replaced = true
+			if how == "sync" {
+				if st := e.sync("swap"); st["last_status"] != "ok" {
+					t.Fatalf("sync: %v", st)
+				}
+			} else {
+				// Asking for a version neither side has makes the mirror
+				// read the server's version list again.
+				e.Expect(e.Do("GET", "/v0.1/servers/com.swap%2Ftool/versions/9.9.9", "", "", nil), 404, how+": unknown version")
+			}
+			reader := e.token([]string{"skills:read"}, nil)
+			e.Expect(e.Do("GET", "/v0.1/servers/com.swap%2Ftool/versions/2.0.0", reader, "", nil), 200, how+": v2 for signed-in callers")
+			r := e.Expect(e.Do("GET", "/v0.1/servers/com.swap%2Ftool/versions/1.0.0", reader, "", nil), 200, how+": v1")
+			if official(r.JSON)["status"] != "deleted" {
+				t.Fatalf("%s: the removed version is still %v", how, official(r.JSON)["status"])
+			}
+			for _, path := range []string{"2.0.0", "1.0.0", "latest"} {
+				if got := e.Do("GET", "/v0.1/servers/com.swap%2Ftool/versions/"+path, "", "", nil).Status; got != 404 {
+					t.Fatalf("%s: anonymous read of %s = %d after the upstream restricted the server", how, path, got)
+				}
+			}
+			if got := servers(e.Do("GET", "/v0.1/servers", "", "", nil)); len(got) != 0 {
+				t.Fatalf("%s: a restricted server is listed to anonymous callers: %d entries", how, len(got))
+			}
+		}
+	})
+
+	t.Run("an unconfirmed reconciliation holds the watermark", func(t *testing.T) {
+		// v1 of a server arrived by a forwarded read. The first full sync
+		// does not find the server in the listing and asks for its version
+		// list, which is unreadable this once. Another entry of the listing
+		// would give the run a watermark; storing it would make every later
+		// run incremental, and incremental runs do not look for servers that
+		// went missing.
+		now := time.Now().UTC().Truncate(time.Second)
+		t1 := now.Add(-time.Hour)
+		entry := func(name string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": "1.0.0",
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true,
+					"updatedAt": t1.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
+		}
+		phase := 1 // 1: serves "gone"; 2: its version list is broken; 3: it is gone
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/other")}})
+			case "/v0.1/servers/com.feed%2Fother/versions/1.0.0":
+				_ = enc.Encode(entry("com.feed/other"))
+			case "/v0.1/servers/com.feed%2Fgone/versions/1.0.0":
+				if phase != 1 {
+					w.WriteHeader(404)
+					return
+				}
+				_ = enc.Encode(entry("com.feed/gone"))
+			case "/v0.1/servers/com.feed%2Fgone/versions":
+				if phase == 2 {
+					_, _ = w.Write([]byte(`{"servers":[{"server":`))
+					return
+				}
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fgone/versions/1.0.0", "", "", nil), 200, "forwarded v1")
+		phase = 2
+		s := e.sync("feed")
+		if s["last_status"] != "ok" || stat(s, "mcp_pending") != 1 || stat(s, "mcp_created") != 1 {
+			t.Fatalf("sync with an unreadable version list: %v", s)
+		}
+		if cursor, _ := s["cursor"].(string); cursor != "" {
+			t.Fatalf("the run stored the watermark %q although a server could not be reconciled", cursor)
+		}
+		phase = 3
+		s = e.sync("feed")
+		cursor, _ := s["cursor"].(string)
+		if at, _ := time.Parse(time.RFC3339Nano, cursor); s["last_status"] != "ok" || stat(s, "mcp_pending") != 0 || !at.Equal(t1) {
+			t.Fatalf("sync after the upstream recovered: %v", s)
+		}
+		r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fgone/versions/1.0.0", "", "", nil), 200, "the version of the missing server")
+		if official(r.JSON)["status"] != "deleted" {
+			t.Fatalf("a server the upstream no longer has is still %v", official(r.JSON)["status"])
+		}
+		if got := servers(e.Do("GET", "/v0.1/servers", "", "", nil)); len(got) != 1 {
+			t.Fatalf("listing after reconciliation: %d entries", len(got))
+		}
+	})
+
 	t.Run("a listing page larger than the response cap", func(t *testing.T) {
 		// Large documents make a full page exceed what one response may
 		// carry, although each document is fine. The sync asks for smaller

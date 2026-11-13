@@ -103,6 +103,8 @@ type Store interface {
 	// version, or updates the status fields and IsLatest of an existing one.
 	// The input's visibility and listing are applied to an existing server
 	// in the same transaction (which counts as an update).
+	// With StatusOnly the server's settings are left alone instead, and only
+	// the state of an existing version changes.
 	// It returns MirrorCreated, MirrorUpdated or MirrorUnchanged; the audit
 	// event is written atomically with a created or updated version and not
 	// at all for an unchanged one.

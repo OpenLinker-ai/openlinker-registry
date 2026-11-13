@@ -185,6 +185,17 @@ func (m *Memory) UpsertMirroredMCP(ctx context.Context, in model.MCPMirrorInput,
 	latest := in.Version.IsLatest && status != model.MCPStatusDeleted
 	in.Visibility = m.mirrorVisibility(in.UpstreamID, in.Visibility)
 
+	if in.StatusOnly {
+		if !found {
+			return "", model.ErrNotFound
+		}
+		if _, exists := m.findMCPVersion(s.ID, in.Version.Version); !exists {
+			return "", model.ErrNotFound
+		}
+		// The current settings stay (never wider than the upstream allows).
+		limit := m.mirrorVisibility(in.UpstreamID, model.VisibilityPublic)
+		in.Visibility, in.Listed = model.NarrowerVisibility(s.Visibility, limit), s.Listed
+	}
 	// A document that is not fresh may only narrow who sees an existing
 	// server; a widening is withheld and reported.
 	stale := false

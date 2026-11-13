@@ -233,9 +233,11 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 		page = next
 	}
 	if full {
-		if err := s.reconcileMCP(ctx, u, c, seen, stats); err != nil {
+		unconfirmed, err := s.reconcileMCP(ctx, u, c, seen, stats)
+		if err != nil {
 			return "", err
 		}
+		pending = pending || unconfirmed
 	}
 	if u.Kind != model.UpstreamMCP {
 		return "", nil
@@ -252,23 +254,27 @@ func (s *Service) syncMCP(ctx context.Context, u model.Upstream, c *upstream.Cli
 // when the listing showed every version mirrored here: a version it did not
 // show (a latest-only listing shows one per server; a version may also have
 // been removed) may have been deleted or deprecated since.
-func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstream.Client, seen map[string]bool, stats syncStats) error {
+//
+// pending reports that a server could not be read this time. The caller
+// then keeps its watermark: incremental runs do not reconcile, so the next
+// run has to be a full one again.
+func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstream.Client, seen map[string]bool, stats syncStats) (pending bool, err error) {
 	after := ""
 	for {
 		servers, err := s.Store.ListMirroredMCP(ctx, u.ID, after, 200)
 		if err != nil {
-			return err
+			return pending, err
 		}
 		for _, srv := range servers {
 			after = srv.Name
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return pending, ctx.Err()
 			}
 			covered := seen[srv.Name]
 			if covered {
 				local, err := s.Store.ListMCPVersions(ctx, srv.ID)
 				if err != nil {
-					return err
+					return pending, err
 				}
 				for _, v := range local {
 					covered = covered && seen[srv.Name+"@"+v.Version]
@@ -277,12 +283,16 @@ func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstrea
 			if covered {
 				continue
 			}
-			if err := s.refreshMCPServer(ctx, u, c, srv, stats); err != nil {
-				return err
+			switch err := s.refreshMCPServer(ctx, u, c, srv, stats); {
+			case errors.Is(err, errUnconfirmed):
+				pending = true
+				stats.add("mcp_pending")
+			case err != nil:
+				return pending, err
 			}
 		}
 		if len(servers) < 200 {
-			return nil
+			return pending, nil
 		}
 	}
 }
@@ -299,7 +309,9 @@ func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *ups
 	_, err = s.refreshMCPServerLocked(ctx, u, c, srv.Name, stats)
 	var ue *upstream.Error
 	if errors.As(err, &ue) {
-		return nil // counted as skipped; the rest of the sync goes on
+		// The upstream's answer was unusable. The rest of the sync goes on,
+		// but this server is not settled.
+		return errUnconfirmed
 	}
 	return err
 }
@@ -332,13 +344,9 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 		return nil, err
 	}
 	docs, err := c.ListMCPVersions(ctx, srv.Name)
-	var ue *upstream.Error
 	switch {
 	case errors.Is(err, upstream.ErrNotFound):
 		return nil, s.withdrawMCP(ctx, u, srv, stats)
-	case errors.As(err, &ue):
-		stats.add("mcp_skipped")
-		return nil, err
 	case err != nil:
 		return nil, err
 	}
@@ -369,8 +377,10 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 		if served[v.Version] || v.Status == model.MCPStatusDeleted {
 			continue
 		}
+		// Status only: the versions applied above may just have changed who
+		// sees the server, and that must stand.
 		if _, err := s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, ConfigVersion: u.ConfigVersion,
-			Namespace: srv.Namespace, Name: srv.Name, Visibility: srv.Visibility, Listed: srv.Listed, Fresh: true,
+			Namespace: srv.Namespace, Name: srv.Name, Visibility: srv.Visibility, Listed: srv.Listed, Fresh: true, StatusOnly: true,
 			Version: model.MCPVersion{Version: v.Version, ServerJSON: v.ServerJSON, Digest: v.Digest, Status: model.MCPStatusDeleted,
 				StatusMessage: "no longer available from the upstream registry", CreatedBy: actor}},
 			auditEvent(actor, "mcp.mirror", srv.Namespace, srv.Name+"@"+v.Version, map[string]any{"status": model.MCPStatusDeleted, "upstream": u.Name})); err != nil {

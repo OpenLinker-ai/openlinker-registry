@@ -103,6 +103,12 @@ type MCPMirrorInput struct {
 	// has applied since, so it may only add a version or narrow who sees
 	// the server; anything else is left alone and reported as MirrorStale.
 	Fresh bool
+	// StatusOnly changes nothing but the state of a version that is already
+	// stored (ErrNotFound otherwise): the server's visibility and listing
+	// stay as they are, and Visibility and Listed are ignored. It is how a
+	// version that is gone upstream is marked deleted without touching who
+	// may see the server.
+	StatusOnly bool
 }
 
 // Mirror upsert outcomes.

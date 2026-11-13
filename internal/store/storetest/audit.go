@@ -385,6 +385,79 @@ var mirrorTests = []testCase{
 			t.Fatalf("fresh document: %+v", got)
 		}
 	}},
+	{"a status-only change leaves the server's settings", func(t *testing.T, st store.Store) {
+		// A version that is gone upstream is marked deleted by a caller that
+		// read the server before the upstream's current versions were
+		// applied. What those versions said about who sees the server stands.
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		v1 := mirrorInput(up, "org.mirror/gone", "1.0.0")
+		v1.Version.IsLatest = true
+		mirrorMCP(t, st, v1, model.MirrorCreated)
+		v2 := mirrorInput(up, "org.mirror/gone", "2.0.0")
+		v2.Visibility, v2.Listed, v2.Version.IsLatest = model.VisibilityInternal, false, true
+		mirrorMCP(t, st, v2, model.MirrorCreated)
+
+		gone := v1 // still says public and listed
+		gone.StatusOnly, gone.Version.IsLatest = true, false
+		gone.Version.Status, gone.Version.StatusMessage = model.MCPStatusDeleted, "gone"
+		mirrorMCP(t, st, gone, model.MirrorUpdated)
+		srv := mcpServer(t, st, "org.mirror/gone")
+		if srv.Visibility != model.VisibilityInternal || srv.Listed {
+			t.Fatalf("marking a version deleted changed who sees the server: %+v", srv)
+		}
+		if v := mcpVersion(t, st, srv.ID, "1.0.0"); v.Status != model.MCPStatusDeleted || v.StatusMessage != "gone" || v.IsLatest {
+			t.Fatalf("version = %+v", v)
+		}
+		if v := mcpVersion(t, st, srv.ID, "latest"); v.Version != "2.0.0" {
+			t.Fatalf("latest = %s", v.Version)
+		}
+		mirrorMCP(t, st, gone, model.MirrorUnchanged)
+
+		// Which version is latest is not recomputed.
+		last := v2
+		last.Visibility, last.Listed, last.StatusOnly, last.Version.IsLatest = model.VisibilityPublic, true, true, false
+		last.Version.Status = model.MCPStatusDeleted
+		mirrorMCP(t, st, last, model.MirrorUpdated)
+		if _, err := st.GetMCPVersion(ctx, srv.ID, "latest"); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("latest after its version was marked deleted: %v", err)
+		}
+		if got := mcpServer(t, st, "org.mirror/gone"); got.Visibility != model.VisibilityInternal || got.Listed {
+			t.Fatalf("server = %+v", got)
+		}
+
+		// It never creates a version, a server or a namespace.
+		absent := mirrorInput(up, "org.mirror/gone", "3.0.0")
+		absent.StatusOnly = true
+		if _, err := st.UpsertMirroredMCP(ctx, absent, audit); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("status of a version that is not stored: %v", err)
+		}
+		absent = mirrorInput(up, "org.nowhere/srv", "1.0.0")
+		absent.StatusOnly = true
+		if _, err := st.UpsertMirroredMCP(ctx, absent, audit); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("status of a server that is not stored: %v", err)
+		}
+		if _, err := st.GetMCPServer(ctx, "org.nowhere/srv"); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a status-only change created a server: %v", err)
+		}
+		if _, err := st.GetNamespace(ctx, "org.nowhere"); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a status-only change created a namespace: %v", err)
+		}
+
+		// Nor is it a way around the upstream's own limit.
+		wide := mirrorInput(up, "org.mirror/wide", "1.0.0")
+		mirrorMCP(t, st, wide, model.MirrorCreated)
+		internal := model.VisibilityInternal
+		lowered, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{Visibility: &internal}, audit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wide.ConfigVersion, wide.StatusOnly, wide.Version.Status = lowered.ConfigVersion, true, model.MCPStatusDeprecated
+		mirrorMCP(t, st, wide, model.MirrorUpdated)
+		if got := mcpServer(t, st, "org.mirror/wide"); got.Visibility != model.VisibilityInternal {
+			t.Fatalf("server of an internal upstream = %+v", got)
+		}
+	}},
 	{"mirror locks exclude each other by key", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		release, err := st.LockMirror(ctx, "skill:org.a/x")
