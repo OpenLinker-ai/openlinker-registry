@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -892,6 +893,78 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("an unusable document of a recorded version", func(t *testing.T) {
+		// The content of a recorded version never changes here. When the
+		// upstream's document for it is malformed now, or is not the
+		// recorded one any more, what the upstream says about the version
+		// (it is deleted, it is deprecated) still has to arrive, in the run
+		// that reads it: the watermark moves on.
+		now := time.Now().UTC().Truncate(time.Second)
+		t1, t2, t3, t4 := now.Add(-4*time.Hour), now.Add(-3*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour)
+		entry := func(name, version, description, status string, updated time.Time) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": description, "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": status != "deleted",
+					"updatedAt": updated.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
+		}
+		phase := 1
+		broken := entry("com.feed/a", "1.0.0", "d\x00", "deleted", t2) // a NUL: not a storable document
+		edited := entry("com.feed/b", "1.0.0", "another description", "deprecated", t3)
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				switch phase {
+				case 1:
+					_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a", "1.0.0", "d", "active", t1), entry("com.feed/b", "1.0.0", "d", "active", t1)}})
+				case 2:
+					_ = enc.Encode(map[string]any{"servers": []map[string]any{broken, entry("com.feed/c", "1.0.0", "d", "active", t3)}})
+				default:
+					_ = enc.Encode(map[string]any{"servers": []map[string]any{edited, entry("com.feed/c", "2.0.0", "d", "active", t4)}})
+				}
+			case "/v0.1/servers/com.feed%2Fa/versions/1.0.0":
+				_ = enc.Encode(broken)
+			case "/v0.1/servers/com.feed%2Fb/versions/1.0.0":
+				_ = enc.Encode(edited)
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		cursorOf := func(s map[string]any) time.Time {
+			c, _ := s["cursor"].(string)
+			at, _ := time.Parse(time.RFC3339Nano, c)
+			return at
+		}
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_created") != 2 {
+			t.Fatalf("first sync: %v", s)
+		}
+		phase = 2
+		s := e.sync("feed")
+		r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fa/versions/1.0.0", "", "", nil), 200, "version with a malformed upstream document")
+		if official(r.JSON)["status"] != "deleted" || !cursorOf(s).Equal(t3) || stat(s, "mcp_state_only") != 1 {
+			t.Fatalf("a deletion that came with a malformed document: the version is %v, sync: %v", official(r.JSON)["status"], s)
+		}
+		phase = 3
+		s = e.sync("feed")
+		r = e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fb/versions/1.0.0", "", "", nil), 200, "version with an edited upstream document")
+		server, _ := r.JSON["server"].(map[string]any)
+		if official(r.JSON)["status"] != "deprecated" || server["description"] != "d" || !cursorOf(s).Equal(t4) {
+			t.Fatalf("a deprecation that came with other content: status %v, description %v, sync: %v", official(r.JSON)["status"], server["description"], s)
+		}
+		// A malformed document of a version that is not recorded is still
+		// just skipped.
+		broken["server"].(map[string]any)["name"], phase = "com.feed/never", 2
+		if s = e.sync("feed"); stat(s, "mcp_skipped") != 1 || stat(s, "mcp_state_only") != 0 {
+			t.Fatalf("a malformed document of an unknown version: %v", s)
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fnever/versions/1.0.0", "", "", nil), 404, "unknown version")
+	})
+
 	t.Run("a listing page larger than the response cap", func(t *testing.T) {
 		// Large documents make a full page exceed what one response may
 		// carry, although each document is fine. The sync asks for smaller
@@ -1555,6 +1628,190 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		r := e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "detail")
 		if versions, _ := r.JSON["versions"].([]any); len(versions) != 3 {
 			t.Fatalf("each digest is one version: %s", r.Body)
+		}
+	})
+
+	t.Run("a restriction on a skill with too many versions", func(t *testing.T) {
+		// A mirrored skill grows beyond the number of versions this
+		// instance imports, and the upstream restricts it. No more versions
+		// are imported, but the restriction must still arrive.
+		up := NewEnv(t, newStore(t), Options{})
+		up.namespace("com.acme", "domain")
+		pub := up.publisher("com.acme")
+		up.Expect(up.Do("POST", "/v1/skills/com.acme/big/versions?version=v1", pub, "text/markdown", md("big", "Big", "MIT")), 201, "upstream version")
+		grown := false
+		// The upstream as seen through a proxy that, once grown, reports the
+		// skill as internal with a thousand more versions.
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			req, _ := http.NewRequest(r.Method, up.Base+r.URL.RequestURI(), nil)
+			req.Header.Set("Authorization", r.Header.Get("Authorization"))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				w.WriteHeader(502)
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if grown && r.URL.Path == "/v1/skills/com.acme/big" && resp.StatusCode == 200 {
+				var detail map[string]any
+				_ = json.Unmarshal(body, &detail)
+				versions := []any{}
+				for i := 1000; i >= 1; i-- {
+					versions = append(versions, map[string]any{"version": fmt.Sprintf("v9.%d", i), "yanked": false,
+						"artifact_digest": sha([]byte(fmt.Sprint(i)))})
+				}
+				detail["versions"] = append(versions, detail["versions"].([]any)...)
+				detail["visibility"], detail["latest_version"] = "internal", "v9.1000"
+				body, _ = json.Marshal(detail)
+			}
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(proxy.Close)
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": proxy.URL, "visibility": "public"}), 201, "upstream")
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_created") != 1 {
+			t.Fatalf("first sync: %v", s)
+		}
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/big/versions/v1/artifact", "", "", nil), 200, "public artifact")
+		grown = true
+		s := down.sync("hub")
+		reader := down.token([]string{"skills:read"}, nil)
+		for _, path := range []string{"/v1/skills/com.acme/big", "/v1/skills/com.acme/big/versions/v1", "/v1/skills/com.acme/big/versions/v1/artifact"} {
+			if got := down.Do("GET", path, "", "", nil).Status; got != 404 {
+				t.Fatalf("anonymous GET %s = %d after the upstream restricted the skill (sync: %v)", path, got, s)
+			}
+		}
+		r := down.Expect(down.Do("GET", "/v1/skills/com.acme/big", reader, "", nil), 200, "signed-in reader")
+		if versions, _ := r.JSON["versions"].([]any); r.JSON["visibility"] != "internal" || len(versions) != 1 {
+			t.Fatalf("restricted skill: %s", r.Body)
+		}
+	})
+
+	t.Run("a discovery index entry that cannot be used for a while", func(t *testing.T) {
+		// An index still lists a mirrored skill, but its entry has no valid
+		// digest right now. The skill has not left the index and must not be
+		// withdrawn. With an entry whose name cannot be read, the index does
+		// not say which skills it lists, and nothing is withdrawn at all.
+		alpha, beta := md("alpha", "Alpha", "MIT"), md("beta", "Beta", "MIT")
+		betaDigest, listAlpha, nameless := sha(beta), true, false
+		var site *httptest.Server
+		site = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/.well-known/agent-skills/index.json":
+				w.Header().Set("Content-Type", "application/json")
+				skills := []map[string]any{{"name": "beta", "type": "skill-md", "description": "Beta", "url": site.URL + "/beta/SKILL.md", "digest": betaDigest}}
+				if listAlpha {
+					skills = append(skills, map[string]any{"name": "alpha", "type": "skill-md", "description": "Alpha", "url": site.URL + "/alpha/SKILL.md", "digest": sha(alpha)})
+				}
+				if nameless {
+					skills = append(skills, map[string]any{"type": "skill-md", "url": site.URL + "/x/SKILL.md", "digest": sha(alpha)})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"skills": skills})
+			case "/alpha/SKILL.md":
+				_, _ = w.Write(alpha)
+			case "/beta/SKILL.md":
+				_, _ = w.Write(beta)
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		t.Cleanup(site.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "site", "kind": "agent-skills", "base_url": site.URL, "target_namespace": "mirror.site", "visibility": "public"}), 201, "upstream")
+		read := func(name string) int { return e.Do("GET", "/v1/skills/mirror.site/"+name, "", "", nil).Status }
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_created") != 2 {
+			t.Fatalf("first sync: %v", s)
+		}
+		betaDigest = "sha256:pending"
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_withdrawn") != 0 || read("beta") != 200 {
+			t.Fatalf("a listed entry without a usable digest was withdrawn (GET = %d): %v", read("beta"), s)
+		}
+		betaDigest = sha(beta)
+		listAlpha, nameless = false, true
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_withdrawn") != 0 || stat(s, "skills_pending") != 1 || read("alpha") != 200 {
+			t.Fatalf("an index with an unreadable entry was taken as complete (GET = %d): %v", read("alpha"), s)
+		}
+		nameless = false
+		if s := e.sync("site"); stat(s, "skills_withdrawn") != 1 || read("alpha") != 404 || read("beta") != 200 {
+			t.Fatalf("an entry that really left the index: alpha %d, beta %d: %v", read("alpha"), read("beta"), s)
+		}
+	})
+
+	t.Run("a namespace that is no longer selected", func(t *testing.T) {
+		// The administrator takes a namespace out of what an upstream
+		// mirrors. Nothing is read for it any more, so its entries could
+		// not follow the upstream (a restriction, a deletion): they are
+		// withdrawn at the next sync, and come back when the namespace is
+		// selected again.
+		up := NewEnv(t, newStore(t), Options{})
+		pubs := map[string]string{}
+		for _, ns := range []string{"com.acme", "com.other"} {
+			up.namespace(ns, "domain")
+			pubs[ns] = up.publisher(ns)
+			up.Expect(up.Do("POST", "/v1/skills/"+ns+"/tool/versions?version=v1", pubs[ns], "text/markdown", md("tool", "Tool", "MIT")), 201, "skill")
+			up.Expect(up.publishMCP(pubs[ns], ns, serverJSON(ns+"/server", "1.0.0", "https://"+ns+".example/mcp")), 201, "server")
+		}
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base, "visibility": "public"}), 201, "upstream")
+		paths := func(ns string) []string {
+			return []string{"/v1/skills/" + ns + "/tool", "/v1/skills/" + ns + "/tool/versions/v1/artifact", "/v0.1/servers/" + ns + "%2Fserver/versions/1.0.0"}
+		}
+		expect := func(step, ns string, want int) {
+			t.Helper()
+			for _, path := range paths(ns) {
+				if got := down.Do("GET", path, "", "", nil).Status; got != want {
+					t.Fatalf("%s: anonymous GET %s = %d, want %d", step, path, got, want)
+				}
+			}
+		}
+		down.sync("hub")
+		expect("mirrored", "com.acme", 200)
+		down.Expect(down.Do("PATCH", "/v1/admin/upstreams/hub", AdminToken, "", map[string]any{"namespace_deny": []string{"com.acme"}}), 200, "deny")
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_withdrawn") != 1 || stat(s, "mcp_withdrawn") != 1 {
+			t.Fatalf("sync after the namespace was denied: %v", s)
+		}
+		expect("denied", "com.acme", 404)
+		expect("denied", "com.other", 200)
+		if s := down.sync("hub"); stat(s, "skills_withdrawn") != 0 || stat(s, "mcp_withdrawn") != 0 {
+			t.Fatalf("a second sync withdrew again: %v", s)
+		}
+		down.Expect(down.Do("PATCH", "/v1/admin/upstreams/hub", AdminToken, "", map[string]any{"namespace_deny": []string{}}), 200, "allow again")
+		down.sync("hub")
+		expect("selected again", "com.acme", 200)
+
+		// The official API has no visibility: there the versions are marked
+		// deleted, and restored when the namespace is selected again.
+		entry := map[string]any{"server": map[string]any{"name": "com.feed/server", "description": "d", "version": "1.0.0",
+			"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+			"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}}
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers", "/v0.1/servers/com.feed%2Fserver/versions":
+				_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{entry}})
+			case "/v0.1/servers/com.feed%2Fserver/versions/1.0.0":
+				_ = json.NewEncoder(w).Encode(entry)
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		status := func() any {
+			return official(e.Do("GET", "/v0.1/servers/com.feed%2Fserver/versions/1.0.0", "", "", nil).JSON)["status"]
+		}
+		e.sync("feed")
+		e.Expect(e.Do("PATCH", "/v1/admin/upstreams/feed", AdminToken, "", map[string]any{"namespace_allow": []string{"io.*"}}), 200, "narrow")
+		if s := e.sync("feed"); s["last_status"] != "ok" || status() != "deleted" {
+			t.Fatalf("a server outside the allow list is still %v: %v", status(), s)
+		}
+		e.Expect(e.Do("PATCH", "/v1/admin/upstreams/feed", AdminToken, "", map[string]any{"namespace_allow": []string{}}), 200, "widen")
+		if s := e.sync("feed"); s["last_status"] != "ok" || status() != "active" {
+			t.Fatalf("a server selected again is %v: %v", status(), s)
 		}
 	})
 

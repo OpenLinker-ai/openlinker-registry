@@ -496,16 +496,30 @@ func clip(s string, max int) string {
 // document is applied only to a version that is already mirrored; the
 // outcome is then "ignored" for anything else. fresh says the document was
 // read just now under the server's mirror lock (see model.MCPMirrorInput).
+//
+// A version that is recorded here never changes its content. So when the
+// upstream's document for it cannot be used (it is malformed now, or differs
+// from what was recorded), what the upstream says about the version still
+// applies: its status, whether it is the latest, and who may see the server.
+// Otherwise a deletion would never arrive. The outcome is then "state_only".
 func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.MCPDoc, onlyExisting, fresh bool) (string, error) {
 	if u.Kind == model.UpstreamMCP && doc.Visibility != "" {
 		return "", errUpstreamKind
 	}
+	stateOnly := false
 	p, err := mcp.Parse(doc.Server, mcp.Options{})
-	if err != nil {
-		return "", err
+	if err == nil && (p.Name != doc.Name || p.Version != doc.Version) {
+		err = &mcp.Error{Code: "name_invalid", Msg: "upstream document does not match its listing"}
 	}
-	if p.Name != doc.Name || p.Version != doc.Version {
-		return "", &mcp.Error{Code: "name_invalid", Msg: "upstream document does not match its listing"}
+	if err != nil {
+		stored, ok, lerr := s.recordedMCP(ctx, u, doc.Name, doc.Version)
+		if lerr != nil {
+			return "", lerr
+		}
+		if !ok {
+			return "", err
+		}
+		p, stateOnly = stored, true
 	}
 	if !u.Allows(p.Namespace) {
 		return "", fail(http.StatusForbidden, "namespace_not_allowed", "namespace is not allowed for this upstream")
@@ -545,12 +559,56 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 	if status == model.MCPStatusActive {
 		msg = ""
 	}
-	return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, ConfigVersion: u.ConfigVersion, Namespace: p.Namespace, Name: p.Name,
-		Visibility: visibility, Listed: listed, Fresh: fresh, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
-			Status: status, StatusMessage: msg, StatusChangedAt: doc.StatusChangedAt, PublishedAt: doc.PublishedAt,
-			IsLatest: doc.IsLatest && status != model.MCPStatusDeleted, CreatedBy: actor}},
-		auditEvent(actor, "mcp.mirror", p.Namespace, p.Name+"@"+p.Version, map[string]any{"digest": p.Digest, "status": status,
-			"visibility": visibility, "upstream": u.Name}))
+	upsert := func(p *mcp.Parsed) (string, error) {
+		return s.Store.UpsertMirroredMCP(ctx, model.MCPMirrorInput{UpstreamID: u.ID, ConfigVersion: u.ConfigVersion, Namespace: p.Namespace, Name: p.Name,
+			Visibility: visibility, Listed: listed, Fresh: fresh, Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest,
+				Status: status, StatusMessage: msg, StatusChangedAt: doc.StatusChangedAt, PublishedAt: doc.PublishedAt,
+				IsLatest: doc.IsLatest && status != model.MCPStatusDeleted, CreatedBy: actor}},
+			auditEvent(actor, "mcp.mirror", p.Namespace, p.Name+"@"+p.Version, map[string]any{"digest": p.Digest, "status": status,
+				"visibility": visibility, "upstream": u.Name}))
+	}
+	res, err := upsert(p)
+	var ce *model.ConflictError
+	if errors.As(err, &ce) && ce.Code == "digest_mismatch" {
+		// The upstream now serves other content for this version. The
+		// recorded content stays; the version's state is still the upstream's.
+		stored, ok, lerr := s.recordedMCP(ctx, u, p.Name, p.Version)
+		if lerr != nil {
+			return "", lerr
+		}
+		if !ok {
+			return "", err
+		}
+		stateOnly = true
+		res, err = upsert(stored)
+	}
+	if err == nil && stateOnly && res != model.MirrorStale {
+		res = "state_only"
+	}
+	return res, err
+}
+
+// recordedMCP returns a version of a server this upstream mirrors, as it is
+// recorded here.
+func (s *Service) recordedMCP(ctx context.Context, u model.Upstream, name, version string) (*mcp.Parsed, bool, error) {
+	if name == "" || version == "" || version == "latest" {
+		return nil, false, nil
+	}
+	srv, err := s.Store.GetMCPServer(ctx, name)
+	if err == nil && srv.Upstream != u.Name {
+		return nil, false, nil
+	}
+	var v model.MCPVersion
+	if err == nil {
+		v, err = s.Store.GetMCPVersion(ctx, srv.ID, version)
+	}
+	if errors.Is(err, model.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &mcp.Parsed{Name: srv.Name, Namespace: srv.Namespace, Version: v.Version, Canonical: v.ServerJSON, Digest: v.Digest}, true, nil
 }
 
 // ResolveSkill returns a skill, forwarding a local miss to the upstream

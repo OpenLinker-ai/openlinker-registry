@@ -270,6 +270,21 @@ func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstrea
 			if ctx.Err() != nil {
 				return pending, ctx.Err()
 			}
+			if !u.Allows(srv.Namespace) {
+				// No longer selected: documents of this namespace are not
+				// applied any more, so the server is withdrawn rather than
+				// left as it was.
+				release, err := s.Store.LockMirror(ctx, "mcp:"+srv.Name)
+				if err != nil {
+					return pending, err
+				}
+				err = s.withdrawMCP(ctx, u, srv, stats)
+				release()
+				if err != nil {
+					return pending, err
+				}
+				continue
+			}
 			covered := seen[srv.Name]
 			if covered {
 				local, err := s.Store.ListMCPVersions(ctx, srv.ID)
@@ -495,6 +510,21 @@ func (s *Service) syncSkills(ctx context.Context, u model.Upstream, c *upstream.
 			if listed[row.Namespace+"/"+row.Name] {
 				continue
 			}
+			if !u.Allows(row.Namespace) {
+				// The namespace is no longer selected for this upstream.
+				// Nothing is read for it any more, so the entry would stay
+				// as it was whatever the upstream does: it is withdrawn.
+				release, err := s.Store.LockMirror(ctx, "skill:"+row.Namespace+"/"+row.Name)
+				if err != nil {
+					return err
+				}
+				err = s.withdrawSkill(ctx, u, row.Namespace, row.Name, stats)
+				release()
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			if err := s.refreshSkill(ctx, u, c, row.Namespace, row.Name, stats); err != nil {
 				return err
 			}
@@ -658,9 +688,6 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 		}
 		return fail(http.StatusForbidden, "upstream_private", "the upstream does not share this entry")
 	}
-	if len(d.Versions) > maxSkillVersions {
-		return invalid("too_many_versions", "upstream skill has too many versions to mirror")
-	}
 	actor := "upstream:" + u.Name
 	local, err := s.Store.GetSkill(ctx, d.Namespace, d.Name)
 	exists := err == nil
@@ -669,6 +696,17 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 	}
 	if exists && local.Upstream != u.Name {
 		return model.ErrNamespaceManaged()
+	}
+	// A skill with more versions than this is not imported. One that is
+	// mirrored already still follows what the upstream says about it and
+	// about the versions recorded here (a restriction, a yank); only new
+	// versions are no longer added.
+	tooMany := invalid("too_many_versions", "upstream skill has too many versions to mirror")
+	if len(d.Versions) <= maxSkillVersions {
+		tooMany = nil
+	}
+	if tooMany != nil && !exists {
+		return tooMany
 	}
 	// A yank is final and nothing of a yanked skill is served: there is
 	// nothing to gain from recording more of its history, and the store does
@@ -762,6 +800,9 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			}
 			changed = true
 		}
+	}
+	if tooMany != nil {
+		return tooMany
 	}
 	created := false
 	// Oldest first, stopping at the first version that cannot be recorded,
@@ -975,16 +1016,22 @@ func (s *Service) buildURLEntry(entryType string, data []byte) ([]skill.File, st
 // into the upstream's target namespace. Such an index has no versions, so
 // each distinct digest becomes the version "sha-<first 12 hex digits>".
 func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upstream.Client, stats syncStats) error {
-	entries, dropped, err := c.WellKnownIndex(ctx)
+	index, err := c.WellKnownIndex(ctx)
 	if err != nil {
 		return err
 	}
-	stats["skills_skipped"] += dropped
-	// Every name the index lists, before any cap: an entry is only withdrawn
-	// when the index really no longer has it.
+	entries := index.Entries
+	stats["skills_skipped"] += index.Dropped
+	// Every name the index lists, before any cap and whether or not the
+	// entry can be used: an entry is only withdrawn when the index really no
+	// longer has it. A listed entry that cannot be used right now (a digest
+	// that is missing or malformed) stays as it is.
 	indexed := map[string]bool{}
 	for _, e := range entries {
 		indexed[e.Name] = true
+	}
+	for _, name := range index.DroppedNames {
+		indexed[name] = true
 	}
 	if len(entries) > maxIndexEntries {
 		stats["skills_skipped"] += len(entries) - maxIndexEntries
@@ -1088,6 +1135,12 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 		}
 	}
 	// Entries mirrored earlier that the index no longer lists are withdrawn.
+	// An index with an entry whose name cannot be read does not tell which
+	// skills it lists: nothing is withdrawn on its word.
+	if !index.Complete {
+		stats.add("skills_pending")
+		return nil
+	}
 	afterNS, afterName := "", ""
 	for {
 		rows, err := s.Store.ListMirroredSkills(ctx, u.ID, afterNS, afterName, 200)

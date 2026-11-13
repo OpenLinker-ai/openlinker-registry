@@ -48,10 +48,11 @@ func TestWellKnownIndex(t *testing.T) {
 		http.NotFound(w, r)
 	})
 	c := newClient(f.URL + "/site")
-	entries, dropped, err := c.WellKnownIndex(ctx)
+	read, err := c.WellKnownIndex(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	entries, dropped := read.Entries, read.Dropped
 	want := []upstream.IndexEntry{
 		{Name: "relative", Type: "skill-md", Description: "Relative to the index", URL: f.URL + "/site/.well-known/agent-skills/relative/SKILL.md", Digest: d1},
 		{Name: "rooted", Type: "archive", Description: "Rooted path", URL: f.URL + "/files/rooted.tar.gz?v=2", Digest: d2},
@@ -70,12 +71,18 @@ func TestWellKnownIndex(t *testing.T) {
 	if dropped != 24 {
 		t.Errorf("dropped = %d, want 24", dropped)
 	}
+	// The index still lists the entries it names, usable or not; with
+	// entries that have no readable name it is not a complete list.
+	if got := strings.Join(read.DroppedNames, " "); read.Complete || got != "no-url empty-url bad-type no-type no-digest upper-digest "+
+		"short-digest md5-digest bare-digest padded-digest ftp file javascript userinfo fragment unparseable typed-url" {
+		t.Errorf("complete = %v, dropped names = %s", read.Complete, got)
+	}
 	if got := f.uris(); len(got) != 1 || got[0] != "/site/.well-known/agent-skills/index.json" {
 		t.Fatalf("requests = %v", got)
 	}
 
 	// A site without an index.
-	_, _, err = newClient(f.URL).WellKnownIndex(ctx)
+	_, err = newClient(f.URL).WellKnownIndex(ctx)
 	wantNotFound(t, "WellKnownIndex", err)
 }
 
@@ -92,9 +99,9 @@ func TestWellKnownIndexShapes(t *testing.T) {
 	}
 	for body, code := range cases {
 		f := newFake(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) })
-		entries, dropped, err := newClient(f.URL).WellKnownIndex(ctx)
-		if ucode(err) != code || len(entries) != 0 || dropped != 0 {
-			t.Errorf("%q: %v %d %v, want code %q", body, entries, dropped, err, code)
+		index, err := newClient(f.URL).WellKnownIndex(ctx)
+		if ucode(err) != code || len(index.Entries) != 0 || index.Dropped != 0 || index.Complete != (err == nil) {
+			t.Errorf("%q: %+v %v, want code %q", body, index, err, code)
 		}
 		if err != nil && strings.Contains(err.Error(), "SECRET-BODY") {
 			t.Errorf("error echoes the body: %v", err)

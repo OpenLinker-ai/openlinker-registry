@@ -169,9 +169,10 @@ func TestTokenOnlyToBaseOrigin(t *testing.T) {
 		_, _ = w.Write([]byte("base"))
 	})
 	c := newClient(base.URL)
-	entries, dropped, err := c.WellKnownIndex(ctx)
-	if err != nil || dropped != 0 || len(entries) != 2 {
-		t.Fatalf("%v %d %v", entries, dropped, err)
+	index, err := c.WellKnownIndex(ctx)
+	entries, dropped := index.Entries, index.Dropped
+	if err != nil || dropped != 0 || len(entries) != 2 || !index.Complete {
+		t.Fatalf("%+v %v", index, err)
 	}
 	for i, want := range []string{"base", "other"} {
 		body, err := c.Fetch(ctx, entries[i].URL, 1<<10)
@@ -267,7 +268,7 @@ func TestRedirectIsAnErrorAndNotFollowed(t *testing.T) {
 		"GetSkill":         func() error { _, err := c.GetSkill(ctx, "io.github.alice", "demo"); return err },
 		"GetSkillVersion":  func() error { _, err := c.GetSkillVersion(ctx, "io.github.alice", "demo", "1.0.0"); return err },
 		"GetSkillArtifact": func() error { _, err := c.GetSkillArtifact(ctx, "io.github.alice", "demo", "1.0.0", 100); return err },
-		"WellKnownIndex":   func() error { _, _, err := c.WellKnownIndex(ctx); return err },
+		"WellKnownIndex":   func() error { _, err := c.WellKnownIndex(ctx); return err },
 		"Fetch":            func() error { _, err := c.Fetch(ctx, f.URL+"/file", 100); return err },
 	}
 	for name, call := range calls {
@@ -360,7 +361,7 @@ func TestErrorsNeverContainToken(t *testing.T) {
 	add(err) // 302
 	_, _, err = c.ListSkills(ctx, "", 0)
 	add(err) // too large
-	_, _, err = c.WellKnownIndex(ctx)
+	_, err = c.WellKnownIndex(ctx)
 	add(err) // not JSON
 	_, err = c.Fetch(ctx, f.URL+"/missing", 10)
 	add(err)

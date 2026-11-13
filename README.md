@@ -225,8 +225,15 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   arrive. A malformed entry is skipped, not fatal. A skill with a version
   that cannot be recorded here (not served yet, malformed, or beyond this
   instance's limits) waits for a later run, newer versions included, so
-  versions are never recorded out of order or left out. A change the
-  upstream could not confirm holds the watermark until it is applied. When the upstream throttles a sync
+  versions are never recorded out of order or left out. A skill with more
+  versions than this instance imports (1000) gets no new versions, but still
+  follows the upstream's restrictions and yanks. The content of a recorded
+  MCP version never changes; when the upstream's document for it is
+  malformed or differs, its status and the server's visibility still follow
+  the upstream (counted as `mcp_state_only`). A change the
+  upstream could not confirm holds the watermark until it is applied, and
+  nothing is taken as removed on the word of a list that could not be read
+  completely. When the upstream throttles a sync
   (`429`), the sync waits for `Retry-After` and continues. One run per
   upstream is active at a time, across replicas. Changing what an upstream selects (URL,
   allow and deny lists, `latest_only`, `visibility`) starts the next sync
@@ -240,7 +247,9 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   administrators still see it, cached bytes included) and comes back if the
   upstream shares it again. `visibility` on the upstream is the widest a
   mirrored entry can be; lowering it to `internal` applies at once to what
-  is already mirrored.
+  is already mirrored. Entries of a namespace that the allow and deny lists
+  no longer select are withdrawn at the next sync, because nothing is read
+  for them any more; they come back when the namespace is selected again.
 - **Use the right kind.** Another openlinker-registry must be configured as
   `openlinker-registry`; as `mcp-registry` its sync is refused, because that
   kind follows the official change feed, which carries no visibility.
