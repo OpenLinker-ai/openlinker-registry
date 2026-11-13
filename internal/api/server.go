@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/ratelimit"
@@ -73,7 +74,55 @@ func (s *Server) Handler() http.Handler {
 		outer.HandleFunc("GET /healthz", s.healthz)
 		h = outer
 	}
-	return s.recoverer(s.headers(s.logger(s.authenticate(s.limit(h)))))
+	return s.recoverer(s.headers(s.logger(s.wellFormed(s.authenticate(s.limit(h))))))
+}
+
+// storable reports whether text can be used in a lookup or stored as it is:
+// valid UTF-8 without NUL (PostgreSQL text accepts neither).
+func storable(text string) bool {
+	return utf8.ValidString(text) && !strings.ContainsRune(text, 0)
+}
+
+// wellFormed refuses requests whose path or query carry text that no entry
+// can have (invalid UTF-8, NUL), before it reaches a lookup. Every store
+// then answers such a request the same way.
+func (s *Server) wellFormed(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ok := storable(r.URL.Path)
+		for key, values := range r.URL.Query() {
+			ok = ok && storable(key)
+			for _, v := range values {
+				ok = ok && storable(v)
+			}
+		}
+		if !ok {
+			s.reject(w, r, &registry.Error{Status: http.StatusBadRequest, Code: "invalid_request", Msg: "path and query must be valid UTF-8 without NUL"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// hasNUL reports whether a decoded JSON value has a NUL in any string or
+// object key.
+func hasNUL(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.ContainsRune(t, 0)
+	case []any:
+		for _, item := range t {
+			if hasNUL(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range t {
+			if strings.ContainsRune(key, 0) || hasNUL(item) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) routes(m *http.ServeMux) {
@@ -305,14 +354,23 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(strings.ToLower(ct), "application/json") {
 		return &registry.Error{Status: http.StatusUnsupportedMediaType, Code: "content_type", Msg: "expected application/json"}
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxJSONBody))
+	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			return &registry.Error{Status: http.StatusRequestEntityTooLarge, Code: "body_too_large", Msg: "request body too large"}
 		}
+		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "request body could not be read"}
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
 		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "invalid JSON body: " + sanitizeJSONErr(err)}
+	}
+	// No field of any request holds a NUL, and PostgreSQL text cannot.
+	var generic any
+	if json.Unmarshal(body, &generic) == nil && hasNUL(generic) {
+		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "strings must not contain NUL"}
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "request body must contain a single JSON object"}

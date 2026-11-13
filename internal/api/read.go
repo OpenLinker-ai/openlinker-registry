@@ -168,7 +168,7 @@ func decodeCursor(c string) (string, string, bool) {
 		return "", "", false
 	}
 	ns, name, ok := strings.Cut(string(b), "\x00")
-	return ns, name, ok && utf8.ValidString(ns) && utf8.ValidString(name)
+	return ns, name, ok && storable(ns) && storable(name)
 }
 
 func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {

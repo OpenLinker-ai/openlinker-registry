@@ -591,7 +591,12 @@ func (s *Service) mirrorMCP(ctx context.Context, u model.Upstream, doc upstream.
 // recordedMCP returns a version of a server this upstream mirrors, as it is
 // recorded here.
 func (s *Service) recordedMCP(ctx context.Context, u model.Upstream, name, version string) (*mcp.Parsed, bool, error) {
-	if name == "" || version == "" || version == "latest" {
+	// Name and version come from an upstream document that could not be
+	// used: only an identity an entry can have is looked up.
+	if _, _, ok := mcp.SplitName(name); !ok || version == "latest" || !utf8.ValidString(version) || strings.ContainsRune(version, 0) {
+		return nil, false, nil
+	}
+	if n := utf8.RuneCountInString(version); n < 1 || n > 255 {
 		return nil, false, nil
 	}
 	srv, err := s.Store.GetMCPServer(ctx, name)

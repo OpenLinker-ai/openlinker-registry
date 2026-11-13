@@ -116,13 +116,17 @@ func encodeMCPCursor(name, version string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(name + "\x00" + version))
 }
 
+// maxMCPCursor is the longest (name, version) a cursor can name: a server
+// name of 200 bytes and a version of 255 characters of up to 4 bytes each.
+const maxMCPCursor = 200 + 1 + 4*255
+
 func decodeMCPCursor(c string) (string, string, bool) {
 	b, err := base64.RawURLEncoding.DecodeString(c)
-	if err != nil || len(b) > 512 {
+	if err != nil || len(b) > maxMCPCursor {
 		return "", "", false
 	}
 	name, version, ok := strings.Cut(string(b), "\x00")
-	return name, version, ok && name != "" && utf8.ValidString(name) && utf8.ValidString(version)
+	return name, version, ok && name != "" && storable(name) && storable(version)
 }
 
 func badQuery(msg string) error {
@@ -140,7 +144,7 @@ func (s *Server) mcpQuery(r *http.Request, searchParam string, defaultLimit int)
 	if q.Mode != "" && !slices.Contains([]string{model.MCPModeRegistered, model.MCPModeIndexed, model.MCPModeMirrored}, q.Mode) {
 		return q, 0, badQuery("mode must be registered, indexed or mirrored")
 	}
-	if len(q.Version) > 255 || len(q.Namespace) > 128 {
+	if utf8.RuneCountInString(q.Version) > 255 || len(q.Namespace) > 128 {
 		return q, 0, badQuery("version or namespace is too long")
 	}
 	if v := qv.Get("updated_since"); v != "" {

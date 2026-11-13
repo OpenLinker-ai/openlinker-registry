@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ func runHardening(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("mcp sync", func(t *testing.T) { runMCPSyncRules(t, newStore) })
 	t.Run("skill sync", func(t *testing.T) { runSkillSyncRules(t, newStore) })
 	t.Run("limits and error formats", func(t *testing.T) { runLimitsAndFormats(t, newStore) })
+	t.Run("odd names, versions and requests", func(t *testing.T) { runOddInputs(t, newStore) })
 }
 
 // runMirrorVisibility mirrors from an upstream that shows this instance more
@@ -2028,6 +2030,115 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2F"+name+"/versions/1.0.0", "", "", nil), 200, name)
 			if official(r.JSON)["status"] != "deleted" {
 				t.Fatalf("%s: %s", name, r.Body)
+			}
+		}
+	})
+}
+
+// runOddInputs covers text that is legal JSON or a legal URL but that no
+// entry can have, and the longest version a server may have. Every store
+// must answer the same way.
+func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
+	t.Run("an upstream entry with a NUL in its name", func(t *testing.T) {
+		// The entry is skipped like any malformed one. It must not reach a
+		// lookup that fails and ends the sync before the entries after it.
+		entry := func(name string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": "1.0.0",
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}}
+		}
+		odd := entry("com.feed/ok")
+		odd["server"].(map[string]any)["version"] = "1.0.0\x00"
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.EscapedPath() != "/v0.1/servers" {
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{entry("com.feed/s\x00"), odd, entry("com.feed/ok")}})
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_skipped") != 2 || stat(s, "mcp_created") != 1 {
+			t.Fatalf("sync with entries that have a NUL in name or version: %v", s)
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fok/versions/1.0.0", "", "", nil), 200, "the entry after the odd ones")
+	})
+
+	t.Run("requests with text no entry can have", func(t *testing.T) {
+		e := NewEnv(t, newStore(t), Options{})
+		e.namespace("com.acme", "domain")
+		pub := e.publisher("com.acme")
+		e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/s", "1.0.0", "https://s.acme.example/mcp")), 201, "publish")
+		cursor := base64.RawURLEncoding.EncodeToString([]byte("com.acme/s\x001.0.0\x00"))
+		for _, path := range []string{
+			"/v0.1/servers/com.acme%2Fs%00/versions/1.0.0", "/v0.1/servers/com.acme%2Fs/versions/1%00", "/v0.1/servers/com.acme%2Fs%FF/versions/1.0.0",
+			"/v0.1/servers?search=%00", "/v0.1/servers?version=%FF", "/v0.1/servers?cursor=" + cursor,
+			"/v1/mcp/servers/com.acme/s%00", "/v1/mcp/servers?namespace=com%00", "/v1/skills/com.acme/x%00", "/v1/skills/com.acme%FF/x",
+			"/v1/skills?q=%00", "/v1/skills/com.acme/x/versions/1%00/artifact", "/ns/com%00/.well-known/agent-skills/index.json",
+		} {
+			r := e.Do("GET", path, "", "", nil)
+			if r.Status != 400 {
+				t.Errorf("GET %s = %d %s, want 400", path, r.Status, r.Body)
+			}
+			if _, isString := r.JSON["error"].(string); strings.HasPrefix(path, "/v0.1/") && !isString {
+				t.Errorf("GET %s: official API error body: %s", path, r.Body)
+			}
+		}
+		r := e.Do("POST", "/v1/mcp/servers/com.acme/s/status", pub, "", map[string]any{"status": "deprecated", "message": "old\x00"})
+		if r.Status != 400 || errCode(r) != "invalid_json" {
+			t.Errorf("a NUL in a JSON body: %d %s", r.Status, r.Body)
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers/com.acme%2Fs/versions/1.0.0", "", "", nil), 200, "the server is unaffected")
+	})
+
+	t.Run("the longest version", func(t *testing.T) {
+		// A version may have 255 characters, of any script. Listings must
+		// page past it, filter by it and address it.
+		long := strings.Repeat("é", 255)
+		e := NewEnv(t, newStore(t), Options{})
+		e.namespace("com.acme", "domain")
+		pub := e.publisher("com.acme")
+		for _, v := range []string{"1.0.0", long, "2.0.0"} {
+			e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/s", v, "https://s.acme.example/mcp")), 201, "publish")
+		}
+		for _, base := range []string{"/v0.1/servers?limit=1", "/v0/servers?limit=1"} {
+			seen, cursor := map[string]bool{}, ""
+			for page := 0; page < 10; page++ {
+				path := base
+				if cursor != "" {
+					path += "&cursor=" + url.QueryEscape(cursor)
+				}
+				r := e.Expect(e.Do("GET", path, "", "", nil), 200, "page of "+base)
+				for _, item := range r.JSON["servers"].([]any) {
+					entry := item.(map[string]any)
+					if server, ok := entry["server"].(map[string]any); ok {
+						entry = server
+					}
+					seen[entry["version"].(string)] = true
+				}
+				cursor, _ = r.JSON["next_cursor"].(string)
+				if meta, ok := r.JSON["metadata"].(map[string]any); ok {
+					cursor, _ = meta["nextCursor"].(string)
+				}
+				if cursor == "" {
+					break
+				}
+			}
+			if len(seen) != 3 || !seen[long] {
+				t.Fatalf("%s: paging saw %d versions (the long one: %v)", base, len(seen), seen[long])
+			}
+		}
+		r := e.Expect(e.Do("GET", "/v0.1/servers?version="+url.QueryEscape(long), "", "", nil), 200, "filter by the long version")
+		if got := servers(r); len(got) != 1 {
+			t.Fatalf("filter by the long version: %d entries", len(got))
+		}
+		for _, path := range []string{"/v0.1/servers/com.acme%2Fs/versions/", "/v1/mcp/servers/com.acme/s/versions/"} {
+			r = e.Expect(e.Do("GET", path+url.PathEscape(long), "", "", nil), 200, "the long version by name")
+			if !strings.Contains(string(r.Body), long) {
+				t.Fatalf("GET %s<long>: %s", path, r.Body)
 			}
 		}
 	})
