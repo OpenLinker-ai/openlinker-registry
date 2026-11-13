@@ -62,6 +62,12 @@ type Store interface {
 	// version serves its content (see model.Version.MirrorServed).
 	SetVersionMirrorServed(ctx context.Context, versionID int64, served bool, audit model.AuditEvent) error
 
+	// SetVersionLocatorURL records where the content of a URL-indexed
+	// version is served now (ErrNotFound for any other version). Versions
+	// are read with that URL in their locator from then on; nothing else
+	// about the version changes.
+	SetVersionLocatorURL(ctx context.Context, versionID int64, url string, audit model.AuditEvent) error
+
 	Search(ctx context.Context, q model.SearchQuery) ([]model.SkillSummary, error)
 	// IndexCandidates returns public, listed, active skills with their latest
 	// non-yanked version. namespace filters by namespace; aliasOnly limits to

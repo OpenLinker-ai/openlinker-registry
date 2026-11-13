@@ -523,15 +523,16 @@ func jsonOrNil[T any](v *T) []byte {
 const versionCols = `id, skill_id, version, mode, frontmatter_name, frontmatter_description, license_kind, license_id,
 	license_text, license_approved, core_compatible, files, artifact_digest, artifact_type, artifact_size,
 	COALESCE(archive_digest, ''), source, locator, indexed_by, COALESCE(check_result, ''), checked_at, yanked_at,
-	yank_reason, created_by, created_at, mirror_served`
+	yank_reason, created_by, created_at, mirror_served, locator_url`
 
 func scanVersion(row pgx.Row) (model.Version, error) {
 	var v model.Version
 	var files, src, loc []byte
+	var locatorURL string
 	err := row.Scan(&v.ID, &v.SkillID, &v.Version, &v.Mode, &v.FrontmatterName, &v.FrontmatterDescription, &v.LicenseKind,
 		&v.LicenseID, &v.LicenseText, &v.LicenseApproved, &v.CoreCompatible, &files, &v.ArtifactDigest, &v.ArtifactType,
 		&v.ArtifactSize, &v.ArchiveDigest, &src, &loc, &v.IndexedBy, &v.CheckResult, &v.CheckedAt, &v.YankedAt,
-		&v.YankReason, &v.CreatedBy, &v.CreatedAt, &v.MirrorServed)
+		&v.YankReason, &v.CreatedBy, &v.CreatedAt, &v.MirrorServed, &locatorURL)
 	if err != nil {
 		return v, err
 	}
@@ -548,6 +549,9 @@ func scanVersion(row pgx.Row) (model.Version, error) {
 		v.Locator = new(model.Locator)
 		if err := json.Unmarshal(loc, v.Locator); err != nil {
 			return v, err
+		}
+		if locatorURL != "" {
+			v.Locator.URL = locatorURL // see SetVersionLocatorURL
 		}
 	}
 	return v, nil
@@ -711,6 +715,11 @@ func (s *Store) SetSkillCurrentVersion(ctx context.Context, skillID int64, versi
 		return err
 	})
 	return out, err
+}
+
+// SetVersionLocatorURL implements store.Store.
+func (s *Store) SetVersionLocatorURL(ctx context.Context, id int64, url string, audit model.AuditEvent) error {
+	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET locator_url = $2 WHERE id = $1 AND locator->>'kind' = 'url'`, id, url)
 }
 
 // SetVersionCheck implements store.Store.

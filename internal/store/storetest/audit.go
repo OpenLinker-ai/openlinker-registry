@@ -198,6 +198,59 @@ var mirrorTests = []testCase{
 			t.Fatalf("after a new version: latest = %s / %s (%s)", s, c, d)
 		}
 	}},
+	{"a URL-indexed version that moved", func(t *testing.T, st store.Store) {
+		// The locator of a version is immutable, except where its content
+		// is served now.
+		ctx := context.Background()
+		up := newUpstream(t, st, "up")
+		put := func(name string, l *model.Locator) model.Version {
+			t.Helper()
+			v := version("sha-a", "spdx")
+			v.Source, v.Locator = nil, l
+			_, out, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "org.site", Name: name, Mode: "indexed",
+				SourceKey: "upstream:up:" + name, Visibility: model.VisibilityPublic, Listed: true, UpstreamID: up.ID,
+				UpstreamConfigVersion: up.ConfigVersion, Version: v}, audit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return out
+		}
+		digest := "sha256:" + strings.Repeat("b", 64)
+		moved := put("moved", &model.Locator{Kind: "url", URL: "https://site.example/old/SKILL.md", Digest: digest, EntryType: "skill-md", Upstream: "up"})
+		other := put("other", &model.Locator{Kind: "registry", Upstream: "up", Namespace: "org.site", Name: "other", Version: "sha-a"})
+		events := auditCount(t, st, "test")
+		if err := st.SetVersionLocatorURL(ctx, moved.ID, "https://site.example/new/SKILL.md", audit); err != nil {
+			t.Fatal(err)
+		}
+		if n := auditCount(t, st, "test"); n != events+1 {
+			t.Fatalf("audit events: %d", n-events)
+		}
+		want := model.Locator{Kind: "url", URL: "https://site.example/new/SKILL.md", Digest: digest, EntryType: "skill-md", Upstream: "up"}
+		got, err := st.GetVersion(ctx, moved.SkillID, "sha-a")
+		if err != nil || got.Locator == nil || *got.Locator != want {
+			t.Fatalf("version = %+v, %v", got.Locator, err)
+		}
+		if vs, _ := st.ListVersions(ctx, moved.SkillID); len(vs) != 1 || *vs[0].Locator != want {
+			t.Fatalf("listed versions = %+v", vs)
+		}
+		cands, err := st.IndexCandidates(ctx, "org.site", false)
+		if err != nil || len(cands) != 2 || *cands[0].Version.Locator != want {
+			t.Fatalf("index candidates = %+v, %v", cands, err)
+		}
+		// Only a URL-indexed version has a URL to move.
+		if err := st.SetVersionLocatorURL(ctx, other.ID, "https://site.example/x", audit); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a version with another kind of locator: %v", err)
+		}
+		if err := st.SetVersionLocatorURL(ctx, moved.ID+1000, "https://site.example/x", audit); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a version that does not exist: %v", err)
+		}
+		if _, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{NamespaceDeny: &[]string{"org.other"}}, audit); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetVersionLocatorURL(model.WithUpstreamGuard(ctx, up.ID, up.ConfigVersion), moved.ID, "https://site.example/y", audit); conflictCode(err) != "upstream_config_changed" {
+			t.Fatalf("under settings that changed: %v", err)
+		}
+	}},
 	{"every mirrored entry can be enumerated", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		up, other := newUpstream(t, st, "up"), newUpstream(t, st, "other")

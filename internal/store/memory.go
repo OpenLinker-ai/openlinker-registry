@@ -454,6 +454,25 @@ func (m *Memory) mutateVersion(ctx context.Context, id int64, audit *model.Audit
 	return nil
 }
 
+// SetVersionLocatorURL implements Store.
+func (m *Memory) SetVersionLocatorURL(ctx context.Context, id int64, url string, audit model.AuditEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.guard(ctx); err != nil {
+		return err
+	}
+	v, ok := m.versions[id]
+	if !ok || v.Locator == nil || v.Locator.Kind != "url" {
+		return model.ErrNotFound
+	}
+	moved := *v.Locator
+	moved.URL = url
+	v.Locator = &moved
+	m.versions[id] = v
+	m.appendAudit(audit)
+	return nil
+}
+
 // YankVersion implements Store.
 func (m *Memory) YankVersion(ctx context.Context, id int64, reason string, at time.Time, audit model.AuditEvent) error {
 	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) {

@@ -1058,14 +1058,19 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 			if err != nil {
 				return err
 			}
-			if _, err := s.Store.GetVersion(ctx, local.ID, version); err == nil {
+			if v, err := s.Store.GetVersion(ctx, local.ID, version); err == nil {
+				// The same content may be served from another URL now.
+				moved, err := s.followIndexURL(ctx, c, actor, local, v, e, stats)
+				if err != nil {
+					return err
+				}
 				// The index may have named another version in between and
 				// now names this one again: it is the current one again.
 				followed, err := s.followLatest(ctx, actor, local, version)
 				if err != nil {
 					return err
 				}
-				if restored || followed {
+				if restored || followed || moved {
 					stats.add("skills_updated")
 				} else {
 					stats.add("skills_unchanged")
@@ -1160,6 +1165,40 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 			return nil
 		}
 	}
+}
+
+// followIndexURL records the URL a discovery index now gives for content
+// that is already recorded as a version, after reading that URL and
+// checking that it serves exactly the recorded bytes. Readers and this
+// registry's own discovery index then use it. A URL that does not serve the
+// content (yet) changes nothing. It reports whether the URL was recorded.
+func (s *Service) followIndexURL(ctx context.Context, c *upstream.Client, actor string, local model.Skill, v model.Version, e upstream.IndexEntry, stats syncStats) (bool, error) {
+	l := v.Locator
+	if l == nil || l.Kind != "url" || l.URL == e.URL || l.Digest != e.Digest {
+		return false, nil
+	}
+	data, err := c.Fetch(ctx, e.URL, s.fetchLimit())
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		stats.add("skills_unavailable")
+		return false, nil
+	}
+	if skill.Digest(data) != l.Digest {
+		stats.add("skills_digest_mismatch")
+		return false, nil
+	}
+	target := local.Name + "@" + v.Version
+	if err := s.Store.SetVersionLocatorURL(ctx, v.ID, e.URL,
+		auditEvent(actor, "version.relocate", local.Namespace, target, map[string]any{"reason": "moved in the discovery index"})); err != nil {
+		return false, err
+	}
+	// The bytes at the new URL were verified just now.
+	if err := s.Store.SetVersionCheck(ctx, v.ID, model.CheckOK, s.Now()); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // followLatest makes the version the upstream names as its latest the one

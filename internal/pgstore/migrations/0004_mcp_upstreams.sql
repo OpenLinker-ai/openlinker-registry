@@ -145,3 +145,9 @@ ALTER TABLE skill_versions ADD COLUMN mirror_served BOOLEAN;
 -- The version a skill's source names as its current one when that is not the
 -- newest ('' otherwise): a discovery index may return to earlier content.
 ALTER TABLE skills ADD COLUMN current_version TEXT NOT NULL DEFAULT '';
+
+-- Where the content of a URL-indexed version is served now, when a
+-- discovery index moved it ('' while it is where the locator says). The
+-- locator itself is immutable; the bytes are verified against its digest
+-- wherever they are read from.
+ALTER TABLE skill_versions ADD COLUMN locator_url TEXT NOT NULL DEFAULT '';

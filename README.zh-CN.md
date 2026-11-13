@@ -21,7 +21,7 @@
 |---|---|---|
 | `openlinker-registry` | 另一个 openlinker-registry | Skill（`/v1`）和 MCP 服务（`/v0.1`） |
 | `mcp-registry` | 任何实现官方 MCP Registry 只读接口的仓库，包括 `registry.modelcontextprotocol.io` | MCP 服务 |
-| `agent-skills` | 发布 `/.well-known/agent-skills/index.json` 的站点 | 其中的 Skill，放进本地指定的命名空间；索引当前给出的摘要对应的版本就是最新版本（站点改回早先内容时也一样） |
+| `agent-skills` | 发布 `/.well-known/agent-skills/index.json` 的站点 | 其中的 Skill，放进本地指定的命名空间；索引当前给出的摘要对应的版本就是最新版本（站点改回早先内容时也一样）；文件只换地址、内容不变时，新地址校验通过后改从新地址读取 |
 
 - **未命中时转发**（`proxy_on_miss`）：按名称读取一个本地没有的条目（或镜像 Skill 的新版本）时，按优先级向上游查询，并把结果镜像下来。只有本来就能看到该上游镜像内容的调用者才会触发转发，匿名调用者不会让仓库去访问镜像为 `internal` 的上游。
 - **定时同步**（`sync_interval_seconds`）：把上游目录镜像到本地，列表和搜索因此完整。MCP 用 `updated_since` 增量同步；状态变更、任意版本的撤回和删除都会传播。已记录的 MCP 版本内容不变；上游对应文档损坏或内容不同，它的状态和服务器可见性仍然跟随上游。上游列表读不完整时，不会据此判定任何条目已被移除。

@@ -1815,6 +1815,73 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a discovery index entry that moves", func(t *testing.T) {
+		// A site moves a skill's file without changing it: same name, same
+		// digest, another URL. The digest is already recorded as a version,
+		// but its content must be read from where it is now. A URL that
+		// does not serve the recorded bytes is not taken over.
+		content := md("tool", "Tool", "MIT")
+		where, indexURL := "/old/SKILL.md", ""
+		var site *httptest.Server
+		site = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/.well-known/agent-skills/index.json":
+				w.Header().Set("Content-Type", "application/json")
+				url := site.URL + where
+				if indexURL != "" {
+					url = site.URL + indexURL
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"skills": []map[string]any{{"name": "tool", "type": "skill-md",
+					"description": "d", "url": url, "digest": sha(content)}}})
+			case where:
+				_, _ = w.Write(content)
+			case "/other/SKILL.md":
+				_, _ = w.Write(md("tool", "Something else", "MIT"))
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		t.Cleanup(site.Close)
+		// Verified content is not trusted for any time: every read goes to
+		// the source.
+		e := NewEnv(t, newStore(t), Options{Loopback: true, VerifyInterval: -1})
+		e.Expect(e.upstream(map[string]any{"name": "site", "kind": "agent-skills", "base_url": site.URL, "target_namespace": "mirror.site", "visibility": "public"}), 201, "upstream")
+		e.sync("site")
+		r := e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "detail")
+		version, _ := r.JSON["latest_version"].(string)
+		artifact := "/v1/skills/mirror.site/tool/versions/" + version + "/artifact"
+		source := func() any {
+			return e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool/versions/"+version, "", "", nil), 200, "version").JSON["source_url"]
+		}
+		e.Expect(e.Do("GET", artifact, "", "", nil), 200, "artifact at the first URL")
+		where = "/new/SKILL.md"
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_updated") != 1 {
+			t.Fatalf("sync after the file moved: %v", s)
+		}
+		if source() != site.URL+"/new/SKILL.md" {
+			t.Fatalf("the version still points to %v", source())
+		}
+		if r := e.Do("GET", artifact, "", "", nil); r.Status != 200 || string(r.Body) != string(content) {
+			t.Fatalf("artifact after the file moved: %d %s", r.Status, r.Body)
+		}
+		r = e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "detail")
+		if versions, _ := r.JSON["versions"].([]any); len(versions) != 1 {
+			t.Fatalf("moving a file created a version: %s", r.Body)
+		}
+		if s := e.sync("site"); stat(s, "skills_unchanged") != 1 {
+			t.Fatalf("a sync without changes: %v", s)
+		}
+		// The index names a URL that serves nothing, then one that serves
+		// other bytes: the recorded URL stays.
+		for bad, counter := range map[string]string{"/missing/SKILL.md": "skills_unavailable", "/other/SKILL.md": "skills_digest_mismatch"} {
+			indexURL = bad
+			if s := e.sync("site"); s["last_status"] != "ok" || stat(s, counter) != 1 || source() != site.URL+"/new/SKILL.md" {
+				t.Fatalf("index URL %s: source %v, sync: %v", bad, source(), s)
+			}
+			e.Expect(e.Do("GET", artifact, "", "", nil), 200, "artifact while the index names "+bad)
+		}
+	})
+
 	t.Run("a license approved upstream later", func(t *testing.T) {
 		// The upstream indexes a skill under a custom license, which it does
 		// not serve until a reviewer approves it. The mirror records the
