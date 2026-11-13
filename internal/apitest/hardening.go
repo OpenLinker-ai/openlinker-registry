@@ -286,6 +286,51 @@ func runForwardAudience(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(e.Do("GET", "/v1/skills/com.staff/tool", reader, "", nil), 200, "authenticated read")
 	})
 
+	t.Run("a miss on one upstream says nothing about another", func(t *testing.T) {
+		// Two upstreams forward: a public one that has nothing, and an
+		// internal one that has the entry. An anonymous caller is only
+		// served by the first and gets a miss. That miss must not answer a
+		// signed-in caller, who is served by the second as well.
+		var asked atomic.Int64
+		empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			asked.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not found"}}`))
+		}))
+		t.Cleanup(empty.Close)
+		staff := NewEnv(t, newStore(t), Options{})
+		staff.namespace("com.acme", "domain")
+		pub := staff.publisher("com.acme")
+		staff.Expect(staff.Do("POST", "/v1/skills/com.acme/tool/versions?version=v1", pub, "text/markdown", md("tool", "Tool", "MIT")), 201, "skill")
+		staff.Expect(staff.Do("POST", "/v1/skills/com.acme/tool/versions?version=v2", pub, "text/markdown", md("tool", "Tool 2", "MIT")), 201, "skill")
+		staff.Expect(staff.publishMCP(pub, "com.acme", serverJSON("com.acme/server", "1.0.0", "https://s.acme.example/mcp")), 201, "server")
+
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "open", "kind": "openlinker-registry", "base_url": empty.URL, "proxy_on_miss": true,
+			"visibility": "public", "priority": 10}), 201, "public upstream")
+		e.Expect(e.upstream(map[string]any{"name": "staff", "kind": "openlinker-registry", "base_url": staff.Base, "proxy_on_miss": true,
+			"visibility": "internal", "priority": 20}), 201, "internal upstream")
+		paths := []string{"/v1/skills/com.acme/tool", "/v0.1/servers/com.acme%2Fserver/versions/1.0.0", "/v0.1/servers/com.acme%2Fserver/versions/latest"}
+		for _, path := range paths {
+			e.Expect(e.Do("GET", path, "", "", nil), 404, "anonymous GET "+path)
+		}
+		first := asked.Load()
+		for _, path := range paths {
+			e.Expect(e.Do("GET", path, "", "", nil), 404, "anonymous GET "+path+" again")
+		}
+		if first == 0 || asked.Load() != first {
+			t.Fatalf("misses on the public upstream: asked %d times, then %d", first, asked.Load())
+		}
+		reader := e.token([]string{"skills:read"}, nil)
+		for _, path := range paths {
+			e.Expect(e.Do("GET", path, reader, "", nil), 200, "signed-in GET "+path)
+		}
+		for _, path := range paths {
+			e.Expect(e.Do("GET", path, "", "", nil), 404, "anonymous GET "+path+" of an internal entry")
+		}
+	})
+
 	t.Run("budget", func(t *testing.T) {
 		// The upstream shows the skill only to its members; the mirror may
 		// publish what it mirrors, so the skill ends up internal here.

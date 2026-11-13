@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -301,7 +302,10 @@ func (s *Service) client(u model.Upstream) *upstream.Client {
 }
 
 // missCache remembers recent upstream misses so repeated reads of a name
-// that exists nowhere do not turn into repeated outbound requests.
+// that exists nowhere do not turn into repeated outbound requests. A miss
+// is remembered for the upstream that was asked, under the settings it was
+// asked with (missKey): callers differ in which upstreams serve them, and
+// what one upstream lacks says nothing about another.
 //
 // Keys are names and versions an entry can have, so they are bounded;
 // expired ones are dropped once per TTL, and the map never holds more than
@@ -341,6 +345,11 @@ func (c *missCache) add(key string, now time.Time) {
 		c.m = map[string]time.Time{}
 	}
 	c.m[key] = now.Add(missTTL)
+}
+
+// missKey names a lookup on one upstream under its current settings.
+func missKey(u model.Upstream, parts ...string) string {
+	return strconv.FormatInt(u.ID, 10) + "\x00" + strconv.FormatInt(u.ConfigVersion, 10) + "\x00" + strings.Join(parts, "\x00")
 }
 
 func errUpstreamUnavailable() error {
@@ -410,34 +419,35 @@ func (s *Service) forwardMCP(ctx context.Context, viewer model.Viewer, name, ver
 	if !ok || (version != "latest" && !mcp.ValidVersion(version)) {
 		return model.ErrNotFound
 	}
-	key := "mcp\x00" + name + "\x00" + version
-	if s.misses.recent(key, s.Now()) {
-		return model.ErrNotFound
-	}
 	targets, err := s.forwardTargets(ctx, viewer, ns, model.UpstreamMCP, model.UpstreamRegistry)
 	if err != nil {
 		return err
 	}
 	unavailable := false
 	for _, u := range targets {
+		key := missKey(u, "mcp", name, version)
+		if s.misses.recent(key, s.Now()) {
+			continue
+		}
 		found, err := s.forwardMCPTo(ctx, u, name, version)
 		switch {
 		case err == nil && found:
 			return nil
 		case err == nil:
+			s.misses.add(key, s.Now())
 		case isStoreFailure(err) && !isUpstreamError(err):
 			return err
 		case isUpstreamError(err):
 			unavailable = true
 			s.Log.Warn("upstream read failed", "upstream", u.Name, "kind", "mcp", "err", err.Error())
 		default:
+			s.misses.add(key, s.Now())
 			s.Log.Warn("upstream entry not mirrored", "upstream", u.Name, "name", name, "err", err.Error())
 		}
 	}
 	if unavailable {
 		return errUpstreamUnavailable()
 	}
-	s.misses.add(key, s.Now())
 	return model.ErrNotFound
 }
 
@@ -652,12 +662,12 @@ func (s *Service) RefreshMirroredSkill(ctx context.Context, viewer model.Viewer,
 	if sk.Upstream == "" || !skill.ValidVersion(version) {
 		return false, nil
 	}
-	key := "skillversion\x00" + sk.Namespace + "\x00" + sk.Name + "\x00" + version
-	if s.misses.recent(key, s.Now()) {
-		return false, nil
-	}
 	u, err := s.Store.GetUpstream(ctx, sk.Upstream)
 	if err != nil || !u.Enabled || !u.ProxyOnMiss || u.Kind != model.UpstreamRegistry || !viewer.CanSee(sk.Namespace, u.Visibility) {
+		return false, nil
+	}
+	key := missKey(u, "skillversion", sk.Namespace, sk.Name, version)
+	if s.misses.recent(key, s.Now()) {
 		return false, nil
 	}
 	if err := s.refreshSkill(model.WithUpstreamGuard(ctx, u.ID, u.ConfigVersion), u, s.client(u), sk.Namespace, sk.Name, syncStats{}); err != nil {
@@ -678,16 +688,16 @@ func (s *Service) forwardSkill(ctx context.Context, viewer model.Viewer, ns, nam
 	if !skill.ValidNamespaceName(ns) || !skill.ValidSkillName(name) {
 		return model.ErrNotFound
 	}
-	key := "skill\x00" + ns + "\x00" + name
-	if s.misses.recent(key, s.Now()) {
-		return model.ErrNotFound
-	}
 	targets, err := s.forwardTargets(ctx, viewer, ns, model.UpstreamRegistry)
 	if err != nil {
 		return err
 	}
 	unavailable := false
 	for _, u := range targets {
+		key := missKey(u, "skill", ns, name)
+		if s.misses.recent(key, s.Now()) {
+			continue
+		}
 		if err := s.refreshSkill(model.WithUpstreamGuard(ctx, u.ID, u.ConfigVersion), u, s.client(u), ns, name, syncStats{}); err != nil {
 			if configChanged(err) {
 				continue
@@ -702,11 +712,11 @@ func (s *Service) forwardSkill(ctx context.Context, viewer model.Viewer, ns, nam
 		if _, err := s.Store.GetSkill(ctx, ns, name); err == nil {
 			return nil
 		}
+		s.misses.add(key, s.Now())
 	}
 	if unavailable {
 		return errUpstreamUnavailable()
 	}
-	s.misses.add(key, s.Now())
 	return model.ErrNotFound
 }
 
