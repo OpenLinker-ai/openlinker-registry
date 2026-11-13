@@ -26,6 +26,16 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 		"two leading variables": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"remotes":[{"type":"sse","url":"{scheme}{slashes}alice:` + secret + `@mcp.example.com/sse",
 			"variables":{"scheme":{"default":"https:"},"slashes":{"default":"//"}}}]}`,
+		// Which leading variable is the scheme and which the credential
+		// cannot be told: none keeps a literal value.
+		"userinfo from a leading variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{origin}{who}@mcp.example.com/sse",
+			"variables":{"origin":{"default":"https://"},"who":{"default":"alice:` + secret + `"}}}]}`,
+		"userinfo from the only leading variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{who}@mcp.example.com/sse","variables":{"who":{"value":"alice:` + secret + `"}}}]}`,
+		"userinfo from a leading variable in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-alt":{"url":"{origin}{who}@alt.example.com/sse","variables":{"origin":{"default":"https://"},"who":{"default":"alice:` + secret + `"}}},
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 		"template authority in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"x-alt":"{scheme}//alice:` + secret + `@alt.example.com/sse","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 	}

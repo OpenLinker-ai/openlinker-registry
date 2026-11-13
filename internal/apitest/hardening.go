@@ -2126,6 +2126,53 @@ func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("credentials in a URL template", func(t *testing.T) {
+		// A template can take the scheme, and the credentials, from
+		// variables at its start. Mirrored, none of it keeps a literal
+		// value; published here, it is refused.
+		const secret = "hunter2-live-0123456789"
+		remotes := map[string]map[string]any{
+			"com.feed/a": {"type": "sse", "url": "{origin}{who}@mcp.example.com/sse",
+				"variables": map[string]any{"origin": map[string]any{"default": "https://"}, "who": map[string]any{"default": "alice:" + secret}}},
+			"com.feed/b": {"type": "sse", "url": "{scheme}//alice:" + secret + "@mcp.example.com/sse",
+				"variables": map[string]any{"scheme": map[string]any{"default": "https:"}}},
+			"com.feed/c": {"type": "sse", "url": "{who}@mcp.example.com/sse", "variables": map[string]any{"who": map[string]any{"value": "alice:" + secret}}},
+		}
+		entry := func(name string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": "1.0.0", "remotes": []any{remotes[name]}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}}
+		}
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.EscapedPath() != "/v0.1/servers" {
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{entry("com.feed/a"), entry("com.feed/b"), entry("com.feed/c")}})
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_created") != 3 {
+			t.Fatalf("sync: %v", s)
+		}
+		for _, path := range []string{"/v0.1/servers", "/v0.1/servers/com.feed%2Fa/versions/1.0.0", "/v0.1/servers/com.feed%2Fb/versions/1.0.0",
+			"/v0.1/servers/com.feed%2Fc/versions/1.0.0", "/v1/mcp/servers/com.feed/a", "/v1/mcp/servers?q=feed"} {
+			if r := e.Expect(e.Do("GET", path, "", "", nil), 200, "GET "+path); strings.Contains(string(r.Body), secret) || strings.Contains(string(r.Body), "@mcp.example.com") {
+				t.Errorf("GET %s serves a mirrored credential: %s", path, r.Body)
+			}
+		}
+		e.namespace("com.acme", "domain")
+		pub := e.publisher("com.acme")
+		for name, remote := range remotes {
+			doc := map[string]any{"name": "com.acme/" + strings.TrimPrefix(name, "com.feed/"), "description": "d", "version": "1.0.0", "remotes": []any{remote}}
+			if r := e.publishMCP(pub, "com.acme", doc); r.Status != 422 || strings.Contains(string(r.Body), secret) {
+				t.Errorf("publishing %s: %d %s", remote["url"], r.Status, r.Body)
+			}
+		}
+	})
+
 	t.Run("requests with text no entry can have", func(t *testing.T) {
 		e := NewEnv(t, newStore(t), Options{})
 		e.namespace("com.acme", "domain")

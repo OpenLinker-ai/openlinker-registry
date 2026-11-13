@@ -338,7 +338,11 @@ func credentialRefs(t map[string]any) map[string]bool {
 			continue
 		}
 		if m := userinfoRe.FindStringSubmatch(s); m != nil {
-			add(strings.TrimPrefix(m[0], m[1]))
+			if strings.HasPrefix(m[1], "{") {
+				add(m[0]) // leading variables: any of them may be the credential
+			} else {
+				add(strings.TrimPrefix(m[0], m[1]))
+			}
 		}
 		base, fragment, _ := strings.Cut(s, "#")
 		_, query, _ := strings.Cut(base, "?")
@@ -405,10 +409,13 @@ func isURLValue(key, value string) bool { return urlKeys[key] || urlRe.MatchStri
 // It works on text, not a parsed URL, so URL templates are covered too: with
 // {variables} in the host, and with the scheme a {variable}, with or without
 // its colon ("{scheme}://user:pw@host", "{scheme}//user:pw@host"). A value
-// that begins with {variables} may get scheme and slashes from them, so
-// what follows them up to an "@" is userinfo as well ("{origin}user:pw@host").
-// Group 1 is what precedes the userinfo.
-var userinfoRe = regexp.MustCompile(`((?:^|:|\})//|^(?:\{[a-zA-Z_][a-zA-Z0-9_]*\})+)[^/?#\s]*@`)
+// that begins with a {variable} may get scheme and slashes from it, so what
+// follows it up to an "@" is userinfo as well ("{origin}user:pw@host",
+// "{origin}{who}@host").
+// Group 1 is what is kept when the userinfo is removed. Which of several
+// leading variables hold the scheme and which the credentials cannot be
+// told, so credentialRefs counts them all.
+var userinfoRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#\s]*@`)
 
 // urlCredentials reports whether a URL carries credentials: userinfo, or a
 // query parameter named like a credential with a literal value
