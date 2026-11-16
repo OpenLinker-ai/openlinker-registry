@@ -104,3 +104,79 @@ func TestCheckResultHoldsUpstreamSettings(t *testing.T) {
 		t.Fatalf("a result made under earlier settings replaced a newer one: %q", got.CheckResult)
 	}
 }
+
+// Versions that are not semantic versions are ordered by publication. A
+// publish whose transaction began before another one committed, but that
+// took the server lock after it, is the later publish: it is the latest
+// version, and it must stay the latest when "latest" is decided again.
+func TestPublicationOrderIsLockOrder(t *testing.T) {
+	st, schema := newStoreSchema(t)
+	ctx := context.Background()
+	if _, err := st.CreateNamespace(ctx, model.Namespace{Name: "com.acme", Kind: "domain"}, testAudit); err != nil {
+		t.Fatal(err)
+	}
+	// An upstream row that the first publish is made to wait for, after its
+	// transaction has begun.
+	gate, err := st.CreateUpstream(ctx, model.Upstream{Name: "gate", Kind: model.UpstreamMCP, BaseURL: "https://gate.example",
+		Enabled: true, Priority: 100, Visibility: model.VisibilityPublic}, testAudit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, _ := publishTestMCP(t, st, "com.acme/s", "nightly-0")
+	publish := func(ctx context.Context, version string) error {
+		_, _, err := st.PublishMCPVersion(ctx, model.MCPPublishInput{Namespace: "com.acme", Name: "com.acme/s",
+			Mode: model.MCPModeRegistered, Visibility: model.VisibilityPublic, Listed: true,
+			Version: model.MCPVersion{Version: version, ServerJSON: []byte(`{"name": "com.acme/s", "version": "` + version + `"}`),
+				Digest: "sha256:" + strings.Repeat("e", 64), CreatedBy: "t"}}, testAudit)
+		return err
+	}
+	conn := connSchema(t, schema)
+	hold, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hold.Exec(ctx, `SELECT 1 FROM upstreams WHERE id = $1 FOR UPDATE`, gate.ID); err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- publish(model.WithUpstreamGuard(ctx, gate.ID, gate.ConfigVersion), "nightly-a") }()
+	select {
+	case err := <-first:
+		t.Fatalf("the first publish did not wait: %v", err)
+	case <-time.After(300 * time.Millisecond): // its transaction has begun
+	}
+	if err := publish(ctx, "nightly-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := hold.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	latest := func() string {
+		v, err := st.GetMCPVersion(ctx, srv.ID, "latest")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v.Version
+	}
+	if got := latest(); got != "nightly-a" {
+		t.Fatalf("latest after both publishes = %s, want the one that was published last", got)
+	}
+	a, _ := st.GetMCPVersion(ctx, srv.ID, "nightly-a")
+	b, _ := st.GetMCPVersion(ctx, srv.ID, "nightly-b")
+	if !a.PublishedAt.After(b.PublishedAt) {
+		t.Fatalf("published_at does not follow the order of publication: a %v, b %v", a.PublishedAt, b.PublishedAt)
+	}
+	// Deciding "latest" again must not change it: a status update that
+	// changes nothing, and one that does.
+	for _, status := range []string{model.MCPStatusActive, model.MCPStatusDeprecated} {
+		if _, err := st.SetMCPStatus(ctx, srv.ID, "nightly-0", status, "", time.Now(), testAudit); err != nil {
+			t.Fatal(err)
+		}
+		if got := latest(); got != "nightly-a" {
+			t.Fatalf("latest after setting an old version %s = %s", status, got)
+		}
+	}
+}

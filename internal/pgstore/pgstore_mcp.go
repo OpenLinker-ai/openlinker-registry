@@ -132,12 +132,26 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 				return err
 			}
 		}
+		// The publication time is taken here, under the server lock, and is
+		// later than that of every version the server has: now() is the
+		// start of the transaction, which may be earlier than the commit of
+		// a publish this one waited for. Whenever "latest" is decided again
+		// (a version is deleted or restored), versions that do not compare
+		// as semantic versions are ordered by this time, and that order has
+		// to be the order in which they were published.
+		publishedAt := in.Version.PublishedAt
+		if publishedAt.IsZero() {
+			if err := tx.QueryRow(ctx, `SELECT GREATEST(clock_timestamp(), (SELECT max(published_at) + interval '1 microsecond'
+				FROM mcp_server_versions WHERE server_id = $1))`, srv.ID).Scan(&publishedAt); err != nil {
+				return err
+			}
+		}
 		title, description := store.MCPSearchText(in.Version.ServerJSON)
 		ver, err = scanMCPVersion(tx.QueryRow(ctx, `INSERT INTO mcp_server_versions AS v (server_id, version, server_json, digest,
 			status_changed_at, published_at, updated_at, is_latest, created_by, title, description)
-			VALUES ($1, $2, $3, $4, COALESCE($5, now()), COALESCE($5, now()), COALESCE($5, now()), $6, $7, $8, $9)
+			VALUES ($1, $2, $3, $4, $5, $5, $5, $6, $7, $8, $9)
 			RETURNING `+mcpVersionCols,
-			srv.ID, in.Version.Version, string(in.Version.ServerJSON), in.Version.Digest, timeOrNil(in.Version.PublishedAt),
+			srv.ID, in.Version.Version, string(in.Version.ServerJSON), in.Version.Digest, publishedAt,
 			latest, in.Version.CreatedBy, title, description))
 		if c, ok := uniqueViolation(err); ok && c != "mcp_server_versions_latest_key" {
 			return conflict("version_exists", "version already exists and is immutable")
