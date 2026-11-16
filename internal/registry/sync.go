@@ -1327,12 +1327,10 @@ func (s *Service) followIndexURL(ctx context.Context, u model.Upstream, c *upstr
 		return false, nil
 	}
 	target := local.Name + "@" + v.Version
-	if err := s.Store.SetVersionLocatorURL(ctx, v.ID, e.URL,
+	// The bytes at the new URL were verified just now; the location and
+	// that check are recorded together.
+	if err := s.Store.SetVersionLocatorURL(ctx, v.ID, e.URL, s.Now(),
 		auditEvent(actor, "version.relocate", local.Namespace, target, map[string]any{"reason": "moved in the discovery index"})); err != nil {
-		return false, err
-	}
-	// The bytes at the new URL were verified just now.
-	if err := s.Store.SetVersionCheck(ctx, v.ID, e.URL, model.CheckOK, s.Now()); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1396,44 +1394,52 @@ func (s *Service) restoreIndexSkill(ctx context.Context, u model.Upstream, local
 // readMirrored re-reads a mirrored or URL-indexed version from its source and
 // verifies it. It returns a check result ("" when verified) instead of an
 // error so the caller records what happened.
-func (s *Service) readMirrored(ctx context.Context, v model.Version) ([]skill.File, []byte, string) {
+func (s *Service) readMirrored(ctx context.Context, v model.Version) ([]skill.File, []byte, model.CheckSource, string) {
 	l := v.Locator
+	src := model.CheckSource{LocatorURL: l.URL}
 	u, err := s.Store.GetUpstream(ctx, l.Upstream)
-	if err != nil || !u.Enabled {
-		return nil, nil, model.CheckSourceUnavailable
+	if err != nil {
+		return nil, nil, src, model.CheckSourceUnavailable
+	}
+	// What is read from here on is read through this upstream as it is set
+	// up now; a result that arrives after its settings changed is about
+	// another source.
+	src.UpstreamID, src.ConfigVersion = u.ID, u.ConfigVersion
+	if !u.Enabled {
+		return nil, nil, src, model.CheckSourceUnavailable
 	}
 	c := s.client(u)
 	switch l.Kind {
 	case "registry":
 		data, err := c.GetSkillArtifact(ctx, l.Namespace, l.Name, l.Version, s.fetchLimit())
 		if err != nil {
-			return nil, nil, model.CheckSourceUnavailable
+			return nil, nil, src, model.CheckSourceUnavailable
 		}
 		if skill.Digest(data) != v.ArtifactDigest {
-			return nil, nil, model.CheckSourceChanged
+			return nil, nil, src, model.CheckSourceChanged
 		}
 		files, err := s.untrustedFiles(v.ArtifactType, data)
 		// The manifest recorded at mirror time came from the upstream's
 		// metadata; it must describe exactly these bytes.
 		if err != nil || !sameManifest(skill.BuildManifest(files), v.Files) {
-			return nil, nil, model.CheckSourceChanged
+			return nil, nil, src, model.CheckSourceChanged
 		}
-		return files, data, ""
+		return files, data, src, ""
 	case "url":
 		data, err := c.Fetch(ctx, l.URL, s.fetchLimit())
 		if err != nil {
-			return nil, nil, model.CheckSourceUnavailable
+			return nil, nil, src, model.CheckSourceUnavailable
 		}
 		if skill.Digest(data) != l.Digest {
-			return nil, nil, model.CheckSourceChanged
+			return nil, nil, src, model.CheckSourceChanged
 		}
 		files, typ, artifact, err := s.buildURLEntry(l.EntryType, data)
 		if err != nil || typ != v.ArtifactType || skill.Digest(artifact) != v.ArtifactDigest {
-			return nil, nil, model.CheckSourceChanged
+			return nil, nil, src, model.CheckSourceChanged
 		}
-		return files, artifact, ""
+		return files, artifact, src, ""
 	}
-	return nil, nil, model.CheckSourceUnavailable
+	return nil, nil, src, model.CheckSourceUnavailable
 }
 
 // untrustedFiles decodes artifact bytes received from an upstream. Unlike

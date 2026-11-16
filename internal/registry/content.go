@@ -92,45 +92,48 @@ func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Versi
 			return nil, nil, err
 		}
 	}
-	files, data, result := s.readSource(ctx, v)
+	files, data, src, result := s.readSource(ctx, v)
 	if result != "" {
-		return nil, nil, s.markCheck(ctx, v, result)
+		return nil, nil, s.markCheck(ctx, v, src, result)
 	}
 	_, _ = s.Blobs.Put(ctx, blobstore.Cache, data)
-	_ = s.Store.SetVersionCheck(ctx, v.ID, locatorURL(v), model.CheckOK, s.Now())
+	_ = s.Store.SetVersionCheck(ctx, v.ID, src, model.CheckOK, s.Now())
 	return files, data, nil
 }
 
 // readSource reads an indexed version from where its locator points and
-// verifies it against the recorded digests. It returns a check result ("" when
-// verified).
-func (s *Service) readSource(ctx context.Context, v model.Version) ([]skill.File, []byte, string) {
+// verifies it against the recorded digests. It returns the source that was
+// read (for recording the result, see model.CheckSource) and a check result
+// ("" when verified).
+func (s *Service) readSource(ctx context.Context, v model.Version) ([]skill.File, []byte, model.CheckSource, string) {
 	l := v.Locator
+	src := model.CheckSource{}
 	if l == nil {
-		return nil, nil, model.CheckSourceUnavailable
+		return nil, nil, src, model.CheckSourceUnavailable
 	}
+	src.LocatorURL = l.URL
 	if l.Kind == "registry" || l.Kind == "url" {
 		return s.readMirrored(ctx, v)
 	}
 	if l.Kind != "github" || s.GitHub == nil {
-		return nil, nil, model.CheckSourceUnavailable
+		return nil, nil, src, model.CheckSourceUnavailable
 	}
 	snap, err := s.GitHub.Fetch(ctx, github.Ref{Owner: l.Owner, Repo: l.Repo, Dir: l.Path, SingleFile: l.SingleFile}, l.Commit)
 	if err != nil {
 		var ge *github.Error
 		if errors.As(err, &ge) && ge.Code == "integrity_mismatch" {
-			return nil, nil, model.CheckSourceChanged
+			return nil, nil, src, model.CheckSourceChanged
 		}
-		return nil, nil, model.CheckSourceUnavailable
+		return nil, nil, src, model.CheckSourceUnavailable
 	}
 	if snap.TreeSHA != l.TreeSHA {
-		return nil, nil, model.CheckSourceChanged
+		return nil, nil, src, model.CheckSourceChanged
 	}
 	_, data, err := s.snapshotArtifact(snap)
 	if err != nil || skill.Digest(data) != v.ArtifactDigest {
-		return nil, nil, model.CheckSourceChanged
+		return nil, nil, src, model.CheckSourceChanged
 	}
-	return snap.Files, data, ""
+	return snap.Files, data, src, ""
 }
 
 // recentlyVerified reports whether v's source was verified successfully
@@ -182,16 +185,8 @@ func (s *Service) gcOne(ctx context.Context, digest string, before time.Time) (b
 	return s.Blobs.DeleteIfOlder(ctx, blobstore.Artifacts, digest, before)
 }
 
-// locatorURL is where the content of v was read from, for SetVersionCheck.
-func locatorURL(v model.Version) string {
-	if v.Locator == nil {
-		return ""
-	}
-	return v.Locator.URL
-}
-
-func (s *Service) markCheck(ctx context.Context, v model.Version, result string) error {
-	_ = s.Store.SetVersionCheck(ctx, v.ID, locatorURL(v), result, s.Now())
+func (s *Service) markCheck(ctx context.Context, v model.Version, src model.CheckSource, result string) error {
+	_ = s.Store.SetVersionCheck(ctx, v.ID, src, result, s.Now())
 	if result == model.CheckSourceChanged {
 		return &Error{Status: http.StatusConflict, Code: result, Msg: "the source no longer matches the indexed version", SourceURL: s.SourceURL(v)}
 	}

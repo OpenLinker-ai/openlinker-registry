@@ -57,22 +57,24 @@ type Store interface {
 	SetAlias(ctx context.Context, skillID int64, alias string, audit model.AuditEvent) error
 	YankVersion(ctx context.Context, versionID int64, reason string, at time.Time, audit model.AuditEvent) error
 	ApproveLicense(ctx context.Context, versionID int64, audit model.AuditEvent) error
-	// SetVersionCheck records the result of verifying a version's content.
-	// locatorURL is where that content was read from: Locator.URL of the
-	// version as the caller loaded it ("" without one). The result is
-	// recorded only while the version's content is still there; a check of
-	// a location the version has moved away from since (see
-	// SetVersionLocatorURL) says nothing about it and is dropped.
-	SetVersionCheck(ctx context.Context, versionID int64, locatorURL, result string, at time.Time) error
+	// SetVersionCheck records the result of verifying a version's content
+	// read from src (see model.CheckSource). The result is recorded only
+	// while the version's content is still at that source, decided in the
+	// same statement: a check of a location the version has moved away from
+	// (see SetVersionLocatorURL), or made through an upstream whose settings
+	// have changed since, says nothing about the version and is dropped
+	// without error.
+	SetVersionCheck(ctx context.Context, versionID int64, src model.CheckSource, result string, at time.Time) error
 	// SetVersionMirrorServed records whether the upstream of a mirrored
 	// version serves its content (see model.Version.MirrorServed).
 	SetVersionMirrorServed(ctx context.Context, versionID int64, served bool, audit model.AuditEvent) error
 
 	// SetVersionLocatorURL records where the content of a URL-indexed
-	// version is served now (ErrNotFound for any other version). Versions
-	// are read with that URL in their locator from then on; nothing else
-	// about the version changes.
-	SetVersionLocatorURL(ctx context.Context, versionID int64, url string, audit model.AuditEvent) error
+	// version is served now (ErrNotFound for any other version), together
+	// with the check that found it there: the caller has verified the
+	// content at url at the time at. Versions are read with that URL in
+	// their locator from then on; nothing else about the version changes.
+	SetVersionLocatorURL(ctx context.Context, versionID int64, url string, at time.Time, audit model.AuditEvent) error
 
 	Search(ctx context.Context, q model.SearchQuery) ([]model.SkillSummary, error)
 	// IndexCandidates returns public, listed, active skills with their latest

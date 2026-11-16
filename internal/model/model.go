@@ -149,6 +149,21 @@ type Skill struct {
 	UpdatedAt      time.Time
 }
 
+// CheckSource says where the content of an indexed version was read from
+// when it was verified. A check result is about that source only: the
+// store records it while the version's content is still there, and drops
+// it otherwise (the file moved, the upstream now points elsewhere).
+type CheckSource struct {
+	// LocatorURL is Locator.URL of the version as it was loaded ("" for a
+	// locator without one).
+	LocatorURL string
+	// UpstreamID and ConfigVersion identify the upstream registry the
+	// content was read through and the settings (its base URL among them)
+	// it had then; zero when no upstream was involved.
+	UpstreamID    int64
+	ConfigVersion int64
+}
+
 // LatestVersion picks the version a skill presents as its latest: the one
 // its source names as current (Skill.CurrentVersion) unless that is yanked
 // or missing, else the newest version that is not yanked. versions is

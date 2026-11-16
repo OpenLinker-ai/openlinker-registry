@@ -218,12 +218,23 @@ var mirrorTests = []testCase{
 		digest := "sha256:" + strings.Repeat("b", 64)
 		moved := put("moved", &model.Locator{Kind: "url", URL: "https://site.example/old/SKILL.md", Digest: digest, EntryType: "skill-md", Upstream: "up"})
 		other := put("other", &model.Locator{Kind: "registry", Upstream: "up", Namespace: "org.site", Name: "other", Version: "sha-a"})
+		oldURL, newURL := model.CheckSource{LocatorURL: "https://site.example/old/SKILL.md"}, model.CheckSource{LocatorURL: "https://site.example/new/SKILL.md"}
+		at := time.Now().UTC().Truncate(time.Second)
+		// The version was found unavailable where it was. Recording the
+		// new location records the check that found it there, in one step:
+		// a new location without its check would never be verified again.
+		if err := st.SetVersionCheck(ctx, moved.ID, oldURL, model.CheckSourceUnavailable, at.Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
 		events := auditCount(t, st, "test")
-		if err := st.SetVersionLocatorURL(ctx, moved.ID, "https://site.example/new/SKILL.md", audit); err != nil {
+		if err := st.SetVersionLocatorURL(ctx, moved.ID, "https://site.example/new/SKILL.md", at, audit); err != nil {
 			t.Fatal(err)
 		}
 		if n := auditCount(t, st, "test"); n != events+1 {
 			t.Fatalf("audit events: %d", n-events)
+		}
+		if got, _ := st.GetVersion(ctx, moved.SkillID, "sha-a"); got.CheckResult != model.CheckOK || got.CheckedAt == nil || !got.CheckedAt.Equal(at) {
+			t.Fatalf("the move did not record its check: %q at %v", got.CheckResult, got.CheckedAt)
 		}
 		want := model.Locator{Kind: "url", URL: "https://site.example/new/SKILL.md", Digest: digest, EntryType: "skill-md", Upstream: "up"}
 		got, err := st.GetVersion(ctx, moved.SkillID, "sha-a")
@@ -240,43 +251,69 @@ var mirrorTests = []testCase{
 		// The result of a check is recorded for the location that was
 		// read. One that was started before the move and ends after it is
 		// about the old location and must not replace the newer result.
-		at := time.Now().UTC().Truncate(time.Second)
-		if err := st.SetVersionCheck(ctx, moved.ID, "https://site.example/new/SKILL.md", model.CheckOK, at); err != nil {
-			t.Fatal(err)
-		}
-		if err := st.SetVersionCheck(ctx, moved.ID, "https://site.example/old/SKILL.md", model.CheckSourceUnavailable, at.Add(time.Minute)); err != nil {
+		if err := st.SetVersionCheck(ctx, moved.ID, oldURL, model.CheckSourceUnavailable, at.Add(time.Minute)); err != nil {
 			t.Fatalf("a stale check result is dropped, not an error: %v", err)
 		}
 		if got, _ := st.GetVersion(ctx, moved.SkillID, "sha-a"); got.CheckResult != model.CheckOK || got.CheckedAt == nil || !got.CheckedAt.Equal(at) {
 			t.Fatalf("a check of the old location replaced the result: %q at %v", got.CheckResult, got.CheckedAt)
 		}
-		if err := st.SetVersionCheck(ctx, moved.ID, "https://site.example/new/SKILL.md", model.CheckSourceChanged, at.Add(2*time.Minute)); err != nil {
+		if err := st.SetVersionCheck(ctx, moved.ID, newURL, model.CheckSourceChanged, at.Add(2*time.Minute)); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := st.GetVersion(ctx, moved.SkillID, "sha-a"); got.CheckResult != model.CheckSourceChanged {
 			t.Fatalf("a check of the current location: %q", got.CheckResult)
 		}
-		// A version without a URL is checked where it is.
-		if err := st.SetVersionCheck(ctx, other.ID, "", model.CheckOK, at); err != nil {
+		// A version mirrored from a registry has no URL of its own: its
+		// content is read through the upstream as that is set up. A check
+		// made through the upstream's earlier settings (another base URL)
+		// that ends after a check through the current ones is dropped.
+		through := model.CheckSource{UpstreamID: up.ID, ConfigVersion: up.ConfigVersion}
+		if err := st.SetVersionCheck(ctx, other.ID, through, model.CheckOK, at); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := st.GetVersion(ctx, other.SkillID, "sha-a"); got.CheckResult != model.CheckOK {
-			t.Fatalf("a version without a URL: %q", got.CheckResult)
+			t.Fatalf("a version read through its upstream: %q", got.CheckResult)
 		}
-		if err := st.SetVersionCheck(ctx, moved.ID+1000, "", model.CheckOK, at); !errors.Is(err, model.ErrNotFound) {
+		base := "https://elsewhere.example"
+		changed, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{BaseURL: &base}, audit)
+		if err != nil || changed.ConfigVersion == up.ConfigVersion {
+			t.Fatalf("a new base URL is a change of settings: %+v, %v", changed, err)
+		}
+		if err := st.SetVersionCheck(ctx, other.ID, through, model.CheckSourceUnavailable, at.Add(time.Minute)); err != nil {
+			t.Fatalf("a stale check result is dropped, not an error: %v", err)
+		}
+		if got, _ := st.GetVersion(ctx, other.SkillID, "sha-a"); got.CheckResult != model.CheckOK {
+			t.Fatalf("a check through the upstream's earlier settings replaced the result: %q", got.CheckResult)
+		}
+		now := model.CheckSource{UpstreamID: up.ID, ConfigVersion: changed.ConfigVersion}
+		if err := st.SetVersionCheck(ctx, other.ID, now, model.CheckSourceChanged, at.Add(2*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := st.GetVersion(ctx, other.SkillID, "sha-a"); got.CheckResult != model.CheckSourceChanged {
+			t.Fatalf("a check through the upstream's current settings: %q", got.CheckResult)
+		}
+		// Without an upstream (a GitHub source) the result is recorded.
+		if err := st.SetVersionCheck(ctx, other.ID, model.CheckSource{}, model.CheckOK, at); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := st.GetVersion(ctx, other.SkillID, "sha-a"); got.CheckResult != model.CheckOK {
+			t.Fatalf("a check without an upstream: %q", got.CheckResult)
+		}
+		if err := st.SetVersionCheck(ctx, moved.ID+1000, model.CheckSource{}, model.CheckOK, at); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("a version that does not exist: %v", err)
 		}
+		up = changed
 		// Only a URL-indexed version has a URL to move.
-		if err := st.SetVersionLocatorURL(ctx, other.ID, "https://site.example/x", audit); !errors.Is(err, model.ErrNotFound) {
+		if err := st.SetVersionLocatorURL(ctx, other.ID, "https://site.example/x", at, audit); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("a version with another kind of locator: %v", err)
 		}
-		if err := st.SetVersionLocatorURL(ctx, moved.ID+1000, "https://site.example/x", audit); !errors.Is(err, model.ErrNotFound) {
+		if err := st.SetVersionLocatorURL(ctx, moved.ID+1000, "https://site.example/x", at, audit); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("a version that does not exist: %v", err)
 		}
 		if _, err := st.UpdateUpstream(ctx, "up", model.UpstreamPatch{NamespaceDeny: &[]string{"org.other"}}, audit); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.SetVersionLocatorURL(model.WithUpstreamGuard(ctx, up.ID, up.ConfigVersion), moved.ID, "https://site.example/y", audit); conflictCode(err) != "upstream_config_changed" {
+		if err := st.SetVersionLocatorURL(model.WithUpstreamGuard(ctx, up.ID, up.ConfigVersion), moved.ID, "https://site.example/y", at, audit); conflictCode(err) != "upstream_config_changed" {
 			t.Fatalf("under settings that changed: %v", err)
 		}
 	}},
@@ -743,7 +780,7 @@ var mirrorTests = []testCase{
 			t.Errorf("unguarded mutation: %v", err)
 		}
 		// Recording a source check is not a mirror write and is never refused.
-		if err := st.SetVersionCheck(guarded, ver.ID, "", model.CheckOK, time.Now()); err != nil {
+		if err := st.SetVersionCheck(guarded, ver.ID, model.CheckSource{}, model.CheckOK, time.Now()); err != nil {
 			t.Errorf("source check under a stale guard: %v", err)
 		}
 	}},

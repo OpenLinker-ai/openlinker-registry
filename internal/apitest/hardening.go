@@ -2440,6 +2440,80 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(e.Do("GET", base+"/artifact", "", "", nil), 200, "artifact at the new URL")
 	})
 
+	t.Run("a check through an upstream address that was replaced", func(t *testing.T) {
+		// A mirrored skill is verified through its upstream. While a
+		// download waits for the upstream at its old address, the
+		// administrator points the upstream to a new address, and a second
+		// download verifies the skill there. Then the old address fails.
+		// That failure is about a source the skill is no longer read from
+		// and must not replace the check that passed.
+		up := NewEnv(t, newStore(t), Options{})
+		up.namespace("com.acme", "domain")
+		pub := up.publisher("com.acme")
+		up.Expect(up.Do("POST", "/v1/skills/com.acme/tool/versions?version=v1", pub, "text/markdown", md("tool", "Tool", "MIT")), 201, "skill")
+		var armed, first atomic.Bool
+		asked, answer := make(chan struct{}), make(chan struct{})
+		forward := func(w http.ResponseWriter, r *http.Request) {
+			req, _ := http.NewRequest(r.Method, up.Base+r.URL.RequestURI(), nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				w.WriteHeader(502)
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+		}
+		oldAddress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if armed.Load() && strings.HasSuffix(r.URL.Path, "/artifact") && first.CompareAndSwap(false, true) {
+				close(asked)
+				<-answer
+				w.WriteHeader(500)
+				return
+			}
+			forward(w, r)
+		}))
+		t.Cleanup(oldAddress.Close)
+		newAddress := httptest.NewServer(http.HandlerFunc(forward))
+		t.Cleanup(newAddress.Close)
+		down := NewEnv(t, newStore(t), Options{Loopback: true, VerifyInterval: -1})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": oldAddress.URL, "visibility": "public"}), 201, "upstream")
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_created") != 1 {
+			t.Fatalf("sync: %v", s)
+		}
+		artifact := "/v1/skills/com.acme/tool/versions/v1/artifact"
+		armed.Store(true)
+		slow := make(chan int, 1)
+		go func() { slow <- down.Do("GET", artifact, "", "", nil).Status }()
+		<-asked
+		down.Expect(down.Do("PATCH", "/v1/admin/upstreams/hub", AdminToken, "", map[string]any{"base_url": newAddress.URL}), 200, "new address")
+		fast := make(chan int, 1)
+		go func() { fast <- down.Do("GET", artifact, "", "", nil).Status }()
+		status := 0
+		select {
+		case status = <-fast:
+		case <-time.After(500 * time.Millisecond):
+		}
+		close(answer)
+		<-slow
+		if status == 0 {
+			status = <-fast
+		}
+		if status != 200 {
+			t.Fatalf("download through the new address: %d", status)
+		}
+		r := down.Expect(down.Do("GET", "/v1/skills/com.acme/tool/versions/v1", "", "", nil), 200, "version")
+		if check, _ := r.JSON["check"].(map[string]any); check["result"] != "ok" {
+			t.Fatalf("a failure of the replaced address overwrote the check: %v", check)
+		}
+		r = down.Expect(down.Do("GET", "/ns/com.acme/.well-known/agent-skills/index.json", "", "", nil), 200, "discovery index")
+		if !strings.Contains(string(r.Body), `"tool"`) {
+			t.Fatalf("the skill dropped out of discovery: %s", r.Body)
+		}
+	})
+
 	t.Run("an index whose downloads are refused", func(t *testing.T) {
 		// The index loads, but the site refuses the download of an entry it
 		// serves itself. That is the upstream refusing this instance: the

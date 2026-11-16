@@ -455,7 +455,7 @@ func (m *Memory) mutateVersion(ctx context.Context, id int64, audit *model.Audit
 }
 
 // SetVersionLocatorURL implements Store.
-func (m *Memory) SetVersionLocatorURL(ctx context.Context, id int64, url string, audit model.AuditEvent) error {
+func (m *Memory) SetVersionLocatorURL(ctx context.Context, id int64, url string, at time.Time, audit model.AuditEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.guard(ctx); err != nil {
@@ -468,6 +468,7 @@ func (m *Memory) SetVersionLocatorURL(ctx context.Context, id int64, url string,
 	moved := *v.Locator
 	moved.URL = url
 	v.Locator = &moved
+	v.CheckResult, v.CheckedAt = model.CheckOK, &at
 	m.versions[id] = v
 	m.appendAudit(audit)
 	return nil
@@ -488,15 +489,22 @@ func (m *Memory) ApproveLicense(ctx context.Context, id int64, audit model.Audit
 }
 
 // SetVersionCheck implements Store.
-func (m *Memory) SetVersionCheck(ctx context.Context, id int64, locatorURL, result string, at time.Time) error {
+func (m *Memory) SetVersionCheck(ctx context.Context, id int64, src model.CheckSource, result string, at time.Time) error {
 	return m.mutateVersion(ctx, id, nil, func(v *model.Version) {
 		current := ""
 		if v.Locator != nil {
 			current = v.Locator.URL
 		}
-		if current == locatorURL { // otherwise the version moved: the result is stale
-			v.CheckResult, v.CheckedAt = result, &at
+		// Otherwise the source changed, and the result is stale.
+		if current != src.LocatorURL {
+			return
 		}
+		if src.UpstreamID != 0 {
+			if u, ok := m.upstreams[src.UpstreamID]; !ok || u.ConfigVersion != src.ConfigVersion {
+				return
+			}
+		}
+		v.CheckResult, v.CheckedAt = result, &at
 	})
 }
 
