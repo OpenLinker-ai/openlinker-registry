@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -337,7 +338,7 @@ func credentialRefs(t map[string]any) map[string]bool {
 		if !ok || !isURLValue(k, s) {
 			continue
 		}
-		if m := userinfoRe.FindStringSubmatch(s); m != nil {
+		if m := findUserinfo(s, urlKeys[k]); m != nil {
 			if strings.HasPrefix(m[1], "{") {
 				add(m[0]) // leading variables: any of them may be the credential
 			} else {
@@ -393,12 +394,19 @@ func credentialName(v any) bool {
 // "{base}/mcp?api_key=...", which no pattern for absolute URLs would catch)
 // or by its form, for members a later schema adds (urlRe: an absolute URL,
 // or a template starting with a {variable}).
+//
+// Free text is never a URL, whatever it begins with: a description may
+// start with a link and go on to name a contact address
+// ("https://example.com, or write to alice@example.org").
 var (
-	urlKeys = map[string]bool{"url": true, "src": true, "websiteUrl": true, "registryBaseUrl": true, "identifier": true}
-	urlRe   = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.:-]*://|//|\{[a-zA-Z_][a-zA-Z0-9_]*\})`)
+	urlKeys  = map[string]bool{"url": true, "src": true, "websiteUrl": true, "registryBaseUrl": true, "identifier": true}
+	textKeys = map[string]bool{"description": true, "title": true}
+	urlRe    = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.:-]*://|//|\{[a-zA-Z_][a-zA-Z0-9_]*\})`)
 )
 
-func isURLValue(key, value string) bool { return urlKeys[key] || urlRe.MatchString(value) }
+func isURLValue(key, value string) bool {
+	return urlKeys[key] || (!textKeys[key] && urlRe.MatchString(value))
+}
 
 // userinfoRe matches the scheme and userinfo of a URL ("https://user:pw@"),
 // through the last "@" of the authority: a user name may itself contain one
@@ -420,14 +428,44 @@ func isURLValue(key, value string) bool { return urlKeys[key] || urlRe.MatchStri
 // password may contain spaces ("https://alice:two words@host").
 var userinfoRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#]*@`)
 
+// userinfoTokenRe is userinfoRe for userinfo without white space.
+var userinfoTokenRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#\s]*@`)
+
+// findUserinfo returns the userinfo of a URL value as userinfoRe matches it
+// (the match and its group 1), or nil.
+//
+// urlMember says that the member holding the value is one that holds URLs.
+// A value that is only taken for a URL because of how it begins may be text
+// that starts with a link ("https://example.com contact alice@example.org"
+// in a member this registry does not know). There, white space is accepted
+// in userinfo only after a colon, where a password is; anything else must be
+// userinfo without white space.
+func findUserinfo(value string, urlMember bool) []string {
+	m := userinfoRe.FindStringSubmatch(value)
+	if m == nil || urlMember {
+		return m
+	}
+	info := strings.TrimPrefix(m[0], m[1])
+	if i := strings.IndexFunc(info, unicode.IsSpace); i >= 0 && !strings.Contains(info[:i], ":") {
+		return userinfoTokenRe.FindStringSubmatch(value)
+	}
+	return m
+}
+
 // urlCredentials reports whether a URL carries credentials: userinfo, or a
 // query parameter named like a credential with a literal value
 // ("?api_key=live-secret"; "?api_key={key}" refers to a variable and is
 // fine). clean is the URL without them.
-func urlCredentials(raw string) (clean string, found bool) {
+func urlCredentials(raw string, urlMember bool) (clean string, found bool) {
 	clean = raw
-	if userinfoRe.MatchString(clean) {
-		clean, found = userinfoRe.ReplaceAllString(clean, "$1"), true
+	for {
+		m := findUserinfo(clean, urlMember)
+		if m == nil {
+			break
+		}
+		// Each round removes at least the "@", so this ends.
+		i := strings.Index(clean, m[0])
+		clean, found = clean[:i]+m[1]+clean[i+len(m[0]):], true
 	}
 	// Parameters travel in the query and, for tokens handed to a client
 	// ("#access_token=..."), in the fragment.
@@ -478,7 +516,7 @@ func scrubURLCredentials(v any, redact bool) (path string) {
 	case map[string]any:
 		for _, k := range slices.Sorted(maps.Keys(t)) {
 			if s, ok := t[k].(string); ok && isURLValue(k, s) {
-				if clean, found := urlCredentials(s); found {
+				if clean, found := urlCredentials(s, urlKeys[k]); found {
 					if !redact {
 						return k
 					}
@@ -496,7 +534,7 @@ func scrubURLCredentials(v any, redact bool) (path string) {
 	case []any:
 		for i, e := range t {
 			if s, ok := e.(string); ok && isURLValue("", s) {
-				if clean, found := urlCredentials(s); found {
+				if clean, found := urlCredentials(s, false); found {
 					if !redact {
 						return fmt.Sprintf("[%d]", i)
 					}

@@ -3086,6 +3086,58 @@ func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("links in free text and passwords with spaces", func(t *testing.T) {
+		// A description may begin with a link and go on to name a contact
+		// address: it is text, kept as it is when published and when
+		// mirrored. A URL whose password contains a space is still a URL
+		// with a password: refused when published, cleaned when mirrored.
+		const text = "https://example.com for help write to alice@example.org"
+		const secret = "hunter2 live 0123456789"
+		prose := func(name string) map[string]any {
+			return map[string]any{"name": name, "description": text, "title": text, "version": "1.0.0",
+				"remotes": []any{map[string]any{"type": "sse", "url": "https://mcp.example.com/sse"}}}
+		}
+		spaced := func(name string) map[string]any {
+			return map[string]any{"name": name, "description": "d", "version": "1.0.0",
+				"packages": []any{map[string]any{"registryType": "mcpb", "identifier": "https://alice:" + secret + "@downloads.example/tool.mcpb",
+					"fileSha256": strings.Repeat("a", 64), "transport": map[string]any{"type": "stdio"}}}}
+		}
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.EscapedPath() != "/v0.1/servers" {
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				return
+			}
+			meta := map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}
+			_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{
+				{"server": prose("com.feed/prose"), "_meta": meta}, {"server": spaced("com.feed/spaced"), "_meta": meta}}})
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.namespace("com.acme", "domain")
+		pub := e.publisher("com.acme")
+		e.Expect(e.publishMCP(pub, "com.acme", prose("com.acme/prose")), 201, "publish text that begins with a link")
+		if r := e.publishMCP(pub, "com.acme", spaced("com.acme/spaced")); r.Status != 422 || strings.Contains(string(r.Body), "hunter2") {
+			t.Fatalf("publishing a URL with a spaced password: %d %s", r.Status, r.Body)
+		}
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_created") != 2 {
+			t.Fatalf("sync: %v", s)
+		}
+		for _, name := range []string{"com.acme%2Fprose", "com.feed%2Fprose"} {
+			r := e.Expect(e.Do("GET", "/v0.1/servers/"+name+"/versions/1.0.0", "", "", nil), 200, "text "+name)
+			server, _ := r.JSON["server"].(map[string]any)
+			if server["description"] != text || server["title"] != text {
+				t.Fatalf("%s: free text was rewritten: %v / %v", name, server["description"], server["title"])
+			}
+		}
+		r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fspaced/versions/1.0.0", "", "", nil), 200, "mirrored URL with a spaced password")
+		if strings.Contains(string(r.Body), "hunter2") || strings.Contains(string(r.Body), "@downloads.example") {
+			t.Fatalf("a mirrored password with spaces is served: %s", r.Body)
+		}
+	})
+
 	t.Run("requests with text no entry can have", func(t *testing.T) {
 		e := NewEnv(t, newStore(t), Options{})
 		e.namespace("com.acme", "domain")

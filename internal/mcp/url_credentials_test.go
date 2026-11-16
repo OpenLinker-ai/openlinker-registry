@@ -73,6 +73,39 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 	if err != nil || !strings.Contains(string(p.Canonical), "/users/@alice/sse?to=a@b.example") {
 		t.Fatalf("path and query may contain @: %v", err)
 	}
+	// Free text is not a URL, whatever it begins with; nor is text in a
+	// member this registry does not know that merely starts with a link.
+	// Both are kept as they are, by strict and by lenient parsing.
+	for name, member := range map[string]string{
+		"description":               `"description":"https://example.com contact alice@example.org"`,
+		"description with a query":  `"description":"https://example.com/docs?token=abc for alice@example.org"`,
+		"title":                     `"description":"d","title":"https://example.com by alice@example.org"`,
+		"text in an unknown member": `"description":"d","x-note":"https://example.com contact alice@example.org"`,
+		"list in an unknown member": `"description":"d","x-notes":["https://example.com contact alice@example.org"]`,
+		"scheme-relative text":      `"description":"d","x-note":"//example.com then mail alice@example.org"`,
+		"description of a remote":   `"description":"d","x-remote":{"description":"https://a.example and b@c.example","url":"https://mcp.example.com/x"}`,
+	} {
+		doc := `{"name":"io.github.alice/w",` + member + `,"version":"1.0.0","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`
+		for _, o := range []Options{{Strict: true}, {}} {
+			p, err := Parse([]byte(doc), o)
+			if err != nil {
+				t.Errorf("%s (strict %v): %v", name, o.Strict, err)
+				continue
+			}
+			if !strings.Contains(string(p.Canonical), "@example.org") && !strings.Contains(string(p.Canonical), "b@c.example") {
+				t.Errorf("%s (strict %v): text was rewritten: %s", name, o.Strict, p.Canonical)
+			}
+		}
+	}
+	// In a member that holds URLs, white space does not end the userinfo.
+	spaced := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"packages":[{"registryType":"mcpb","identifier":"https://alice smith@downloads.example/tool.mcpb","transport":{"type":"stdio"}}]}`
+	if _, err := Parse([]byte(spaced), Options{Strict: true}); err == nil {
+		t.Error("userinfo with a space in a URL member must be refused")
+	}
+	if p, err := Parse([]byte(spaced), Options{}); err != nil || strings.Contains(string(p.Canonical), "smith") {
+		t.Errorf("userinfo with a space in a URL member must be removed: %v", err)
+	}
 	// Nor in a template, after its first slash.
 	for _, url := range []string{"{base}/users/@alice/sse", "{base}/a//b@c/sse", "{scheme}://mcp.example.com/a//b@c"} {
 		ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0","remotes":[{"type":"sse","url":"` + url + `",
