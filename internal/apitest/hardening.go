@@ -1012,6 +1012,92 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fnever/versions/1.0.0", "", "", nil), 404, "unknown version")
 	})
 
+	t.Run("a version history larger than the response cap", func(t *testing.T) {
+		// A latest-only mirror holds an old version of a server whose whole
+		// history no longer fits one response. Reconciling that server must
+		// neither end the sync (the servers after it still have to be
+		// reconciled) nor leave the server as it was: what is mirrored is
+		// read version by version.
+		up := NewEnv(t, newStore(t), Options{})
+		up.namespace("com.acme", "domain")
+		pub := up.publisher("com.acme")
+		for _, name := range []string{"com.acme/big", "com.acme/zeta"} {
+			up.Expect(up.publishMCP(pub, "com.acme", serverJSON(name, "1.0.0", "https://x.acme.example/mcp")), 201, "publish")
+		}
+		padded, gone := false, ""
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if gone != "" && r.URL.EscapedPath() == gone {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				return
+			}
+			req, _ := http.NewRequest(r.Method, up.Base+r.URL.RequestURI(), nil)
+			req.Header.Set("Authorization", r.Header.Get("Authorization"))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				w.WriteHeader(502)
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if padded && r.URL.EscapedPath() == "/v0.1/servers/com.acme%2Fbig/versions" && resp.StatusCode == 200 {
+				// As large as three hundred documents of 60 KiB.
+				body = append(bytes.TrimSuffix(bytes.TrimSpace(body), []byte("}")), []byte(`,"padding":"`+strings.Repeat("a", 18<<20)+`"}`)...)
+			}
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(proxy.Close)
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": proxy.URL, "latest_only": true, "visibility": "public"}), 201, "upstream")
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "mcp_created") != 2 {
+			t.Fatalf("first sync: %v", s)
+		}
+		status := func(name, version string) any {
+			r := down.Do("GET", "/v0.1/servers/"+url.PathEscape(name)+"/versions/"+version, "", "", nil)
+			if r.Status != 200 {
+				return r.Status
+			}
+			return official(r.JSON)["status"]
+		}
+		// Both servers get a new latest version; their old ones change.
+		for _, name := range []string{"com.acme/big", "com.acme/zeta"} {
+			up.Expect(up.publishMCP(pub, "com.acme", serverJSON(name, "2.0.0", "https://x.acme.example/mcp")), 201, "publish")
+		}
+		up.Expect(up.Do("POST", "/v1/mcp/servers/com.acme/big/versions/1.0.0/status", pub, "", map[string]any{"status": "deprecated", "message": "old"}), 200, "deprecate")
+		up.Expect(up.Do("POST", "/v1/mcp/servers/com.acme/zeta/versions/1.0.0/status", pub, "", map[string]any{"status": "deleted"}), 200, "delete")
+		padded = true
+		s := down.sync("hub")
+		if s["last_status"] != "ok" {
+			t.Fatalf("a history that is too large ended the sync: %v", s)
+		}
+		if got := status("com.acme/zeta", "1.0.0"); got != "deleted" {
+			t.Fatalf("the server after the large one was not reconciled: its old version is %v", got)
+		}
+		if a, b := status("com.acme/big", "1.0.0"), status("com.acme/big", "2.0.0"); a != "deprecated" || b != "active" {
+			t.Fatalf("the large server was left as it was: 1.0.0 is %v, 2.0.0 is %v", a, b)
+		}
+		// A version the upstream no longer serves is marked deleted.
+		gone = "/v0.1/servers/com.acme%2Fbig/versions/1.0.0"
+		if s = down.sync("hub"); s["last_status"] != "ok" || status("com.acme/big", "1.0.0") != "deleted" || status("com.acme/big", "2.0.0") != "active" {
+			t.Fatalf("a version that is gone upstream: 1.0.0 is %v, 2.0.0 is %v: %v", status("com.acme/big", "1.0.0"), status("com.acme/big", "2.0.0"), s)
+		}
+		// And comes back when it is served again.
+		gone = ""
+		up.Expect(up.Do("POST", "/v1/mcp/servers/com.acme/big/versions/1.0.0/status", pub, "", map[string]any{"status": "active"}), 200, "restore")
+		down.sync("hub")
+		if got := status("com.acme/big", "1.0.0"); got != "active" {
+			t.Fatalf("a version served again is %v", got)
+		}
+		// The upstream stops sharing the server.
+		up.Expect(up.Do("PATCH", "/v1/mcp/servers/com.acme/big", pub, "", map[string]any{"visibility": "private"}), 200, "restrict")
+		if s = down.sync("hub"); s["last_status"] != "ok" || status("com.acme/big", "2.0.0") != 404 {
+			t.Fatalf("a large server the upstream stopped sharing is still served (%v): %v", status("com.acme/big", "2.0.0"), s)
+		}
+	})
+
 	t.Run("a listing page larger than the response cap", func(t *testing.T) {
 		// Large documents make a full page exceed what one response may
 		// carry, although each document is fine. The sync asks for smaller

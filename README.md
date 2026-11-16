@@ -233,7 +233,8 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   the upstream (counted as `mcp_state_only`). A change the
   upstream could not confirm holds the watermark until it is applied, and
   nothing is taken as removed on the word of a list that could not be read
-  completely. When the upstream throttles a sync
+  completely. A server whose version history is too large for one response
+  is reconciled version by version. When the upstream throttles a sync
   (`429`), the sync waits for `Retry-After` and continues. One run per
   upstream is active at a time, across replicas. Changing what an upstream selects (URL,
   allow and deny lists, `latest_only`, `visibility`) starts the next sync

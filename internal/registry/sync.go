@@ -359,6 +359,15 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 		return nil, err
 	}
 	docs, complete, err := c.ListMCPVersions(ctx, srv.Name)
+	if tooLarge(err) {
+		// The server's whole history does not fit one response. That must
+		// not stop the sync, nor leave this server as it was: the versions
+		// mirrored here are read one by one instead.
+		docs, complete, err = s.readMirroredMCP(ctx, c, srv)
+		if err == nil && complete && len(docs) == 0 {
+			err = upstream.ErrNotFound // none of it is served any more
+		}
+	}
 	switch {
 	case errors.Is(err, upstream.ErrNotFound):
 		return nil, s.withdrawMCP(ctx, u, srv, stats)
@@ -409,6 +418,53 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 		stats.add("mcp_updated")
 	}
 	return served, nil
+}
+
+// readMirroredMCP reads, version by version, what the upstream serves of a
+// mirrored server: its latest version and every version recorded here. It
+// stands in for the server's version list when that is too large to read.
+// A version the upstream answers 404 for is not among the documents; complete
+// is false when a version could not be read, so that nothing is concluded
+// about it.
+func (s *Service) readMirroredMCP(ctx context.Context, c *upstream.Client, srv model.MCPServer) (docs []upstream.MCPDoc, complete bool, err error) {
+	local, err := s.Store.ListMCPVersions(ctx, srv.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	complete = true
+	read := map[string]bool{}
+	get := func(version string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		doc, err := c.GetMCP(ctx, srv.Name, version)
+		var ue *upstream.Error
+		switch {
+		case err == nil:
+			if !read[doc.Version] {
+				read[doc.Version] = true
+				docs = append(docs, doc)
+			}
+		case errors.Is(err, upstream.ErrNotFound):
+		case errors.As(err, &ue) || tooLarge(err):
+			complete = false
+		default:
+			return err
+		}
+		return nil
+	}
+	if err := get("latest"); err != nil {
+		return nil, false, err
+	}
+	for _, v := range local {
+		if read[v.Version] {
+			continue
+		}
+		if err := get(v.Version); err != nil {
+			return nil, false, err
+		}
+	}
+	return docs, complete, nil
 }
 
 // mirrorListedMCP applies a document that came with a listing page. Such a
