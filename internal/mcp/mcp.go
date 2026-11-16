@@ -428,8 +428,10 @@ func isURLValue(key, value string) bool {
 // password may contain spaces ("https://alice:two words@host").
 var userinfoRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#]*@`)
 
-// userinfoTokenRe is userinfoRe for userinfo without white space.
-var userinfoTokenRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#\s]*@`)
+// userinfoTokenRe is userinfoRe for userinfo without white space. White
+// space is what unicode.IsSpace says it is, a no-break space included: "\s"
+// alone is only the ASCII part of it.
+var userinfoTokenRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#\s\v\x{0085}\pZ]*@`)
 
 // findUserinfo returns the userinfo of a URL value as userinfoRe matches it
 // (the match and its group 1), or nil.

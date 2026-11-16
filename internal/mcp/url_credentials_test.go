@@ -3,6 +3,7 @@ package mcp
 import (
 	"strings"
 	"testing"
+	"unicode"
 )
 
 func TestURLsMustNotEmbedCredentials(t *testing.T) {
@@ -83,6 +84,10 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 		"text in an unknown member": `"description":"d","x-note":"https://example.com contact alice@example.org"`,
 		"list in an unknown member": `"description":"d","x-notes":["https://example.com contact alice@example.org"]`,
 		"scheme-relative text":      `"description":"d","x-note":"//example.com then mail alice@example.org"`,
+		"no-break spaces":           `"description":"d","x-note":"https://example.com\u00a0contact\u00a0alice@example.org"`,
+		"ideographic space":         `"description":"d","x-note":"https://example.com\u3000contact alice@example.org"`,
+		"line separator in a list":  `"description":"d","x-notes":["//example.com\u2028mail alice@example.org"]`,
+		"next line":                 `"description":"d","x-note":"https://example.com\u0085alice@example.org"`,
 		"description of a remote":   `"description":"d","x-remote":{"description":"https://a.example and b@c.example","url":"https://mcp.example.com/x"}`,
 	} {
 		doc := `{"name":"io.github.alice/w",` + member + `,"version":"1.0.0","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`
@@ -105,6 +110,33 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 	}
 	if p, err := Parse([]byte(spaced), Options{}); err != nil || strings.Contains(string(p.Canonical), "smith") {
 		t.Errorf("userinfo with a space in a URL member must be removed: %v", err)
+	}
+	// Nor does any other white space, and a password may contain it in a
+	// member that is only taken for a URL by its form.
+	for name, member := range map[string]string{
+		"no-break space in a URL member":  `"packages":[{"registryType":"mcpb","identifier":"https://bob\u00a0smith@downloads.example/tool.mcpb","transport":{"type":"stdio"}}]`,
+		"no-break space in a password":    `"x-mirror":"https://bob:two\u00a0words@example.com/"`,
+		"ideographic space in a password": `"x-mirror":"https://bob:two\u3000words@example.com/"`,
+		"vertical tab in a password":      `"x-mirror":"https://bob:two\u000bwords@example.com/"`,
+		"userinfo before no-break text":   `"x-mirror":"https://bob@example.com/\u00a0see\u00a0the\u00a0docs"`,
+	} {
+		doc := `{"name":"io.github.alice/w","description":"d",` + member + `,"version":"1.0.0","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`
+		if _, err := Parse([]byte(doc), Options{Strict: true}); err == nil || err.(*Error).Code != codeSecretValue {
+			t.Errorf("%s: must be refused as a credential, got %v", name, err)
+		}
+		if p, err := Parse([]byte(doc), Options{}); err != nil || strings.Contains(string(p.Canonical), "bob") {
+			t.Errorf("%s: userinfo must be removed: %v", name, err)
+		}
+	}
+	// Text with no-break spaces that goes on to a URL with userinfo loses
+	// that userinfo and nothing else.
+	mixed := `{"name":"io.github.alice/w","description":"d","x-note":"//example.com\u00a0mail\u00a0bob@x.example\u00a0see://carol@host.example/",
+		"version":"1.0.0","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`
+	if _, err := Parse([]byte(mixed), Options{Strict: true}); err == nil || err.(*Error).Code != codeSecretValue {
+		t.Errorf("userinfo after text with no-break spaces must be refused, got %v", err)
+	}
+	if p, err := Parse([]byte(mixed), Options{}); err != nil || strings.Contains(string(p.Canonical), "carol") || !strings.Contains(string(p.Canonical), "bob@x.example") {
+		t.Errorf("only the userinfo must be removed: %v %s", err, p.Canonical)
 	}
 	// Nor in a template, after its first slash.
 	for _, url := range []string{"{base}/users/@alice/sse", "{base}/a//b@c/sse", "{scheme}://mcp.example.com/a//b@c"} {
@@ -229,5 +261,23 @@ func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
 	p, err := Parse([]byte(ok), Options{Strict: true})
 	if err != nil || !strings.Contains(string(p.Canonical), "api_key={key}&max_tokens=4096&region=eu") {
 		t.Fatalf("placeholders and ordinary parameters must pass: %v", err)
+	}
+}
+
+// The userinfo of text that only looks like a URL has no white space, and
+// white space is the same thing everywhere this package asks about it.
+func TestUserinfoTokenHasNoWhiteSpace(t *testing.T) {
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if r >= 0xD800 && r <= 0xDFFF {
+			continue
+		}
+		switch r {
+		case '/', '?', '#', '@':
+			continue
+		}
+		got := userinfoTokenRe.MatchString("//a" + string(r) + "b@host")
+		if want := !unicode.IsSpace(r); got != want {
+			t.Fatalf("%U: userinfo matched = %v, want %v", r, got, want)
+		}
 	}
 }

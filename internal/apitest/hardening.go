@@ -3093,9 +3093,12 @@ func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
 		// with a password: refused when published, cleaned when mirrored.
 		const text = "https://example.com for help write to alice@example.org"
 		const secret = "hunter2 live 0123456789"
+		// Text in a member the registry does not know is text as well,
+		// whatever kind of space separates its words.
+		const note = "https://example.com\u00a0contact\u00a0alice@example.org"
 		prose := func(name string) map[string]any {
 			return map[string]any{"name": name, "description": text, "title": text, "version": "1.0.0",
-				"remotes": []any{map[string]any{"type": "sse", "url": "https://mcp.example.com/sse"}}}
+				"x-note": note, "remotes": []any{map[string]any{"type": "sse", "url": "https://mcp.example.com/sse"}}}
 		}
 		spaced := func(name string) map[string]any {
 			return map[string]any{"name": name, "description": "d", "version": "1.0.0",
@@ -3130,6 +3133,9 @@ func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
 			server, _ := r.JSON["server"].(map[string]any)
 			if server["description"] != text || server["title"] != text {
 				t.Fatalf("%s: free text was rewritten: %v / %v", name, server["description"], server["title"])
+			}
+			if server["x-note"] != note {
+				t.Fatalf("%s: text in an unknown member was rewritten: %q", name, server["x-note"])
 			}
 		}
 		r := e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Fspaced/versions/1.0.0", "", "", nil), 200, "mirrored URL with a spaced password")
