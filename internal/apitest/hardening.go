@@ -1129,7 +1129,10 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 				case 1:
 					_ = enc.Encode(entry("com.feed/tool", "1.0.0", "deleted", false))
 				case 2:
-					w.WriteHeader(503)
+					// A redirect is not followed; it is an answer for
+					// this version like an error status.
+					w.Header().Set("Location", "/elsewhere")
+					w.WriteHeader(302)
 				default:
 					_ = enc.Encode(entry("com.feed/tool", "1.0.0", "active", false))
 				}
@@ -1175,6 +1178,94 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 		if status("com.feed/tool") != "active" || status("com.feed/zz") != "deprecated" {
 			t.Fatalf("after the upstream recovered: tool v1 is %v, zz v1 is %v", status("com.feed/tool"), status("com.feed/zz"))
+		}
+	})
+
+	t.Run("a forwarded read overtaken by a sync", func(t *testing.T) {
+		// A forwarded read asks the upstream for v1 of a server that is not
+		// mirrored yet; the answer (public) is slow. Meanwhile the upstream
+		// makes the server internal and publishes v2, and a sync mirrors
+		// both. The forwarded read's answer is older than what the sync
+		// read: applied afterwards, it must not make the server public
+		// again.
+		entry := func(version, visibility string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": "com.race/slow", "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": version == "2.0.0"},
+					metaEntry: map[string]any{"visibility": visibility, "listed": true}}}
+		}
+		var restricted atomic.Bool
+		asked, answer := make(chan struct{}), make(chan struct{})
+		var first atomic.Bool
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[]}`))
+			case "/v0.1/servers", "/v0.1/servers/com.race%2Fslow/versions":
+				if !restricted.Load() {
+					_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("1.0.0", "public")}})
+					return
+				}
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("2.0.0", "internal"), entry("1.0.0", "internal")}})
+			case "/v0.1/servers/com.race%2Fslow/versions/1.0.0":
+				if first.CompareAndSwap(false, true) {
+					// The forwarded read: what the upstream says now, sent
+					// only after the sync has had its chance.
+					close(asked)
+					<-answer
+					_ = enc.Encode(entry("1.0.0", "public"))
+					return
+				}
+				visibility := "public"
+				if restricted.Load() {
+					visibility = "internal"
+				}
+				_ = enc.Encode(entry("1.0.0", visibility))
+			case "/v0.1/servers/com.race%2Fslow/versions/2.0.0":
+				if !restricted.Load() {
+					w.WriteHeader(404)
+					return
+				}
+				_ = enc.Encode(entry("2.0.0", "internal"))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "race", "kind": "openlinker-registry", "base_url": fake.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		forwarded := make(chan int, 1)
+		go func() { forwarded <- e.Do("GET", "/v0.1/servers/com.race%2Fslow/versions/1.0.0", "", "", nil).Status }()
+		<-asked
+		restricted.Store(true)
+		synced := make(chan map[string]any, 1)
+		go func() { synced <- e.sync("race") }()
+		// The sync either finishes on its own (and then the old answer
+		// arrives after it), or waits for the forwarded read.
+		var result map[string]any
+		select {
+		case result = <-synced:
+		case <-time.After(500 * time.Millisecond):
+		}
+		close(answer)
+		if got := <-forwarded; got != 200 && got != 404 {
+			t.Fatalf("forwarded read: %d", got)
+		}
+		if result == nil {
+			result = <-synced
+		}
+		if result["last_status"] != "ok" {
+			t.Fatalf("sync: %v", result)
+		}
+		reader := e.token([]string{"skills:read"}, nil)
+		e.Expect(e.Do("GET", "/v0.1/servers/com.race%2Fslow/versions/2.0.0", reader, "", nil), 200, "v2 for signed-in callers")
+		for _, version := range []string{"2.0.0", "1.0.0", "latest"} {
+			if got := e.Do("GET", "/v0.1/servers/com.race%2Fslow/versions/"+version, "", "", nil).Status; got != 404 {
+				t.Fatalf("anonymous read of %s = %d: an older forwarded answer made an internal server public", version, got)
+			}
 		}
 	})
 
@@ -2104,10 +2195,19 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		for _, name := range []string{"bad", "good"} {
 			up.Expect(up.Do("POST", "/v1/skills/com.acme/"+name+"/versions?version=v1", pub, "text/markdown", md(name, "Skill", "MIT")), 201, "skill")
 		}
+		for _, name := range []string{"moved", "zeta"} {
+			up.Expect(up.Do("POST", "/v1/skills/com.acme/"+name+"/versions?version=v1", pub, "text/markdown", md(name, "Skill", "MIT")), 201, "skill")
+		}
 		broken := true
 		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if broken && r.URL.Path == "/v1/skills/com.acme/bad" {
 				w.WriteHeader(500)
+				return
+			}
+			if broken && r.URL.Path == "/v1/skills/com.acme/moved" {
+				// A redirect is not followed, and is no reason to stop.
+				w.Header().Set("Location", "/v1/skills/com.acme/good")
+				w.WriteHeader(301)
 				return
 			}
 			req, _ := http.NewRequest(r.Method, up.Base+r.URL.RequestURI(), nil)
@@ -2125,17 +2225,19 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		t.Cleanup(proxy.Close)
 		down := NewEnv(t, newStore(t), Options{Loopback: true})
 		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": proxy.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
-		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_skipped") != 1 || stat(s, "skills_created") != 1 {
-			t.Fatalf("a sync with one skill the upstream cannot serve: %v", s)
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_skipped") != 2 || stat(s, "skills_created") != 2 {
+			t.Fatalf("a sync with skills the upstream cannot serve: %v", s)
 		}
 		down.Expect(down.Do("GET", "/v1/skills/com.acme/good", "", "", nil), 200, "the skill after the failing one")
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/zeta", "", "", nil), 200, "the skill after the redirected one")
 		// A forwarded read of it reports the upstream, not a miss.
 		down.Expect(down.Do("GET", "/v1/skills/com.acme/bad", "", "", nil), 502, "forwarded read of the failing skill")
 		broken = false
-		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_created") != 1 {
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_created") != 2 {
 			t.Fatalf("the sync after the upstream recovered: %v", s)
 		}
 		down.Expect(down.Do("GET", "/v1/skills/com.acme/bad", "", "", nil), 200, "the skill that had failed")
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/moved", "", "", nil), 200, "the skill that had been redirected")
 	})
 
 	t.Run("a license approved upstream later", func(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/archive"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/blobstore"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/mcp"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/safehttp"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
@@ -144,8 +145,8 @@ func isUpstreamError(err error) bool {
 }
 
 // answered reports whether err is the upstream's own answer to one request
-// (an error status, a body that is too large or that cannot be used) rather
-// than a failure to reach it. Such an answer is about one entry: that entry
+// (an error status, a redirect, a body that is too large or that cannot be
+// used) rather than a failure to reach it. Such an answer is about one entry: that entry
 // is left for a later run, and the sync goes on with the others. "Not
 // found" is an answer too, with a meaning of its own; callers check it first.
 // A refusal of this instance (401, 403) is not about one entry and stays a
@@ -161,7 +162,8 @@ func answered(err error) bool {
 	case se.Code == safehttp.CodeStatus:
 		return se.Status != http.StatusUnauthorized && se.Status != http.StatusForbidden
 	}
-	return se.Code == safehttp.CodeTooLarge
+	// A redirect is not followed; it is this entry's answer all the same.
+	return se.Code == safehttp.CodeTooLarge || se.Code == safehttp.CodeRedirectNotFollowed
 }
 
 // syncOneSkill refreshes one skill during a sync. An error the upstream
@@ -518,16 +520,26 @@ func (s *Service) readMirroredMCP(ctx context.Context, c *upstream.Client, srv m
 // newer one since. So it is only allowed to add a version or to narrow who
 // sees the server; if it would do anything else, the version is read again
 // under the server's mirror lock and that answer is applied.
+//
+// The document is applied under the server's mirror lock as well. A
+// forwarded read holds that lock from before it asks the upstream until it
+// has applied the answer as a fresh one; without the lock here, a listing
+// could be applied in between, and the forwarded read's older answer would
+// then override it.
 func (s *Service) mirrorListedMCP(ctx context.Context, u model.Upstream, c *upstream.Client, doc upstream.MCPDoc, onlyExisting bool) (string, error) {
-	res, err := s.mirrorMCP(ctx, u, doc, onlyExisting, false)
-	if err != nil || res != model.MirrorStale {
-		return res, err
+	if _, _, ok := mcp.SplitName(doc.Name); !ok {
+		// No server has this name: nothing to lock, nothing to apply.
+		return s.mirrorMCP(ctx, u, doc, onlyExisting, false)
 	}
 	release, err := s.Store.LockMirror(ctx, "mcp:"+doc.Name)
 	if err != nil {
 		return "", err
 	}
 	defer release()
+	res, err := s.mirrorMCP(ctx, u, doc, onlyExisting, false)
+	if err != nil || res != model.MirrorStale {
+		return res, err
+	}
 	fresh, err := c.GetMCP(ctx, doc.Name, doc.Version)
 	switch {
 	case errors.Is(err, upstream.ErrNotFound):
