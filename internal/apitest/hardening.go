@@ -1098,6 +1098,86 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a mirrored version that cannot be read", func(t *testing.T) {
+		// v1 is mirrored as deleted and was restored upstream since. A full
+		// latest-only run has to read the server version by version (its
+		// history is too large for one response), and the read of v1 fails
+		// this once. A second server's version list answers with an error.
+		// Neither ends the run, and both keep the watermark where it is:
+		// the next run must be a full one again, or v1 would stay deleted.
+		now := time.Now().UTC().Truncate(time.Second)
+		t1, t2 := now.Add(-2*time.Hour), now.Add(-time.Hour)
+		entry := func(name, version, status string, latest bool) map[string]any {
+			return map[string]any{"server": map[string]any{"name": name, "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": latest,
+					"updatedAt": t2.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
+		}
+		phase := 1 // 1: before the sync; 2: reads fail; 3: everything answers
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/tool", "2.0.0", "active", true)}})
+			case "/v0.1/servers/com.feed%2Ftool/versions":
+				_, _ = w.Write([]byte(`{"servers":[],"padding":"` + strings.Repeat("a", 17<<20) + `"}`))
+			case "/v0.1/servers/com.feed%2Ftool/versions/latest", "/v0.1/servers/com.feed%2Ftool/versions/2.0.0":
+				_ = enc.Encode(entry("com.feed/tool", "2.0.0", "active", true))
+			case "/v0.1/servers/com.feed%2Ftool/versions/1.0.0":
+				switch phase {
+				case 1:
+					_ = enc.Encode(entry("com.feed/tool", "1.0.0", "deleted", false))
+				case 2:
+					w.WriteHeader(503)
+				default:
+					_ = enc.Encode(entry("com.feed/tool", "1.0.0", "active", false))
+				}
+			case "/v0.1/servers/com.feed%2Fzz/versions/1.0.0":
+				_ = enc.Encode(entry("com.feed/zz", "1.0.0", "active", true))
+			case "/v0.1/servers/com.feed%2Fzz/versions":
+				if phase == 2 {
+					w.WriteHeader(500)
+					return
+				}
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("com.feed/zz", "1.0.0", "deprecated", true)}})
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "proxy_on_miss": true,
+			"latest_only": true, "visibility": "public"}), 201, "upstream")
+		status := func(name string) any {
+			return official(e.Do("GET", "/v0.1/servers/"+url.PathEscape(name)+"/versions/1.0.0", "", "", nil).JSON)["status"]
+		}
+		if status("com.feed/tool") != "deleted" || status("com.feed/zz") != "active" {
+			t.Fatalf("forwarded versions: %v, %v", status("com.feed/tool"), status("com.feed/zz"))
+		}
+		phase = 2
+		s := e.sync("feed")
+		if s["last_status"] != "ok" || stat(s, "mcp_pending") != 2 {
+			t.Fatalf("a run with versions that could not be read: %v", s)
+		}
+		if cursor, _ := s["cursor"].(string); cursor != "" {
+			t.Fatalf("the run stored the watermark %q although mirrored versions were not confirmed", cursor)
+		}
+		if r := e.Do("GET", "/v0.1/servers/com.feed%2Ftool/versions/latest", "", "", nil); v0Version(r.JSON) != "2.0.0" {
+			t.Fatalf("what could be read was not applied: %s", r.Body)
+		}
+		phase = 3
+		s = e.sync("feed")
+		cursor, _ := s["cursor"].(string)
+		if at, _ := time.Parse(time.RFC3339Nano, cursor); s["last_status"] != "ok" || stat(s, "mcp_pending") != 0 || !at.Equal(t2) {
+			t.Fatalf("the run after the upstream recovered: %v", s)
+		}
+		if status("com.feed/tool") != "active" || status("com.feed/zz") != "deprecated" {
+			t.Fatalf("after the upstream recovered: tool v1 is %v, zz v1 is %v", status("com.feed/tool"), status("com.feed/zz"))
+		}
+	})
+
 	t.Run("a listing page larger than the response cap", func(t *testing.T) {
 		// Large documents make a full page exceed what one response may
 		// carry, although each document is fine. The sync asks for smaller
@@ -2013,6 +2093,49 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			}
 			e.Expect(e.Do("GET", artifact, "", "", nil), 200, "artifact while the index names "+bad)
 		}
+	})
+
+	t.Run("an upstream error for one skill", func(t *testing.T) {
+		// The upstream answers one skill's detail with an error. That skill
+		// waits; the skills after it are still mirrored.
+		up := NewEnv(t, newStore(t), Options{})
+		up.namespace("com.acme", "domain")
+		pub := up.publisher("com.acme")
+		for _, name := range []string{"bad", "good"} {
+			up.Expect(up.Do("POST", "/v1/skills/com.acme/"+name+"/versions?version=v1", pub, "text/markdown", md(name, "Skill", "MIT")), 201, "skill")
+		}
+		broken := true
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if broken && r.URL.Path == "/v1/skills/com.acme/bad" {
+				w.WriteHeader(500)
+				return
+			}
+			req, _ := http.NewRequest(r.Method, up.Base+r.URL.RequestURI(), nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				w.WriteHeader(502)
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(proxy.Close)
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": proxy.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_skipped") != 1 || stat(s, "skills_created") != 1 {
+			t.Fatalf("a sync with one skill the upstream cannot serve: %v", s)
+		}
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/good", "", "", nil), 200, "the skill after the failing one")
+		// A forwarded read of it reports the upstream, not a miss.
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/bad", "", "", nil), 502, "forwarded read of the failing skill")
+		broken = false
+		if s := down.sync("hub"); s["last_status"] != "ok" || stat(s, "skills_created") != 1 {
+			t.Fatalf("the sync after the upstream recovered: %v", s)
+		}
+		down.Expect(down.Do("GET", "/v1/skills/com.acme/bad", "", "", nil), 200, "the skill that had failed")
 	})
 
 	t.Run("a license approved upstream later", func(t *testing.T) {
