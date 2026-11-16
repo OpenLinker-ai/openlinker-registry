@@ -300,6 +300,9 @@ func (s *Server) uiSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	versions, err := s.Svc.Store.ListVersions(r.Context(), sk.ID)
+	if err == nil {
+		sk, err = s.confirmSkill(r, sk)
+	}
 	if err != nil {
 		s.uiError(w, r, err)
 		return
@@ -463,6 +466,9 @@ func (s *Server) uiMCPServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	versions, err := s.Svc.Store.ListMCPVersions(r.Context(), srv.ID)
+	if err == nil {
+		srv, err = s.confirmMCP(r, srv)
+	}
 	if err != nil {
 		s.uiError(w, r, err)
 		return

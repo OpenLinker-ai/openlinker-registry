@@ -833,13 +833,18 @@ func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly
 	}
 	out := make([]model.IndexCandidate, 0, len(keys))
 	for _, k := range keys {
+		v, err := s.GetVersion(ctx, k.id, k.ver)
+		if err != nil {
+			return nil, err
+		}
+		// The skill is read after its version: it may have been
+		// restricted since the selection, and then it is not a candidate.
 		sk, err := s.getSkillByID(ctx, s.pool, k.id)
 		if err != nil {
 			return nil, err
 		}
-		v, err := s.GetVersion(ctx, k.id, k.ver)
-		if err != nil {
-			return nil, err
+		if sk.Visibility != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive {
+			continue
 		}
 		out = append(out, model.IndexCandidate{Skill: sk, Version: v})
 	}

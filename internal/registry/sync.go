@@ -371,10 +371,10 @@ func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *ups
 // every version it no longer contains as deleted.
 func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *upstream.Client, doc upstream.MCPDoc) (string, error) {
 	if _, err := s.refreshMCPServerLocked(ctx, u, c, doc.Name, syncStats{}); err != nil {
-		if isUpstreamError(err) {
+		if answered(err) {
 			return "", errUnconfirmed
 		}
-		return "", err // errUnconfirmed included
+		return "", err // errUnconfirmed included; other failures end the run
 	}
 	return model.MirrorUpdated, nil
 }
@@ -547,9 +547,11 @@ func (s *Service) mirrorListedMCP(ctx context.Context, u model.Upstream, c *upst
 		// from the server's own version list, rather than leave a change
 		// unapplied that no later run would read again.
 		return s.reconcileMissingMCP(ctx, u, c, doc)
-	case err != nil && isUpstreamError(err):
-		// Unreadable right now. Nothing was changed here; the sync must
-		// come back to this entry.
+	case answered(err):
+		// The upstream answered this read with an error. Nothing was
+		// changed here; the sync must come back to this entry. A failure
+		// that is not about this entry (the upstream refuses this instance
+		// or cannot be reached) ends the run instead.
 		return "", errUnconfirmed
 	case err != nil:
 		return "", err

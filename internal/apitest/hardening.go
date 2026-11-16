@@ -31,6 +31,7 @@ func runHardening(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("skill sync", func(t *testing.T) { runSkillSyncRules(t, newStore) })
 	t.Run("limits and error formats", func(t *testing.T) { runLimitsAndFormats(t, newStore) })
 	t.Run("odd names, versions and requests", func(t *testing.T) { runOddInputs(t, newStore) })
+	t.Run("a change between two reads of one request", func(t *testing.T) { runSplitReads(t, newStore) })
 }
 
 // runMirrorVisibility mirrors from an upstream that shows this instance more
@@ -1266,6 +1267,73 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 			if got := e.Do("GET", "/v0.1/servers/com.race%2Fslow/versions/"+version, "", "", nil).Status; got != 404 {
 				t.Fatalf("anonymous read of %s = %d: an older forwarded answer made an internal server public", version, got)
 			}
+		}
+	})
+
+	t.Run("a refusal during confirmation ends the run", func(t *testing.T) {
+		// An incremental run has to confirm a deletion with the upstream.
+		// When the upstream refuses this instance (the token expired), that
+		// is not a change that could not be confirmed: the run must fail,
+		// visibly, rather than finish "ok" with the entry pending.
+		now := time.Now().UTC().Truncate(time.Second)
+		t1, t2 := now.Add(-2*time.Hour), now.Add(-time.Hour)
+		entry := func(status string, updated time.Time) map[string]any {
+			return map[string]any{"server": map[string]any{"name": "com.feed/a", "description": "d", "version": "1.0.0",
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": status != "deleted",
+					"updatedAt": updated.Format(time.RFC3339), "publishedAt": t1.Format(time.RFC3339)}}}
+		}
+		mode := "first" // "refused": the read answers 401; "gone": 404, and the version list answers 403; "ok"
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			switch r.URL.EscapedPath() {
+			case "/v0.1/servers":
+				if mode == "first" {
+					_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("active", t1)}})
+					return
+				}
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("deleted", t2)}})
+			case "/v0.1/servers/com.feed%2Fa/versions/1.0.0":
+				switch mode {
+				case "refused":
+					w.WriteHeader(401)
+				case "gone":
+					w.WriteHeader(404)
+					_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				default:
+					_ = enc.Encode(entry("deleted", t2))
+				}
+			case "/v0.1/servers/com.feed%2Fa/versions":
+				w.WriteHeader(403)
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		cursorOf := func(s map[string]any) time.Time {
+			c, _ := s["cursor"].(string)
+			at, _ := time.Parse(time.RFC3339Nano, c)
+			return at
+		}
+		status := func() any {
+			return official(e.Do("GET", "/v0.1/servers/com.feed%2Fa/versions/1.0.0", "", "", nil).JSON)["status"]
+		}
+		if s := e.sync("feed"); s["last_status"] != "ok" || !cursorOf(s).Equal(t1) {
+			t.Fatalf("first sync: %v", s)
+		}
+		for _, mode = range []string{"refused", "gone"} {
+			s := e.sync("feed")
+			if s["last_status"] != "failed" || s["last_error"] == nil || !cursorOf(s).Equal(t1) || status() != "active" {
+				t.Fatalf("%s: a run the upstream refused must fail and keep its watermark (version is %v): %v", mode, status(), s)
+			}
+		}
+		mode = "ok"
+		if s := e.sync("feed"); s["last_status"] != "ok" || !cursorOf(s).Equal(t2) || status() != "deleted" {
+			t.Fatalf("after the upstream accepts this instance again (version is %v): %v", status(), s)
 		}
 	})
 

@@ -54,6 +54,25 @@ func (s *Server) loadVisible(r *http.Request) (model.Skill, error) {
 	return sk, nil
 }
 
+// confirmSkill re-reads a skill after its versions were loaded. A skill's
+// settings and its versions are read one after the other; in between, the
+// skill may be restricted and get a version that was never meant for this
+// caller (a mirror applying its upstream, an owner going private). What
+// was loaded is served only if the caller may see the skill as it is now.
+func (s *Server) confirmSkill(r *http.Request, sk model.Skill) (model.Skill, error) {
+	now, err := s.Svc.Store.GetSkill(r.Context(), sk.Namespace, sk.Name)
+	if errors.Is(err, model.ErrNotFound) {
+		return model.Skill{}, errNotFound
+	}
+	if err != nil {
+		return model.Skill{}, err
+	}
+	if now.ID != sk.ID || !principal(r).Viewer().CanSee(now.Namespace, now.Visibility) {
+		return model.Skill{}, errNotFound
+	}
+	return now, nil
+}
+
 // loadVisibleVersion also completes a mirrored skill from its upstream when
 // the requested version is not here yet.
 func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version, error) {
@@ -87,7 +106,13 @@ func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version
 	if errors.Is(err, model.ErrNotFound) {
 		return sk, v, errNotFound
 	}
-	return sk, v, err
+	if err != nil {
+		return sk, v, err
+	}
+	if sk, err = s.confirmSkill(r, sk); err != nil {
+		return model.Skill{}, model.Version{}, err
+	}
+	return sk, v, nil
 }
 
 func skillJSON(sk model.Skill, latest string) map[string]any {
@@ -233,6 +258,9 @@ func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	versions, err := s.Svc.Store.ListVersions(r.Context(), sk.ID)
+	if err == nil {
+		sk, err = s.confirmSkill(r, sk)
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return

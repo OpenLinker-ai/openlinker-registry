@@ -225,7 +225,27 @@ func (s *Server) loadVisibleMCP(r *http.Request, name, version string) (model.MC
 	if !visible {
 		return srv, v, errNotFound
 	}
+	if srv, err = s.confirmMCP(r, srv); err != nil {
+		return model.MCPServer{}, model.MCPVersion{}, err
+	}
 	return srv, v, nil
+}
+
+// confirmMCP is confirmSkill for an MCP server: it re-reads the server
+// after its versions were loaded and reports errNotFound unless the caller
+// may see the server as it is now.
+func (s *Server) confirmMCP(r *http.Request, srv model.MCPServer) (model.MCPServer, error) {
+	now, err := s.Svc.Store.GetMCPServer(r.Context(), srv.Name)
+	if errors.Is(err, model.ErrNotFound) {
+		return model.MCPServer{}, errNotFound
+	}
+	if err != nil {
+		return model.MCPServer{}, err
+	}
+	if now.ID != srv.ID || !principal(r).Viewer().CanSee(now.Namespace, now.Visibility) {
+		return model.MCPServer{}, errNotFound
+	}
+	return now, nil
 }
 
 // serverName returns the full server name of a native API request.
@@ -321,6 +341,9 @@ func (s *Server) getMCPServer(w http.ResponseWriter, r *http.Request) {
 		latest = model.MCPVersion{}
 	}
 	versions, err := s.Svc.Store.ListMCPVersions(r.Context(), srv.ID)
+	if err == nil {
+		srv, err = s.confirmMCP(r, srv)
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -524,7 +547,13 @@ func (s *Server) v0Versions(w http.ResponseWriter, r *http.Request, name string)
 		}
 	}
 	versions, err := s.Svc.Store.ListMCPVersions(r.Context(), srv.ID)
+	if err == nil {
+		srv, err = s.confirmMCP(r, srv)
+	}
 	if err != nil {
+		if err == errNotFound {
+			err = &registry.Error{Status: http.StatusNotFound, Code: "not_found", Msg: "Server not found"}
+		}
 		s.v0Fail(w, r, err)
 		return
 	}
