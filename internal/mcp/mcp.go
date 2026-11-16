@@ -415,7 +415,10 @@ func isURLValue(key, value string) bool { return urlKeys[key] || urlRe.MatchStri
 // Group 1 is what is kept when the userinfo is removed. Which of several
 // leading variables hold the scheme and which the credentials cannot be
 // told, so credentialRefs counts them all.
-var userinfoRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#\s]*@`)
+//
+// The userinfo ends at the first "/", "?" or "#" and at nothing else: a
+// password may contain spaces ("https://alice:two words@host").
+var userinfoRe = regexp.MustCompile(`((?:^|:|\})//|^\{[a-zA-Z_][a-zA-Z0-9_]*\})[^/?#]*@`)
 
 // urlCredentials reports whether a URL carries credentials: userinfo, or a
 // query parameter named like a credential with a literal value

@@ -36,6 +36,11 @@ func TestURLsMustNotEmbedCredentials(t *testing.T) {
 		"userinfo from a leading variable in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"x-alt":{"url":"{origin}{who}@alt.example.com/sse","variables":{"origin":{"default":"https://"},"who":{"default":"alice:` + secret + `"}}},
 			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		// A password may contain white space; it is userinfo all the same.
+		"password with a space": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"https://alice:literal ` + secret + `@downloads.example/tool.mcpb","transport":{"type":"stdio"}}]}`,
+		"password with a tab in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-mirror":"https://alice:a\tb ` + secret + `@mirror.example/w","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 		"template authority in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
 			"x-alt":"{scheme}//alice:` + secret + `@alt.example.com/sse","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
 	}
