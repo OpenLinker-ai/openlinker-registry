@@ -726,23 +726,45 @@ func (s *Store) SetVersionLocatorURL(ctx context.Context, id int64, url string, 
 
 // SetVersionCheck implements store.Store.
 func (s *Store) SetVersionCheck(ctx context.Context, id int64, src model.CheckSource, result string, at time.Time) error {
-	// The conditions are evaluated with the write: a result for a source
-	// the version has left must not replace a newer one.
-	tag, err := s.pool.Exec(ctx, `UPDATE skill_versions SET check_result = $2, checked_at = $3 WHERE id = $1
-		AND COALESCE(NULLIF(locator_url, ''), locator->>'url', '') = $4
-		AND ($5 = 0 OR EXISTS (SELECT 1 FROM upstreams u WHERE u.id = $5 AND u.config_version = $6))`,
-		id, result, at, src.LocatorURL, src.UpstreamID, src.ConfigVersion)
-	if err != nil || tag.RowsAffected() > 0 {
-		return err
-	}
-	var exists bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skill_versions WHERE id = $1)`, id).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		return model.ErrNotFound
-	}
-	return nil // the source changed: the result is stale
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Missing or stale: the result is about another source and is
+		// dropped; only a version that does not exist is an error.
+		drop := func() error {
+			var exists bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skill_versions WHERE id = $1)`, id).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				return model.ErrNotFound
+			}
+			return nil
+		}
+		if src.UpstreamID != 0 {
+			// The upstream row is share-locked before the version is
+			// touched (the order every mirror write uses). Its settings
+			// cannot change until this result is committed, so a result
+			// read through earlier settings can never land after one read
+			// through newer ones: a subquery in the UPDATE would be
+			// evaluated with the statement's snapshot, taken before a
+			// change it then outlives.
+			var current int64
+			err := tx.QueryRow(ctx, `SELECT config_version FROM upstreams WHERE id = $1 FOR SHARE`, src.UpstreamID).Scan(&current)
+			if errors.Is(err, pgx.ErrNoRows) || (err == nil && current != src.ConfigVersion) {
+				return drop()
+			}
+			if err != nil {
+				return err
+			}
+		}
+		// The location is a condition on the row being updated, which is
+		// re-evaluated on its current state if it changed meanwhile.
+		tag, err := tx.Exec(ctx, `UPDATE skill_versions SET check_result = $2, checked_at = $3 WHERE id = $1
+			AND COALESCE(NULLIF(locator_url, ''), locator->>'url', '') = $4`, id, result, at, src.LocatorURL)
+		if err != nil || tag.RowsAffected() > 0 {
+			return err
+		}
+		return drop()
+	})
 }
 
 // latestOrder is model.LatestVersion as the ORDER BY of a lateral subquery

@@ -1147,6 +1147,13 @@ func (s *Service) buildURLEntry(entryType string, data []byte) ([]skill.File, st
 // into the upstream's target namespace. Such an index has no versions, so
 // each distinct digest becomes the version "sha-<first 12 hex digits>".
 func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upstream.Client, stats syncStats) error {
+	if !u.Allows(u.TargetNamespace) {
+		// The allow and deny lists apply to the namespace the index is
+		// mirrored into. While they exclude it, nothing is read, and what
+		// was mirrored is withdrawn; it returns when the namespace is
+		// selected again.
+		return s.withdrawIndexSkills(ctx, u, nil, stats)
+	}
 	index, err := c.WellKnownIndex(ctx)
 	if err != nil {
 		return err
@@ -1280,6 +1287,13 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 		stats.add("skills_pending")
 		return nil
 	}
+	return s.withdrawIndexSkills(ctx, u, indexed, stats)
+}
+
+// withdrawIndexSkills withdraws the skills mirrored from a discovery index
+// into the upstream's target namespace, except those named in keep.
+func (s *Service) withdrawIndexSkills(ctx context.Context, u model.Upstream, keep map[string]bool, stats syncStats) error {
+	ns := u.TargetNamespace
 	afterNS, afterName := "", ""
 	for {
 		rows, err := s.Store.ListMirroredSkills(ctx, u.ID, afterNS, afterName, 200)
@@ -1288,7 +1302,7 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 		}
 		for _, row := range rows {
 			afterNS, afterName = row.Namespace, row.Name
-			if row.Namespace != ns || indexed[row.Name] {
+			if row.Namespace != ns || keep[row.Name] {
 				continue
 			}
 			if err := s.withdrawSkill(ctx, u, ns, row.Name, stats); err != nil {

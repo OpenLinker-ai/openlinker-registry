@@ -2514,6 +2514,58 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a discovery index whose namespace is no longer selected", func(t *testing.T) {
+		// The allow and deny lists apply to an index too: to the namespace
+		// it is mirrored into. Excluded, nothing more is imported and what
+		// was mirrored is withdrawn; selected again, it comes back.
+		contents := map[string][]byte{"a": md("tool", "First", "MIT"), "b": md("tool", "Second", "MIT")}
+		current := "a"
+		var site *httptest.Server
+		site = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/.well-known/agent-skills/index.json":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"skills": []map[string]any{{"name": "tool", "type": "skill-md",
+					"description": "d", "url": site.URL + "/tool/SKILL.md", "digest": sha(contents[current])}}})
+			case "/tool/SKILL.md":
+				_, _ = w.Write(contents[current])
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		t.Cleanup(site.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "site", "kind": "agent-skills", "base_url": site.URL, "target_namespace": "mirror.site", "visibility": "public"}), 201, "upstream")
+		versions := func() int {
+			r := e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", AdminToken, "", nil), 200, "detail for the administrator")
+			list, _ := r.JSON["versions"].([]any)
+			return len(list)
+		}
+		e.sync("site")
+		e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "mirrored")
+		e.Expect(e.Do("PATCH", "/v1/admin/upstreams/site", AdminToken, "", map[string]any{"namespace_deny": []string{"*"}}), 200, "deny")
+		current = "b"
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_withdrawn") != 1 || stat(s, "skills_created") != 0 {
+			t.Fatalf("sync with the namespace excluded: %v", s)
+		}
+		for _, path := range []string{"/v1/skills/mirror.site/tool", "/ns/mirror.site/.well-known/agent-skills/index.json"} {
+			if r := e.Do("GET", path, "", "", nil); r.Status == 200 && strings.Contains(string(r.Body), `"tool"`) {
+				t.Fatalf("GET %s still shows a skill of an excluded namespace: %s", path, r.Body)
+			}
+		}
+		if n := versions(); n != 1 {
+			t.Fatalf("a version was imported into an excluded namespace: %d versions", n)
+		}
+		e.Expect(e.Do("PATCH", "/v1/admin/upstreams/site", AdminToken, "", map[string]any{"namespace_deny": []string{}}), 200, "allow again")
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_created") != 1 {
+			t.Fatalf("sync with the namespace selected again: %v", s)
+		}
+		r := e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "restored")
+		if r.JSON["description"] != "Second" || versions() != 2 {
+			t.Fatalf("restored skill: %s", r.Body)
+		}
+	})
+
 	t.Run("an index whose downloads are refused", func(t *testing.T) {
 		// The index loads, but the site refuses the download of an entry it
 		// serves itself. That is the upstream refusing this instance: the

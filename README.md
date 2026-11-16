@@ -255,7 +255,8 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   mirrored entry can be; lowering it to `internal` applies at once to what
   is already mirrored. Entries of a namespace that the allow and deny lists
   no longer select are withdrawn at the next sync, because nothing is read
-  for them any more; they come back when the namespace is selected again.
+  for them any more; they come back when the namespace is selected again. For a discovery
+  index the lists apply to its `target_namespace`.
 - **Use the right kind.** Another openlinker-registry must be configured as
   `openlinker-registry`; as `mcp-registry` its sync is refused, because that
   kind follows the official change feed, which carries no visibility.
