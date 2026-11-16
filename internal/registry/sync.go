@@ -176,9 +176,9 @@ func upstreamFailure(u model.Upstream, entryURL string, err error) bool {
 	if errors.Is(err, upstream.ErrNotFound) || answered(err) {
 		return false
 	}
-	base, berr := url.Parse(u.BaseURL)
-	entry, eerr := url.Parse(entryURL)
-	return berr == nil && eerr == nil && strings.EqualFold(base.Scheme, entry.Scheme) && strings.EqualFold(base.Host, entry.Host)
+	// The same comparison that decides whether the upstream's token goes
+	// along: scheme, host and effective port.
+	return upstream.SameOrigin(u.BaseURL, entryURL)
 }
 
 // syncOneSkill refreshes one skill during a sync. An error the upstream
@@ -1332,7 +1332,7 @@ func (s *Service) followIndexURL(ctx context.Context, u model.Upstream, c *upstr
 		return false, err
 	}
 	// The bytes at the new URL were verified just now.
-	if err := s.Store.SetVersionCheck(ctx, v.ID, model.CheckOK, s.Now()); err != nil {
+	if err := s.Store.SetVersionCheck(ctx, v.ID, e.URL, model.CheckOK, s.Now()); err != nil {
 		return false, err
 	}
 	return true, nil

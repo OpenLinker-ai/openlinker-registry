@@ -57,7 +57,13 @@ type Store interface {
 	SetAlias(ctx context.Context, skillID int64, alias string, audit model.AuditEvent) error
 	YankVersion(ctx context.Context, versionID int64, reason string, at time.Time, audit model.AuditEvent) error
 	ApproveLicense(ctx context.Context, versionID int64, audit model.AuditEvent) error
-	SetVersionCheck(ctx context.Context, versionID int64, result string, at time.Time) error
+	// SetVersionCheck records the result of verifying a version's content.
+	// locatorURL is where that content was read from: Locator.URL of the
+	// version as the caller loaded it ("" without one). The result is
+	// recorded only while the version's content is still there; a check of
+	// a location the version has moved away from since (see
+	// SetVersionLocatorURL) says nothing about it and is dropped.
+	SetVersionCheck(ctx context.Context, versionID int64, locatorURL, result string, at time.Time) error
 	// SetVersionMirrorServed records whether the upstream of a mirrored
 	// version serves its content (see model.Version.MirrorServed).
 	SetVersionMirrorServed(ctx context.Context, versionID int64, served bool, audit model.AuditEvent) error

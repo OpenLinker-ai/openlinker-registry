@@ -97,7 +97,7 @@ func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Versi
 		return nil, nil, s.markCheck(ctx, v, result)
 	}
 	_, _ = s.Blobs.Put(ctx, blobstore.Cache, data)
-	_ = s.Store.SetVersionCheck(ctx, v.ID, model.CheckOK, s.Now())
+	_ = s.Store.SetVersionCheck(ctx, v.ID, locatorURL(v), model.CheckOK, s.Now())
 	return files, data, nil
 }
 
@@ -182,8 +182,16 @@ func (s *Service) gcOne(ctx context.Context, digest string, before time.Time) (b
 	return s.Blobs.DeleteIfOlder(ctx, blobstore.Artifacts, digest, before)
 }
 
+// locatorURL is where the content of v was read from, for SetVersionCheck.
+func locatorURL(v model.Version) string {
+	if v.Locator == nil {
+		return ""
+	}
+	return v.Locator.URL
+}
+
 func (s *Service) markCheck(ctx context.Context, v model.Version, result string) error {
-	_ = s.Store.SetVersionCheck(ctx, v.ID, result, s.Now())
+	_ = s.Store.SetVersionCheck(ctx, v.ID, locatorURL(v), result, s.Now())
 	if result == model.CheckSourceChanged {
 		return &Error{Status: http.StatusConflict, Code: result, Msg: "the source no longer matches the indexed version", SourceURL: s.SourceURL(v)}
 	}

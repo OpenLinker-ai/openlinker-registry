@@ -103,6 +103,22 @@ func plainHTTPURL(u *url.URL) bool {
 		u.User == nil && u.Fragment == "" && u.RawFragment == ""
 }
 
+// SameOrigin reports whether two absolute URLs have the same origin:
+// scheme, host (ignoring case) and effective port, so that
+// "https://site.example" and "https://SITE.example:443/x" are one origin.
+// It is the comparison that decides whether a token is sent.
+func SameOrigin(a, b string) bool {
+	ua, err := url.Parse(a)
+	if err != nil || ua.Host == "" {
+		return false
+	}
+	ub, err := url.Parse(b)
+	if err != nil || ub.Host == "" {
+		return false
+	}
+	return origin(ua) == origin(ub)
+}
+
 // origin is scheme, lowercase host and effective port.
 func origin(u *url.URL) string {
 	port := u.Port()

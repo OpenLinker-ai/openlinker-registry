@@ -723,8 +723,22 @@ func (s *Store) SetVersionLocatorURL(ctx context.Context, id int64, url string, 
 }
 
 // SetVersionCheck implements store.Store.
-func (s *Store) SetVersionCheck(ctx context.Context, id int64, result string, at time.Time) error {
-	return s.execVersion(ctx, `UPDATE skill_versions SET check_result = $2, checked_at = $3 WHERE id = $1`, id, result, at)
+func (s *Store) SetVersionCheck(ctx context.Context, id int64, locatorURL, result string, at time.Time) error {
+	// The condition is evaluated on the current row: a result for a
+	// location the version has left must not replace a newer one.
+	tag, err := s.pool.Exec(ctx, `UPDATE skill_versions SET check_result = $2, checked_at = $3 WHERE id = $1
+		AND COALESCE(NULLIF(locator_url, ''), locator->>'url', '') = $4`, id, result, at, locatorURL)
+	if err != nil || tag.RowsAffected() > 0 {
+		return err
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skill_versions WHERE id = $1)`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return model.ErrNotFound
+	}
+	return nil // the version moved: the result is stale
 }
 
 // latestOrder is model.LatestVersion as the ORDER BY of a lateral subquery

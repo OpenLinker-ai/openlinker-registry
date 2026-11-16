@@ -488,8 +488,16 @@ func (m *Memory) ApproveLicense(ctx context.Context, id int64, audit model.Audit
 }
 
 // SetVersionCheck implements Store.
-func (m *Memory) SetVersionCheck(ctx context.Context, id int64, result string, at time.Time) error {
-	return m.mutateVersion(ctx, id, nil, func(v *model.Version) { v.CheckResult, v.CheckedAt = result, &at })
+func (m *Memory) SetVersionCheck(ctx context.Context, id int64, locatorURL, result string, at time.Time) error {
+	return m.mutateVersion(ctx, id, nil, func(v *model.Version) {
+		current := ""
+		if v.Locator != nil {
+			current = v.Locator.URL
+		}
+		if current == locatorURL { // otherwise the version moved: the result is stale
+			v.CheckResult, v.CheckedAt = result, &at
+		}
+	})
 }
 
 // Search implements Store.

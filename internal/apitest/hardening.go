@@ -2361,6 +2361,85 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		down.Expect(down.Do("GET", "/v1/skills/com.acme/moved", "", "", nil), 200, "the skill that had been redirected")
 	})
 
+	t.Run("a check of the old location that ends after a move", func(t *testing.T) {
+		// A download starts to verify a version at its URL. While it waits
+		// for the site, a sync finds the file moved, verifies it at the new
+		// URL and records that. Then the old URL answers 404. That answer
+		// is about a location the version has left: it must not replace
+		// the check that passed, or the skill would drop out of discovery
+		// with nothing left to repair it.
+		content := md("tool", "Tool", "MIT")
+		var moved, first atomic.Bool
+		asked, answer := make(chan struct{}), make(chan struct{})
+		var site *httptest.Server
+		site = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/.well-known/agent-skills/index.json":
+				w.Header().Set("Content-Type", "application/json")
+				where := "/old/SKILL.md"
+				if moved.Load() {
+					where = "/new/SKILL.md"
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"skills": []map[string]any{{"name": "tool", "type": "skill-md",
+					"description": "d", "url": site.URL + where, "digest": sha(content)}}})
+			case "/old/SKILL.md":
+				if !moved.Load() {
+					_, _ = w.Write(content)
+					return
+				}
+				if first.CompareAndSwap(false, true) {
+					close(asked)
+					<-answer
+				}
+				w.WriteHeader(404)
+			case "/new/SKILL.md":
+				if !moved.Load() {
+					w.WriteHeader(404)
+					return
+				}
+				_, _ = w.Write(content)
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		t.Cleanup(site.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true, VerifyInterval: -1})
+		e.Expect(e.upstream(map[string]any{"name": "site", "kind": "agent-skills", "base_url": site.URL, "target_namespace": "mirror.site", "visibility": "public"}), 201, "upstream")
+		e.sync("site")
+		r := e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "detail")
+		version, _ := r.JSON["latest_version"].(string)
+		base := "/v1/skills/mirror.site/tool/versions/" + version
+		moved.Store(true)
+		download := make(chan int, 1)
+		go func() { download <- e.Do("GET", base+"/artifact", "", "", nil).Status }()
+		<-asked
+		synced := make(chan map[string]any, 1)
+		go func() { synced <- e.sync("site") }()
+		var result map[string]any
+		select {
+		case result = <-synced:
+		case <-time.After(500 * time.Millisecond):
+		}
+		close(answer)
+		<-download
+		if result == nil {
+			result = <-synced
+		}
+		if result["last_status"] != "ok" {
+			t.Fatalf("sync: %v", result)
+		}
+		r = e.Expect(e.Do("GET", base, "", "", nil), 200, "version")
+		check, _ := r.JSON["check"].(map[string]any)
+		if r.JSON["source_url"] != site.URL+"/new/SKILL.md" || check["result"] != "ok" {
+			t.Fatalf("after the move: source %v, check %v", r.JSON["source_url"], check)
+		}
+		r = e.Expect(e.Do("GET", "/ns/mirror.site/.well-known/agent-skills/index.json", "", "", nil), 200, "discovery index")
+		if !strings.Contains(string(r.Body), `"tool"`) {
+			t.Fatalf("the skill dropped out of discovery: %s", r.Body)
+		}
+		e.Expect(e.Do("GET", base+"/artifact", "", "", nil), 200, "artifact at the new URL")
+	})
+
 	t.Run("an index whose downloads are refused", func(t *testing.T) {
 		// The index loads, but the site refuses the download of an entry it
 		// serves itself. That is the upstream refusing this instance: the

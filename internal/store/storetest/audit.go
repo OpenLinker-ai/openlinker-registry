@@ -237,6 +237,35 @@ var mirrorTests = []testCase{
 		if err != nil || len(cands) != 2 || *cands[0].Version.Locator != want {
 			t.Fatalf("index candidates = %+v, %v", cands, err)
 		}
+		// The result of a check is recorded for the location that was
+		// read. One that was started before the move and ends after it is
+		// about the old location and must not replace the newer result.
+		at := time.Now().UTC().Truncate(time.Second)
+		if err := st.SetVersionCheck(ctx, moved.ID, "https://site.example/new/SKILL.md", model.CheckOK, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetVersionCheck(ctx, moved.ID, "https://site.example/old/SKILL.md", model.CheckSourceUnavailable, at.Add(time.Minute)); err != nil {
+			t.Fatalf("a stale check result is dropped, not an error: %v", err)
+		}
+		if got, _ := st.GetVersion(ctx, moved.SkillID, "sha-a"); got.CheckResult != model.CheckOK || got.CheckedAt == nil || !got.CheckedAt.Equal(at) {
+			t.Fatalf("a check of the old location replaced the result: %q at %v", got.CheckResult, got.CheckedAt)
+		}
+		if err := st.SetVersionCheck(ctx, moved.ID, "https://site.example/new/SKILL.md", model.CheckSourceChanged, at.Add(2*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := st.GetVersion(ctx, moved.SkillID, "sha-a"); got.CheckResult != model.CheckSourceChanged {
+			t.Fatalf("a check of the current location: %q", got.CheckResult)
+		}
+		// A version without a URL is checked where it is.
+		if err := st.SetVersionCheck(ctx, other.ID, "", model.CheckOK, at); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := st.GetVersion(ctx, other.SkillID, "sha-a"); got.CheckResult != model.CheckOK {
+			t.Fatalf("a version without a URL: %q", got.CheckResult)
+		}
+		if err := st.SetVersionCheck(ctx, moved.ID+1000, "", model.CheckOK, at); !errors.Is(err, model.ErrNotFound) {
+			t.Fatalf("a version that does not exist: %v", err)
+		}
 		// Only a URL-indexed version has a URL to move.
 		if err := st.SetVersionLocatorURL(ctx, other.ID, "https://site.example/x", audit); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("a version with another kind of locator: %v", err)
@@ -714,7 +743,7 @@ var mirrorTests = []testCase{
 			t.Errorf("unguarded mutation: %v", err)
 		}
 		// Recording a source check is not a mirror write and is never refused.
-		if err := st.SetVersionCheck(guarded, ver.ID, model.CheckOK, time.Now()); err != nil {
+		if err := st.SetVersionCheck(guarded, ver.ID, "", model.CheckOK, time.Now()); err != nil {
 			t.Errorf("source check under a stale guard: %v", err)
 		}
 	}},
