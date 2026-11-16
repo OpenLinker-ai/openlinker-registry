@@ -2,8 +2,10 @@ package mcp
 
 import (
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -261,6 +263,9 @@ func checkPackage(v any) string {
 	if problem := checkNamedInputs(transport, "headers"); problem != "" {
 		return "transport." + problem
 	}
+	if problem := checkVariables(transport); problem != "" {
+		return "transport." + problem
+	}
 	if problem := checkNamedInputs(pkg, "environmentVariables"); problem != "" {
 		return problem
 	}
@@ -290,6 +295,73 @@ func checkNamedInputs(parent map[string]any, key string) string {
 		}
 		if name, ok := input["name"].(string); !ok || name == "" {
 			return fmt.Sprintf("%s[%d].name is required: a non-empty string", key, i)
+		}
+		if problem := checkInput(input); problem != "" {
+			return fmt.Sprintf("%s[%d].%s", key, i, problem)
+		}
+	}
+	return ""
+}
+
+var inputFormats = map[string]bool{"string": true, "number": true, "boolean": true, "filepath": true}
+
+// checkInput validates the members of an input (a header, an environment
+// variable, an argument, a variable) that the official schema defines.
+// Clients decode them with those types, and a published document is
+// immutable, so a number where a string belongs would break them for good.
+// Members the schema does not define are left alone.
+func checkInput(input map[string]any) string {
+	for _, key := range []string{"description", "value", "default", "placeholder", "valueHint"} {
+		if v, present := input[key]; present {
+			if _, ok := v.(string); !ok {
+				return key + " must be a string"
+			}
+		}
+	}
+	for _, key := range []string{"isRequired", "isSecret", "isRepeated"} {
+		if v, present := input[key]; present {
+			if _, ok := v.(bool); !ok {
+				return key + " must be a boolean"
+			}
+		}
+	}
+	if v, present := input["format"]; present {
+		if s, ok := v.(string); !ok || !inputFormats[s] {
+			return "format must be string, number, boolean or filepath"
+		}
+	}
+	if v, present := input["choices"]; present {
+		choices, ok := v.([]any)
+		if !ok {
+			return "choices must be an array of strings"
+		}
+		for _, choice := range choices {
+			if _, ok := choice.(string); !ok {
+				return "choices must be an array of strings"
+			}
+		}
+	}
+	return checkVariables(input)
+}
+
+// checkVariables validates an optional "variables" member: an object whose
+// values are inputs, which may have variables of their own.
+func checkVariables(parent map[string]any) string {
+	v, present := parent["variables"]
+	if !present {
+		return ""
+	}
+	variables, ok := v.(map[string]any)
+	if !ok {
+		return "variables must be an object"
+	}
+	for _, name := range slices.Sorted(maps.Keys(variables)) {
+		variable, ok := variables[name].(map[string]any)
+		if !ok {
+			return "variables." + name + " must be an object"
+		}
+		if problem := checkInput(variable); problem != "" {
+			return "variables." + name + "." + problem
 		}
 	}
 	return ""
@@ -325,6 +397,9 @@ func checkArguments(parent map[string]any, key string) string {
 			}
 		default:
 			return fmt.Sprintf("%s[%d].type must be positional or named", key, i)
+		}
+		if problem := checkInput(arg); problem != "" {
+			return fmt.Sprintf("%s[%d].%s", key, i, problem)
 		}
 	}
 	return ""
@@ -369,6 +444,9 @@ func remoteOf(v any, o Options) (r Remote, problem string) {
 	}
 	if o.Strict {
 		if problem := checkNamedInputs(remote, "headers"); problem != "" {
+			return r, problem
+		}
+		if problem := checkVariables(remote); problem != "" {
 			return r, problem
 		}
 	}

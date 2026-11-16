@@ -237,7 +237,9 @@ Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams
   is reconciled version by version. When the upstream answers one entry with
   an error or a redirect (redirects are never followed), that entry waits for a later run and the sync goes on with the
   rest; a refusal of this instance (`401`, `403`) or an upstream that cannot
-  be reached ends the run. When the upstream throttles a sync
+  be reached ends the run. For a discovery index that also holds for the
+  files the site serves itself; a file on another host that cannot be
+  fetched only leaves that entry out. When the upstream throttles a sync
   (`429`), the sync waits for `Retry-After` and continues. One run per
   upstream is active at a time, across replicas. Changing what an upstream selects (URL,
   allow and deny lists, `latest_only`, `visibility`) starts the next sync

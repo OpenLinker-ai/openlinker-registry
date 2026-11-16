@@ -731,6 +731,10 @@ func secretDoc(input obj) map[string]obj {
 
 func TestSecretValues(t *testing.T) {
 	const literal = "sk-live-0123456789"
+	// A flag of the wrong type does not make the input a secret; strict
+	// refuses the document as malformed wherever the schema defines the
+	// input, and lenient keeps the value.
+	const malformedFlag = "isSecret is not a boolean"
 	inputs := []struct {
 		name    string
 		input   obj
@@ -749,7 +753,7 @@ func TestSecretValues(t *testing.T) {
 		{"no value", obj{"name": "API_KEY", "isSecret": true, "description": "Your key", "isRequired": true}, false},
 		{"not secret", obj{"name": "REGION", "isSecret": false, "value": literal, "default": literal}, false},
 		{"isSecret absent", obj{"name": "REGION", "value": literal}, false},
-		{"isSecret is not a boolean", obj{"name": "REGION", "isSecret": "true", "value": literal}, false},
+		{malformedFlag, obj{"name": "REGION", "isSecret": "true", "value": literal}, false},
 		// A credential by name is secret whatever the flag says.
 		{"credential name without the flag", obj{"name": "API_KEY", "value": literal}, true},
 		{"credential name flagged not secret", obj{"name": "GITHUB_TOKEN", "isSecret": false, "value": literal}, true},
@@ -768,7 +772,11 @@ func TestSecretValues(t *testing.T) {
 			}
 
 			_, err := Parse(data, strict)
-			if codeOf(err) != want {
+			if in.name == malformedFlag && position != "position not in schema" {
+				if code := codeOf(err); code == "" || code == codeSecretValue {
+					t.Errorf("%s: strict code %q (%v), want the document refused as malformed", name, code, err)
+				}
+			} else if codeOf(err) != want {
 				t.Errorf("%s: strict code %q (%v), want %q", name, codeOf(err), err, want)
 			}
 			if err != nil && strings.Contains(err.Error(), literal) {

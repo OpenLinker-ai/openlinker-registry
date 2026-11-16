@@ -166,6 +166,21 @@ func answered(err error) bool {
 	return se.Code == safehttp.CodeTooLarge || se.Code == safehttp.CodeRedirectNotFollowed
 }
 
+// upstreamFailure reports whether a failed download of an index entry is a
+// failure of the upstream itself rather than of that entry: the entry is
+// served by the upstream's own origin, and the upstream refused this
+// instance or could not be reached. Such a failure ends the run, as it
+// would for the index. An entry on another host, and any answer about the
+// entry itself (not found, an error status), only leaves that entry out.
+func upstreamFailure(u model.Upstream, entryURL string, err error) bool {
+	if errors.Is(err, upstream.ErrNotFound) || answered(err) {
+		return false
+	}
+	base, berr := url.Parse(u.BaseURL)
+	entry, eerr := url.Parse(entryURL)
+	return berr == nil && eerr == nil && strings.EqualFold(base.Scheme, entry.Scheme) && strings.EqualFold(base.Host, entry.Host)
+}
+
 // syncOneSkill refreshes one skill during a sync. An error the upstream
 // answered for this skill (see answered) is counted and does not end the
 // sync: the skills after it still have to be read.
@@ -1176,7 +1191,7 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 			}
 			if v, err := s.Store.GetVersion(ctx, local.ID, version); err == nil {
 				// The same content may be served from another URL now.
-				moved, err := s.followIndexURL(ctx, c, actor, local, v, e, stats)
+				moved, err := s.followIndexURL(ctx, u, c, actor, local, v, e, stats)
 				if err != nil {
 					return err
 				}
@@ -1202,6 +1217,9 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if upstreamFailure(u, e.URL, err) {
+				return err
 			}
 			stats.add("skills_unavailable")
 			continue
@@ -1288,7 +1306,7 @@ func (s *Service) syncAgentSkills(ctx context.Context, u model.Upstream, c *upst
 // checking that it serves exactly the recorded bytes. Readers and this
 // registry's own discovery index then use it. A URL that does not serve the
 // content (yet) changes nothing. It reports whether the URL was recorded.
-func (s *Service) followIndexURL(ctx context.Context, c *upstream.Client, actor string, local model.Skill, v model.Version, e upstream.IndexEntry, stats syncStats) (bool, error) {
+func (s *Service) followIndexURL(ctx context.Context, u model.Upstream, c *upstream.Client, actor string, local model.Skill, v model.Version, e upstream.IndexEntry, stats syncStats) (bool, error) {
 	l := v.Locator
 	if l == nil || l.Kind != "url" || l.URL == e.URL || l.Digest != e.Digest {
 		return false, nil
@@ -1297,6 +1315,9 @@ func (s *Service) followIndexURL(ctx context.Context, c *upstream.Client, actor 
 	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
+		}
+		if upstreamFailure(u, e.URL, err) {
+			return false, err
 		}
 		stats.add("skills_unavailable")
 		return false, nil

@@ -207,11 +207,16 @@ func (s *Server) loadVisibleMCP(r *http.Request, name, version string) (model.MC
 		return srv, v, err
 	}
 	visible := !missing && viewer.CanSee(srv.Namespace, srv.Visibility)
+	// The server is here but the caller may not see it: whether one of its
+	// versions is stored must not show. Nothing is asked upstream for it (an
+	// upstream failure would answer differently from a stored version), but
+	// the request draws on the forwarding budget like any other miss.
+	hidden := srv.ID != 0 && !viewer.CanSee(srv.Namespace, srv.Visibility)
 	if !visible && s.Svc.CanForwardMCP(r.Context(), viewer, name) {
 		if err := s.chargeForward(r); err != nil {
 			return srv, v, err
 		}
-		if missing {
+		if missing && !hidden {
 			srv, v, err = s.Svc.ResolveMCP(r.Context(), viewer, name, version, true)
 			if errors.Is(err, model.ErrNotFound) {
 				return srv, v, errNotFound

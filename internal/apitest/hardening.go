@@ -332,6 +332,59 @@ func runForwardAudience(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("an absent version of a server the caller may not see", func(t *testing.T) {
+		// An internal server is mirrored. To an anonymous caller a version
+		// that is stored and one that is not must look the same, also when
+		// the upstream is failing: nothing is asked upstream for either.
+		var asked atomic.Int64
+		var refuse atomic.Bool
+		entry := map[string]any{"server": map[string]any{"name": "com.hid/server", "description": "d", "version": "1.0.0",
+			"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+			"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true},
+				metaEntry: map[string]any{"visibility": "internal", "listed": true}}}
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			asked.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if refuse.Load() {
+				w.WriteHeader(401)
+				return
+			}
+			switch r.URL.EscapedPath() {
+			case "/v1/skills":
+				_, _ = w.Write([]byte(`{"skills":[]}`))
+			case "/v0.1/servers", "/v0.1/servers/com.hid%2Fserver/versions":
+				_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{entry}})
+			case "/v0.1/servers/com.hid%2Fserver/versions/1.0.0", "/v0.1/servers/com.hid%2Fserver/versions/latest":
+				_ = json.NewEncoder(w).Encode(entry)
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": fake.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("hub"); s["last_status"] != "ok" || stat(s, "mcp_created") != 1 {
+			t.Fatalf("sync: %v", s)
+		}
+		reader := e.token([]string{"skills:read"}, nil)
+		e.Expect(e.Do("GET", "/v0.1/servers/com.hid%2Fserver/versions/1.0.0", reader, "", nil), 200, "signed-in read")
+		refuse.Store(true)
+		asked.Store(0)
+		for _, version := range []string{"1.0.0", "9.9.9", "latest"} {
+			for _, path := range []string{"/v0.1/servers/com.hid%2Fserver/versions/", "/v1/mcp/servers/com.hid/server/versions/"} {
+				if got := e.Do("GET", path+version, "", "", nil).Status; got != 404 {
+					t.Fatalf("anonymous GET %s%s = %d: a stored and an absent version of a hidden server must answer alike", path, version, got)
+				}
+			}
+		}
+		if n := asked.Load(); n != 0 {
+			t.Fatalf("the upstream was asked %d times on behalf of a caller who may not see the server", n)
+		}
+		// A caller who may see it is told that the upstream failed.
+		e.Expect(e.Do("GET", "/v0.1/servers/com.hid%2Fserver/versions/9.9.9", reader, "", nil), 502, "signed-in read of an absent version")
+	})
+
 	t.Run("budget", func(t *testing.T) {
 		// The upstream shows the skill only to its members; the mirror may
 		// publish what it mirrors, so the skill ends up internal here.
@@ -2308,6 +2361,66 @@ func runSkillSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		down.Expect(down.Do("GET", "/v1/skills/com.acme/moved", "", "", nil), 200, "the skill that had been redirected")
 	})
 
+	t.Run("an index whose downloads are refused", func(t *testing.T) {
+		// The index loads, but the site refuses the download of an entry it
+		// serves itself. That is the upstream refusing this instance: the
+		// run fails, visibly. An entry on another host that cannot be
+		// reached only leaves that entry out.
+		content, far := md("tool", "Tool", "MIT"), md("far", "Far", "MIT")
+		elsewhere := httptest.NewServer(http.NotFoundHandler())
+		elsewhereURL := elsewhere.URL
+		elsewhere.Close() // nothing listens there any more
+		status, where := 401, "/a/SKILL.md"
+		var site *httptest.Server
+		site = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/.well-known/agent-skills/index.json":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"skills": []map[string]any{
+					{"name": "far", "type": "skill-md", "description": "d", "url": elsewhereURL + "/far/SKILL.md", "digest": sha(far)},
+					{"name": "tool", "type": "skill-md", "description": "d", "url": site.URL + where, "digest": sha(content)}}})
+			case where:
+				if status != 200 {
+					w.WriteHeader(status)
+					return
+				}
+				_, _ = w.Write(content)
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		t.Cleanup(site.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "site", "kind": "agent-skills", "base_url": site.URL, "target_namespace": "mirror.site", "visibility": "public"}), 201, "upstream")
+		if s := e.sync("site"); s["last_status"] != "failed" || s["last_error"] == nil {
+			t.Fatalf("a run whose downloads the site refuses must fail: %v", s)
+		}
+		e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 404, "nothing was mirrored")
+		status = 200
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_created") != 1 || stat(s, "skills_unavailable") != 1 {
+			t.Fatalf("a run with one entry on a host that is down: %v", s)
+		}
+		r := e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool", "", "", nil), 200, "detail")
+		version, _ := r.JSON["latest_version"].(string)
+		source := func() any {
+			return e.Expect(e.Do("GET", "/v1/skills/mirror.site/tool/versions/"+version, "", "", nil), 200, "version").JSON["source_url"]
+		}
+		// The file moves, and the site refuses the new location.
+		status, where = 403, "/b/SKILL.md"
+		if s := e.sync("site"); s["last_status"] != "failed" || source() != site.URL+"/a/SKILL.md" {
+			t.Fatalf("a refused download of a moved entry (source %v): %v", source(), s)
+		}
+		// An error about the entry itself is that entry's problem.
+		status = 500
+		if s := e.sync("site"); s["last_status"] != "ok" || stat(s, "skills_unavailable") != 2 || source() != site.URL+"/a/SKILL.md" {
+			t.Fatalf("an entry the site cannot serve right now (source %v): %v", source(), s)
+		}
+		status = 200
+		if s := e.sync("site"); s["last_status"] != "ok" || source() != site.URL+"/b/SKILL.md" {
+			t.Fatalf("after the site serves it again (source %v): %v", source(), s)
+		}
+	})
+
 	t.Run("a license approved upstream later", func(t *testing.T) {
 		// The upstream indexes a skill under a custom license, which it does
 		// not serve until a reviewer approves it. The mirror records the
@@ -2594,6 +2707,40 @@ func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
 			if r := e.publishMCP(pub, "com.acme", doc); r.Status != 422 || strings.Contains(string(r.Body), secret) {
 				t.Errorf("publishing %s: %d %s", remote["url"], r.Status, r.Body)
 			}
+		}
+	})
+
+	t.Run("an input member of the wrong type", func(t *testing.T) {
+		// A published document is immutable and clients decode its inputs
+		// with the official types: publishing refuses a number where a
+		// string belongs. A mirror keeps what its upstream serves.
+		remote := map[string]any{"type": "sse", "url": "https://mcp.example.com/sse",
+			"headers": []any{map[string]any{"name": "X-Region", "value": 123}}}
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.namespace("com.acme", "domain")
+		pub := e.publisher("com.acme")
+		doc := map[string]any{"name": "com.acme/typed", "description": "d", "version": "1.0.0", "remotes": []any{remote}}
+		for _, path := range []string{"/v1/mcp/servers/com.acme", "/v0.1/publish"} {
+			if r := e.Do("POST", path, pub, "application/json", doc); r.Status != 422 {
+				t.Fatalf("POST %s with a numeric header value = %d %s", path, r.Status, r.Body)
+			}
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers/com.acme%2Ftyped/versions/1.0.0", "", "", nil), 404, "nothing was published")
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.EscapedPath() != "/v0.1/servers" {
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"servers": []map[string]any{{"server": map[string]any{"name": "com.feed/typed",
+				"description": "d", "version": "1.0.0", "remotes": []any{remote}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": "active", "isLatest": true}}}}})
+		}))
+		t.Cleanup(fake.Close)
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "visibility": "public"}), 201, "upstream")
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_created") != 1 {
+			t.Fatalf("mirroring the same document: %v", s)
 		}
 	})
 
