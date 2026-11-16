@@ -324,6 +324,30 @@ func (m *Memory) ListMCPVersions(_ context.Context, serverID int64) ([]model.MCP
 	return out, nil
 }
 
+// ListMCPVersionsPage implements Store.
+func (m *Memory) ListMCPVersionsPage(ctx context.Context, serverID int64, q model.MCPVersionPage) ([]model.MCPVersion, error) {
+	all, err := m.ListMCPVersions(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	out := []model.MCPVersion{}
+	for _, v := range all {
+		if a := q.After; a != nil {
+			if c := v.PublishedAt.Compare(a.PublishedAt); c > 0 || (c == 0 && v.ID >= a.ID) {
+				continue
+			}
+		}
+		if q.Limit > 0 && len(out) == q.Limit {
+			break
+		}
+		if q.Summary {
+			v.ServerJSON = nil
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 // SetMCPStatus implements Store.
 func (m *Memory) SetMCPStatus(ctx context.Context, serverID int64, version, status, message string, at time.Time, audit model.AuditEvent) (int, error) {
 	m.mu.Lock()

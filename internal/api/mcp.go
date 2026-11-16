@@ -345,7 +345,8 @@ func (s *Server) getMCPServer(w http.ResponseWriter, r *http.Request) {
 		}
 		latest = model.MCPVersion{}
 	}
-	versions, err := s.Svc.Store.ListMCPVersions(r.Context(), srv.ID)
+	// Everything about each version but its document.
+	versions, err := s.Svc.Store.ListMCPVersionsPage(r.Context(), srv.ID, model.MCPVersionPage{Summary: true})
 	if err == nil {
 		srv, err = s.confirmMCP(r, srv)
 	}
@@ -551,24 +552,57 @@ func (s *Server) v0Versions(w http.ResponseWriter, r *http.Request, name string)
 			return
 		}
 	}
-	versions, err := s.Svc.Store.ListMCPVersions(r.Context(), srv.ID)
-	if err == nil {
-		srv, err = s.confirmMCP(r, srv)
-	}
-	if err != nil {
-		if err == errNotFound {
-			err = &registry.Error{Status: http.StatusNotFound, Code: "not_found", Msg: "Server not found"}
+	// A server may have thousands of versions of tens of kilobytes each.
+	// They are read and written a page at a time, so that one request never
+	// holds more than a page of documents. Each page is confirmed (see
+	// confirmMCP) before it is written; once the response is under way it
+	// cannot be taken back, only cut short.
+	count, started := 0, false
+	var after *model.MCPVersion
+	for {
+		page, err := s.Svc.Store.ListMCPVersionsPage(r.Context(), srv.ID, model.MCPVersionPage{After: after, Limit: v0VersionsPage})
+		if err == nil {
+			srv, err = s.confirmMCP(r, srv)
 		}
-		s.v0Fail(w, r, err)
-		return
+		if err != nil {
+			if started {
+				panic(http.ErrAbortHandler)
+			}
+			if err == errNotFound {
+				err = &registry.Error{Status: http.StatusNotFound, Code: "not_found", Msg: "Server not found"}
+			}
+			s.v0Fail(w, r, err)
+			return
+		}
+		if !started {
+			s.setCache(w, r, false)
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"servers":[`)
+			started = true
+		}
+		for i := range page {
+			item, err := json.Marshal(v0Response(srv, page[i]))
+			if err != nil {
+				panic(http.ErrAbortHandler)
+			}
+			if count > 0 {
+				_, _ = io.WriteString(w, ",")
+			}
+			_, _ = w.Write(item)
+			count++
+		}
+		if len(page) < v0VersionsPage {
+			break
+		}
+		after = &page[len(page)-1]
 	}
-	items := make([]map[string]any, 0, len(versions))
-	for _, v := range versions {
-		items = append(items, v0Response(srv, v))
-	}
-	s.setCache(w, r, false)
-	writeJSON(w, http.StatusOK, map[string]any{"servers": items, "metadata": map[string]any{"count": len(items)}})
+	_, _ = io.WriteString(w, `],"metadata":{"count":`+strconv.Itoa(count)+"}}\n")
 }
+
+// v0VersionsPage is how many versions of one server are held at a time while
+// its version list is written.
+const v0VersionsPage = 50
 
 // v0Publish accepts a server.json like the official registry's publish
 // endpoint, authorized by a registry token with the publisher role in the

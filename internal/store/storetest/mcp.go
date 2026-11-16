@@ -316,6 +316,75 @@ var mcpTests = []testCase{
 		}
 	}},
 
+	{"mcp versions that only look like semantic versions", func(t *testing.T, st store.Store) {
+		// "1.0.0-build_2" is not a semantic version (an underscore is not
+		// allowed): it is ordered by publication, so it is the latest.
+		newNamespace(t, st, "org.odd")
+		srv, _ := publishMCP(t, st, mcpInput("org.odd/server", "1.0.0"))
+		publishMCP(t, st, mcpInput("org.odd/server", "1.0.0-build_2"))
+		if got := latestMCP(t, st, srv.ID); got != "1.0.0-build_2" {
+			t.Fatalf("latest = %s, want the version published last", got)
+		}
+		// A real pre-release of the same version is lower than it.
+		other, _ := publishMCP(t, st, mcpInput("org.odd/other", "1.0.0"))
+		publishMCP(t, st, mcpInput("org.odd/other", "1.0.0-rc.1"))
+		if got := latestMCP(t, st, other.ID); got != "1.0.0" {
+			t.Fatalf("latest = %s, want 1.0.0", got)
+		}
+	}},
+	{"mcp versions page by page", func(t *testing.T, st store.Store) {
+		ctx := context.Background()
+		newNamespace(t, st, "org.many")
+		var srv model.MCPServer
+		const n = 23
+		for i := 1; i <= n; i++ {
+			srv, _ = publishMCP(t, st, mcpInput("org.many/server", fmt.Sprintf("nightly-%02d", i)))
+		}
+		all, err := st.ListMCPVersions(ctx, srv.ID)
+		if err != nil || len(all) != n || all[0].Version != "nightly-23" || all[n-1].Version != "nightly-01" {
+			t.Fatalf("all versions, newest first: %d, %v", len(all), err)
+		}
+		for _, limit := range []int{1, 5, n, n + 1} {
+			var got []model.MCPVersion
+			var after *model.MCPVersion
+			for {
+				page, err := st.ListMCPVersionsPage(ctx, srv.ID, model.MCPVersionPage{After: after, Limit: limit})
+				if err != nil || len(page) > limit {
+					t.Fatalf("limit %d: page of %d, %v", limit, len(page), err)
+				}
+				got = append(got, page...)
+				if len(page) < limit {
+					break
+				}
+				after = &page[len(page)-1]
+			}
+			if len(got) != n {
+				t.Fatalf("limit %d: paging returned %d versions", limit, len(got))
+			}
+			for i := range got {
+				if got[i].ID != all[i].ID || !sameJSON(got[i].ServerJSON, all[i].ServerJSON) {
+					t.Fatalf("limit %d: version %d is %s, want %s with its document", limit, i, got[i].Version, all[i].Version)
+				}
+			}
+		}
+		summaries, err := st.ListMCPVersionsPage(ctx, srv.ID, model.MCPVersionPage{Summary: true})
+		if err != nil || len(summaries) != n {
+			t.Fatalf("summaries: %d, %v", len(summaries), err)
+		}
+		for i, v := range summaries {
+			if v.ServerJSON != nil || v.ID != all[i].ID || v.Version != all[i].Version || v.Digest != all[i].Digest ||
+				v.Status != all[i].Status || v.IsLatest != all[i].IsLatest || !v.PublishedAt.Equal(all[i].PublishedAt) {
+				t.Fatalf("summary %d = %+v", i, v)
+			}
+		}
+		// A summary does not strip the stored document.
+		if again, _ := st.ListMCPVersions(ctx, srv.ID); len(again[0].ServerJSON) == 0 {
+			t.Fatal("reading summaries removed a stored document")
+		}
+		if none, err := st.ListMCPVersionsPage(ctx, srv.ID+1000, model.MCPVersionPage{Limit: 5}); err != nil || len(none) != 0 {
+			t.Fatalf("a server that does not exist: %d, %v", len(none), err)
+		}
+	}},
 	{"concurrent mcp publish", func(t *testing.T, st store.Store) {
 		ctx := context.Background()
 		const n = 20

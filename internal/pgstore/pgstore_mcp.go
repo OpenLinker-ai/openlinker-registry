@@ -336,6 +336,28 @@ func (s *Store) ListMCPVersions(ctx context.Context, serverID int64) ([]model.MC
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPVersion, error) { return scanMCPVersion(row) })
 }
 
+// ListMCPVersionsPage implements store.Store.
+func (s *Store) ListMCPVersionsPage(ctx context.Context, serverID int64, q model.MCPVersionPage) ([]model.MCPVersion, error) {
+	cols := mcpVersionCols
+	if q.Summary {
+		cols = strings.Replace(cols, "v.server_json", "NULL::text", 1)
+	}
+	sql, args := `SELECT `+cols+` FROM mcp_server_versions v WHERE v.server_id = $1`, []any{serverID}
+	if q.After != nil {
+		sql += ` AND (v.published_at, v.id) < ($2, $3)`
+		args = append(args, q.After.PublishedAt, q.After.ID)
+	}
+	sql += ` ORDER BY v.published_at DESC, v.id DESC`
+	if q.Limit > 0 {
+		sql += ` LIMIT ` + strconv.Itoa(q.Limit)
+	}
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPVersion, error) { return scanMCPVersion(row) })
+}
+
 // SetMCPStatus implements store.Store.
 func (s *Store) SetMCPStatus(ctx context.Context, serverID int64, version, status, message string, at time.Time, audit model.AuditEvent) (int, error) {
 	if status == model.MCPStatusActive {

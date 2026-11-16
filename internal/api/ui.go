@@ -465,7 +465,7 @@ func (s *Server) uiMCPServer(w http.ResponseWriter, r *http.Request) {
 		s.uiError(w, r, err)
 		return
 	}
-	versions, err := s.Svc.Store.ListMCPVersions(r.Context(), srv.ID)
+	versions, err := s.Svc.Store.ListMCPVersionsPage(r.Context(), srv.ID, model.MCPVersionPage{Summary: true})
 	if err == nil {
 		srv, err = s.confirmMCP(r, srv)
 	}

@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -139,6 +140,18 @@ func NarrowerVisibility(a, b string) string {
 	return b
 }
 
+// MCPVersionPage selects versions of one server, newest first.
+type MCPVersionPage struct {
+	// After is the last version of the previous page (nil for the first
+	// page); only its PublishedAt and ID are used.
+	After *MCPVersion
+	// Limit is the most versions to return; 0 returns all of them.
+	Limit int
+	// Summary leaves ServerJSON out: everything about each version but its
+	// document, which can be as large as the publication limit.
+	Summary bool
+}
+
 // MCPPatch updates mutable server settings.
 type MCPPatch struct {
 	Visibility *string
@@ -190,8 +203,18 @@ type semver struct {
 	pre []string
 }
 
+// semverRe is the grammar of semver.org 2.0.0 (with an optional leading
+// "v"). A version that does not match it completely is not a semantic
+// version, and is ordered by publication.
+var semverRe = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
+	`(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?` +
+	`(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$`)
+
 func parseSemver(s string) (semver, bool) {
 	var out semver
+	if !semverRe.MatchString(s) {
+		return out, false
+	}
 	s = strings.TrimPrefix(s, "v")
 	if i := strings.IndexByte(s, '+'); i >= 0 {
 		s = s[:i]

@@ -2,7 +2,10 @@ package apitest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -60,9 +63,13 @@ func (h *hookStore) GetMCPVersion(ctx context.Context, serverID int64, version s
 	return h.Store.GetMCPVersion(ctx, serverID, version)
 }
 
-func (h *hookStore) ListMCPVersions(ctx context.Context, serverID int64) ([]model.MCPVersion, error) {
-	h.fire("ListMCPVersions")
-	return h.Store.ListMCPVersions(ctx, serverID)
+func (h *hookStore) ListMCPVersionsPage(ctx context.Context, serverID int64, q model.MCPVersionPage) ([]model.MCPVersion, error) {
+	if q.After == nil {
+		h.fire("ListMCPVersions")
+	} else {
+		h.fire("ListMCPVersions, next page")
+	}
+	return h.Store.ListMCPVersionsPage(ctx, serverID, q)
 }
 
 // runSplitReads covers a request that reads an entry's settings and then its
@@ -125,4 +132,32 @@ func runSplitReads(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 		e.Expect(e.Do("GET", path, pub, "", nil), 200, c.what+": a member's read")
 	}
+
+	// A long version list is written a page at a time. When the server is
+	// restricted between two pages, the answer cannot be taken back; it is
+	// cut short, and nothing read after the restriction is in it.
+	const pages = 60 // more than one page
+	for i := 1; i <= pages; i++ {
+		e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/paged", fmt.Sprintf("nightly-%02d", i), "https://first.acme.example/mcp")), 201, "publish")
+	}
+	h.before("ListMCPVersions, next page", func() {
+		e.Expect(e.Do("PATCH", "/v1/mcp/servers/com.acme/paged", AdminToken, "", map[string]any{"visibility": "private"}), 200, "restrict")
+		e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/paged", "nightly-99", "https://"+marker+".acme.example/mcp")), 201, "second version")
+	})
+	res, err := http.Get(e.Base + "/v0.1/servers/com.acme%2Fpaged/versions")
+	if err != nil {
+		t.Fatalf("version list: %v", err)
+	}
+	body, readErr := io.ReadAll(res.Body)
+	res.Body.Close()
+	if h.waiting("ListMCPVersions, next page") {
+		t.Fatal("the version list was read in one piece; the case tests nothing")
+	}
+	if strings.Contains(string(body), marker) || strings.Contains(string(body), "nightly-01") {
+		t.Fatalf("a version list went on after its server was restricted: %d bytes", len(body))
+	}
+	if readErr == nil && json.Valid(body) {
+		t.Fatalf("a version list that was cut short reads as a complete answer: %d bytes", len(body))
+	}
+	e.Expect(e.Do("GET", "/v0.1/servers/com.acme%2Fpaged/versions", "", "", nil), 404, "the list after the restriction")
 }

@@ -2949,6 +2949,60 @@ func runOddInputs(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a server with many versions", func(t *testing.T) {
+		// The version list is read and written a page at a time; nothing
+		// about the answer depends on where the pages end.
+		e := NewEnv(t, newStore(t), Options{UI: true})
+		e.namespace("com.acme", "domain")
+		pub := e.publisher("com.acme")
+		const n = 120
+		for i := 1; i <= n; i++ {
+			e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/many", fmt.Sprintf("nightly-%03d", i), "https://m.acme.example/mcp")), 201, "publish")
+		}
+		for _, prefix := range []string{"/v0.1", "/v0"} {
+			r := e.Expect(e.Do("GET", prefix+"/servers/com.acme%2Fmany/versions", "", "", nil), 200, "version list")
+			got := servers(r)
+			if meta, _ := r.JSON["metadata"].(map[string]any); len(got) != n || meta["count"] != float64(n) {
+				t.Fatalf("%s: %d versions, metadata %v", prefix, len(got), r.JSON["metadata"])
+			}
+			for i, item := range got {
+				want := fmt.Sprintf("nightly-%03d", n-i)
+				if v0Version(item) != want || official(item)["isLatest"] != (i == 0) {
+					t.Fatalf("%s: version %d is %s (latest %v), want %s", prefix, i, v0Version(item), official(item)["isLatest"], want)
+				}
+			}
+		}
+		r := e.Expect(e.Do("GET", "/v1/mcp/servers/com.acme/many", "", "", nil), 200, "detail")
+		if list, _ := r.JSON["versions"].([]any); len(list) != n || r.JSON["latest_version"] != fmt.Sprintf("nightly-%03d", n) ||
+			list[0].(map[string]any)["digest"] == "" {
+			t.Fatalf("detail: %d versions, latest %v", len(list), r.JSON["latest_version"])
+		}
+		if r := e.Do("GET", "/ui/mcp/com.acme/many", "", "", nil); r.Status != 200 || !strings.Contains(string(r.Body), "nightly-001") {
+			t.Fatalf("page: %d", r.Status)
+		}
+		e.Expect(e.Do("GET", "/v0.1/servers/com.acme%2Fnone/versions", "", "", nil), 404, "a server that does not exist")
+	})
+
+	t.Run("a version that only looks like a semantic version", func(t *testing.T) {
+		// "1.0.0-build_2" is not a semantic version; such versions are
+		// ordered by publication, so the one published last is the latest.
+		e := NewEnv(t, newStore(t), Options{})
+		e.namespace("com.acme", "domain")
+		pub := e.publisher("com.acme")
+		for _, v := range []string{"1.0.0", "1.0.0-build_2"} {
+			e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/odd", v, "https://o.acme.example/mcp")), 201, "publish "+v)
+		}
+		if r := e.Do("GET", "/v0.1/servers/com.acme%2Fodd/versions/latest", "", "", nil); v0Version(r.JSON) != "1.0.0-build_2" {
+			t.Fatalf("latest = %s, want the version published last", v0Version(r.JSON))
+		}
+		for _, v := range []string{"2.0.0", "2.0.0-rc.1"} {
+			e.Expect(e.publishMCP(pub, "com.acme", serverJSON("com.acme/odd", v, "https://o.acme.example/mcp")), 201, "publish "+v)
+		}
+		if r := e.Do("GET", "/v0.1/servers/com.acme%2Fodd/versions/latest", "", "", nil); v0Version(r.JSON) != "2.0.0" {
+			t.Fatalf("latest = %s, want 2.0.0 (a pre-release is lower)", v0Version(r.JSON))
+		}
+	})
+
 	t.Run("requests with text no entry can have", func(t *testing.T) {
 		e := NewEnv(t, newStore(t), Options{})
 		e.namespace("com.acme", "domain")

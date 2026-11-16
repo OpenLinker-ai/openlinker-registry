@@ -136,8 +136,13 @@ type Store interface {
 	// GetMCPVersion returns one version; version "latest" resolves to the
 	// version flagged IsLatest.
 	GetMCPVersion(ctx context.Context, serverID int64, version string) (model.MCPVersion, error)
-	// ListMCPVersions returns every version of a server, newest first.
+	// ListMCPVersions returns every version of a server, newest first, with
+	// its document. A server may have many large documents: code that
+	// serves requests uses ListMCPVersionsPage.
 	ListMCPVersions(ctx context.Context, serverID int64) ([]model.MCPVersion, error)
+	// ListMCPVersionsPage returns versions of a server, newest first (by
+	// publication time, then id), as model.MCPVersionPage selects them.
+	ListMCPVersionsPage(ctx context.Context, serverID int64, q model.MCPVersionPage) ([]model.MCPVersion, error)
 	// SetMCPStatus changes the status of one version, or of every version
 	// when version is "". It returns the number of versions changed. When the
 	// latest version is deleted, IsLatest moves to the best remaining

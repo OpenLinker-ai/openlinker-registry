@@ -337,7 +337,7 @@ func (s *Service) reconcileMCP(ctx context.Context, u model.Upstream, c *upstrea
 			}
 			covered := seen[srv.Name]
 			if covered {
-				local, err := s.Store.ListMCPVersions(ctx, srv.ID)
+				local, err := s.Store.ListMCPVersionsPage(ctx, srv.ID, model.MCPVersionPage{Summary: true})
 				if err != nil {
 					return pending, err
 				}
@@ -445,7 +445,7 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 	// A version mirrored here that the upstream's own list no longer has is
 	// gone. Only that version changes: which version is latest was just
 	// taken from the upstream's list and is not recomputed by version number.
-	local, err := s.Store.ListMCPVersions(ctx, srv.ID)
+	local, err := s.Store.ListMCPVersionsPage(ctx, srv.ID, model.MCPVersionPage{Summary: true})
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +491,7 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 // no longer served. unread names the versions (and "latest") that could not
 // be read, about which nothing is concluded.
 func (s *Service) readMirroredMCP(ctx context.Context, c *upstream.Client, srv model.MCPServer) (docs []upstream.MCPDoc, unread map[string]bool, err error) {
-	local, err := s.Store.ListMCPVersions(ctx, srv.ID)
+	local, err := s.Store.ListMCPVersionsPage(ctx, srv.ID, model.MCPVersionPage{Summary: true})
 	if err != nil {
 		return nil, nil, err
 	}
