@@ -355,7 +355,7 @@ func (s *Service) UpdateSettings(ctx context.Context, actor string, sk model.Ski
 			return model.Skill{}, err
 		}
 		if *p.Visibility == model.VisibilityPublic && sk.Mode == skill.ModeHosted {
-			versions, err := s.Store.ListVersions(ctx, sk.ID)
+			versions, err := s.Store.ListVersionSummaries(ctx, sk.ID)
 			if err != nil {
 				return model.Skill{}, err
 			}

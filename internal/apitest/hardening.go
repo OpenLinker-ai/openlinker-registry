@@ -1390,6 +1390,89 @@ func runMCPSyncRules(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a large history is applied version by version", func(t *testing.T) {
+		// When a server's version list is too large, its versions are read
+		// one by one. Each is applied before the next is read, so that no
+		// more than one document is held; and only a sync does this walk:
+		// a forwarded read must not turn one request into one upstream
+		// request per mirrored version.
+		entry := func(version, status string) map[string]any {
+			return map[string]any{"server": map[string]any{"name": "com.feed/long", "description": "d", "version": version,
+				"remotes": []map[string]any{{"type": "sse", "url": "https://x.example/sse"}}},
+				"_meta": map[string]any{metaOfficial: map[string]any{"status": status, "isLatest": version == "3.0.0"}}}
+		}
+		var current atomic.Value // the status the upstream reports for every version
+		current.Store("active")
+		var reads atomic.Int64
+		var probe func() any
+		var seenBefore atomic.Value // what the mirror said about 2.0.0 when 1.0.0 was read
+		fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			status := current.Load().(string)
+			path := r.URL.EscapedPath()
+			switch {
+			case path == "/v0.1/servers":
+				_ = enc.Encode(map[string]any{"servers": []map[string]any{entry("3.0.0", status)}})
+			case path == "/v0.1/servers/com.feed%2Flong/versions":
+				_, _ = w.Write([]byte(`{"servers":[],"padding":"` + strings.Repeat("a", 17<<20) + `"}`))
+			case strings.HasPrefix(path, "/v0.1/servers/com.feed%2Flong/versions/"):
+				reads.Add(1)
+				version := strings.TrimPrefix(path, "/v0.1/servers/com.feed%2Flong/versions/")
+				if version == "latest" {
+					version = "3.0.0"
+				}
+				if version != "1.0.0" && version != "2.0.0" && version != "3.0.0" {
+					w.WriteHeader(404)
+					_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+					return
+				}
+				if version == "1.0.0" && status == "deprecated" && probe != nil {
+					seenBefore.Store(probe())
+				}
+				_ = enc.Encode(entry(version, status))
+			default:
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"error":"Server not found"}`))
+			}
+		}))
+		t.Cleanup(fake.Close)
+		e := NewEnv(t, newStore(t), Options{Loopback: true})
+		e.Expect(e.upstream(map[string]any{"name": "feed", "kind": "mcp-registry", "base_url": fake.URL, "proxy_on_miss": true, "visibility": "public"}), 201, "upstream")
+		status := func(version string) any {
+			return official(e.Do("GET", "/v0.1/servers/com.feed%2Flong/versions/"+version, "", "", nil).JSON)["status"]
+		}
+		for _, version := range []string{"1.0.0", "2.0.0", "3.0.0"} {
+			if status(version) != "active" {
+				t.Fatalf("forwarded %s", version)
+			}
+		}
+		current.Store("deprecated")
+		// A forwarded read of a version nobody has: the upstream is asked
+		// for that version, finds its list too large, and leaves it there.
+		reads.Store(0)
+		e.Expect(e.Do("GET", "/v0.1/servers/com.feed%2Flong/versions/9.9.9", "", "", nil), 404, "a version nobody has")
+		if n := reads.Load(); n != 1 {
+			t.Fatalf("one forwarded read caused %d version reads upstream", n)
+		}
+		if status("1.0.0") != "active" {
+			t.Fatal("the forwarded read applied versions it did not read")
+		}
+		// The sync walks: latest, then the mirrored versions, newest first.
+		probe = func() any { return status("2.0.0") }
+		if s := e.sync("feed"); s["last_status"] != "ok" || stat(s, "mcp_pending") != 0 {
+			t.Fatalf("sync: %v", s)
+		}
+		for _, version := range []string{"1.0.0", "2.0.0", "3.0.0"} {
+			if status(version) != "deprecated" {
+				t.Fatalf("%s is %v after the walk", version, status(version))
+			}
+		}
+		if got := seenBefore.Load(); got != "deprecated" {
+			t.Fatalf("2.0.0 was %v here when 1.0.0 was read: documents are collected instead of applied as they are read", got)
+		}
+	})
+
 	t.Run("a listing page larger than the response cap", func(t *testing.T) {
 		// Large documents make a full page exceed what one response may
 		// carry, although each document is fine. The sync asks for smaller

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
 )
 
@@ -315,6 +316,49 @@ var mirrorTests = []testCase{
 		}
 		if err := st.SetVersionLocatorURL(model.WithUpstreamGuard(ctx, up.ID, up.ConfigVersion), moved.ID, "https://site.example/y", at, audit); conflictCode(err) != "upstream_config_changed" {
 			t.Fatalf("under settings that changed: %v", err)
+		}
+	}},
+	{"version summaries", func(t *testing.T, st store.Store) {
+		// A list of versions shows everything about each version but what
+		// can be large in it.
+		ctx := context.Background()
+		newNamespace(t, st, "com.summaries")
+		var skillID int64
+		for _, ver := range []string{"1", "2", "3"} {
+			v := version(ver, "custom")
+			v.LicenseText = strings.Repeat("license ", 1000)
+			v.Files = []skill.ManifestEntry{{Path: "SKILL.md", Size: 10, SHA256: strings.Repeat("a", 64)}, {Path: "LICENSE", Size: 8000, SHA256: strings.Repeat("b", 64)}}
+			sk, _, err := st.PublishVersion(ctx, model.PublishInput{Namespace: "com.summaries", Name: "big", Mode: skill.ModeHosted,
+				Visibility: model.VisibilityPrivate, Listed: true, Version: v}, audit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			skillID = sk.ID
+		}
+		full, err := st.ListVersions(ctx, skillID)
+		if err != nil || len(full) != 3 || len(full[0].Files) != 2 || full[0].LicenseText == "" {
+			t.Fatalf("full versions: %d, %v", len(full), err)
+		}
+		summaries, err := st.ListVersionSummaries(ctx, skillID)
+		if err != nil || len(summaries) != 3 {
+			t.Fatalf("summaries: %d, %v", len(summaries), err)
+		}
+		for i, v := range summaries {
+			f := full[i]
+			if len(v.Files) != 0 || v.LicenseText != "" {
+				t.Fatalf("summary %s carries its manifest or license text", v.Version)
+			}
+			if v.ID != f.ID || v.Version != f.Version || v.Mode != f.Mode || v.LicenseKind != f.LicenseKind || v.LicenseApproved != f.LicenseApproved ||
+				v.ArtifactDigest != f.ArtifactDigest || v.ArtifactType != f.ArtifactType || v.CoreCompatible != f.CoreCompatible ||
+				v.FrontmatterDescription != f.FrontmatterDescription || !v.CreatedAt.Equal(f.CreatedAt) || (v.Source == nil) != (f.Source == nil) {
+				t.Fatalf("summary %d = %+v, full = %+v", i, v, f)
+			}
+		}
+		if again, _ := st.ListVersions(ctx, skillID); len(again[0].Files) != 2 || again[0].LicenseText == "" {
+			t.Fatal("reading summaries changed what is stored")
+		}
+		if none, err := st.ListVersionSummaries(ctx, skillID+1000); err != nil || len(none) != 0 {
+			t.Fatalf("a skill that does not exist: %d, %v", len(none), err)
 		}
 	}},
 	{"every mirrored entry can be enumerated", func(t *testing.T, st store.Store) {

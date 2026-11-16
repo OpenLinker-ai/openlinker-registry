@@ -58,6 +58,11 @@ func (h *hookStore) ListVersions(ctx context.Context, skillID int64) ([]model.Ve
 	return h.Store.ListVersions(ctx, skillID)
 }
 
+func (h *hookStore) ListVersionSummaries(ctx context.Context, skillID int64) ([]model.Version, error) {
+	h.fire("ListVersions")
+	return h.Store.ListVersionSummaries(ctx, skillID)
+}
+
 func (h *hookStore) GetMCPVersion(ctx context.Context, serverID int64, version string) (model.MCPVersion, error) {
 	h.fire("GetMCPVersion")
 	return h.Store.GetMCPVersion(ctx, serverID, version)

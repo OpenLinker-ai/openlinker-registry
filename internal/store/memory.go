@@ -323,6 +323,15 @@ func (m *Memory) versionsOf(skillID int64) []model.Version {
 	return out
 }
 
+// ListVersionSummaries implements Store (newest first).
+func (m *Memory) ListVersionSummaries(ctx context.Context, skillID int64) ([]model.Version, error) {
+	out, err := m.ListVersions(ctx, skillID)
+	for i := range out {
+		out[i].Files, out[i].LicenseText = nil, ""
+	}
+	return out, err
+}
+
 func (m *Memory) latest(skillID int64) (model.Version, bool) {
 	return model.LatestVersion(m.skills[skillID].CurrentVersion, m.versionsOf(skillID))
 }

@@ -525,6 +525,13 @@ const versionCols = `id, skill_id, version, mode, frontmatter_name, frontmatter_
 	COALESCE(archive_digest, ''), source, locator, indexed_by, COALESCE(check_result, ''), checked_at, yanked_at,
 	yank_reason, created_by, created_at, mirror_served, locator_url`
 
+// versionSummaryCols is versionCols without the file manifest and the
+// license text, which are what makes a version row large.
+const versionSummaryCols = `id, skill_id, version, mode, frontmatter_name, frontmatter_description, license_kind, license_id,
+	'' AS license_text, license_approved, core_compatible, '[]'::jsonb AS files, artifact_digest, artifact_type, artifact_size,
+	COALESCE(archive_digest, ''), source, locator, indexed_by, COALESCE(check_result, ''), checked_at, yanked_at,
+	yank_reason, created_by, created_at, mirror_served, locator_url`
+
 func scanVersion(row pgx.Row) (model.Version, error) {
 	var v model.Version
 	var files, src, loc []byte
@@ -559,7 +566,16 @@ func scanVersion(row pgx.Row) (model.Version, error) {
 
 // ListVersions implements store.Store (newest first).
 func (s *Store) ListVersions(ctx context.Context, skillID int64) ([]model.Version, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+versionCols+` FROM skill_versions WHERE skill_id = $1 ORDER BY id DESC`, skillID)
+	return s.listVersions(ctx, versionCols, skillID)
+}
+
+// ListVersionSummaries implements store.Store (newest first).
+func (s *Store) ListVersionSummaries(ctx context.Context, skillID int64) ([]model.Version, error) {
+	return s.listVersions(ctx, versionSummaryCols, skillID)
+}
+
+func (s *Store) listVersions(ctx context.Context, cols string, skillID int64) ([]model.Version, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+cols+` FROM skill_versions WHERE skill_id = $1 ORDER BY id DESC`, skillID)
 	if err != nil {
 		return nil, err
 	}

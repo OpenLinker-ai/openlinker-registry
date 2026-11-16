@@ -371,7 +371,7 @@ func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *ups
 		return err
 	}
 	defer release()
-	_, err = s.refreshMCPServerLocked(ctx, u, c, srv.Name, stats)
+	_, err = s.refreshMCPServerLocked(ctx, u, c, srv.Name, stats, true)
 	if answered(err) && !errors.Is(err, errUnconfirmed) {
 		// The upstream's answer for this server was an error or unusable.
 		// The rest of the sync goes on, but this server is not settled.
@@ -385,7 +385,7 @@ func (s *Service) refreshMCPServer(ctx context.Context, u model.Upstream, c *ups
 // server's mirror lock. The server's version list is applied, which marks
 // every version it no longer contains as deleted.
 func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *upstream.Client, doc upstream.MCPDoc) (string, error) {
-	if _, err := s.refreshMCPServerLocked(ctx, u, c, doc.Name, syncStats{}); err != nil {
+	if _, err := s.refreshMCPServerLocked(ctx, u, c, doc.Name, syncStats{}, true); err != nil {
 		if answered(err) {
 			return "", errUnconfirmed
 		}
@@ -397,7 +397,13 @@ func (s *Service) reconcileMissingMCP(ctx context.Context, u model.Upstream, c *
 // refreshMCPServerLocked is refreshMCPServer for a caller that holds the
 // mirror lock. It returns the versions the upstream serves, or nil when the
 // server is not mirrored here or was withdrawn.
-func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, c *upstream.Client, name string, stats syncStats) (map[string]bool, error) {
+//
+// When the server's version list is too large for one response, the
+// versions mirrored here are read one by one instead (see readMirroredMCP).
+// That costs one upstream request per version, so it is done only with
+// walk set: a sync walks, a forwarded read leaves the server to the next
+// sync (errUnconfirmed) rather than let one request cause thousands.
+func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, c *upstream.Client, name string, stats syncStats, walk bool) (map[string]bool, error) {
 	// Read under the lock: a forwarded read may have changed the server
 	// since the caller last looked.
 	srv, err := s.Store.GetMCPServer(ctx, name)
@@ -407,40 +413,54 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 	if err != nil {
 		return nil, err
 	}
-	docs, complete, err := c.ListMCPVersions(ctx, srv.Name)
-	// unread: versions (and "latest") that were asked for one by one and
-	// could not be read.
-	var unread map[string]bool
-	if tooLarge(err) {
-		// The server's whole history does not fit one response. That must
-		// not stop the sync, nor leave this server as it was: the versions
-		// mirrored here are read one by one instead.
-		complete = true
-		docs, unread, err = s.readMirroredMCP(ctx, c, srv)
-		if err == nil && len(unread) == 0 && len(docs) == 0 {
-			err = upstream.ErrNotFound // none of it is served any more
-		}
-	}
-	switch {
-	case errors.Is(err, upstream.ErrNotFound):
-		return nil, s.withdrawMCP(ctx, u, srv, stats)
-	case err != nil:
-		return nil, err
-	}
 	served := map[string]bool{}
-	for _, doc := range docs {
+	// apply stores one document the upstream serves. Each is applied as it
+	// is read and then let go: only the names of the versions are kept.
+	apply := func(doc upstream.MCPDoc) error {
 		served[doc.Version] = true
 		res, err := s.mirrorMCP(ctx, u, doc, u.LatestOnly && !doc.IsLatest, true)
 		switch {
 		case err == nil:
 			stats.add("mcp_" + res)
 		case errors.Is(err, errUpstreamKind) || isStoreFailure(err) || configChanged(err):
-			return nil, err
+			return err
 		case errors.Is(err, model.ErrConflict):
 			stats.add("mcp_conflicts")
 		default:
 			stats.add("mcp_skipped")
 		}
+		return nil
+	}
+	docs, complete, err := c.ListMCPVersions(ctx, srv.Name)
+	// unread: versions (and "latest") that were asked for one by one and
+	// could not be read.
+	var unread map[string]bool
+	switch {
+	case tooLarge(err):
+		// The server's whole history does not fit one response. That must
+		// not stop the sync, nor leave this server as it was.
+		if !walk {
+			return nil, errUnconfirmed
+		}
+		var read int
+		complete = true
+		if read, unread, err = s.readMirroredMCP(ctx, c, srv, apply); err != nil {
+			return nil, err
+		}
+		if read == 0 && len(unread) == 0 {
+			return nil, s.withdrawMCP(ctx, u, srv, stats) // none of it is served any more
+		}
+	case errors.Is(err, upstream.ErrNotFound):
+		return nil, s.withdrawMCP(ctx, u, srv, stats)
+	case err != nil:
+		return nil, err
+	default:
+		for _, doc := range docs {
+			if err := apply(doc); err != nil {
+				return nil, err
+			}
+		}
+		docs = nil
 	}
 	// A version mirrored here that the upstream's own list no longer has is
 	// gone. Only that version changes: which version is latest was just
@@ -487,16 +507,17 @@ func (s *Service) refreshMCPServerLocked(ctx context.Context, u model.Upstream, 
 // readMirroredMCP reads, version by version, what the upstream serves of a
 // mirrored server: its latest version and every version recorded here. It
 // stands in for the server's version list when that is too large to read.
-// A version the upstream answers 404 for is not among the documents: it is
-// no longer served. unread names the versions (and "latest") that could not
-// be read, about which nothing is concluded.
-func (s *Service) readMirroredMCP(ctx context.Context, c *upstream.Client, srv model.MCPServer) (docs []upstream.MCPDoc, unread map[string]bool, err error) {
+// Each document is handed to apply as soon as it is read, so that no more
+// than one is held at a time; read counts them. A version the upstream
+// answers 404 for is no longer served. unread names the versions (and
+// "latest") that could not be read, about which nothing is concluded.
+func (s *Service) readMirroredMCP(ctx context.Context, c *upstream.Client, srv model.MCPServer, apply func(upstream.MCPDoc) error) (read int, unread map[string]bool, err error) {
 	local, err := s.Store.ListMCPVersionsPage(ctx, srv.ID, model.MCPVersionPage{Summary: true})
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, err
 	}
 	unread = map[string]bool{}
-	read := map[string]bool{}
+	seen := map[string]bool{}
 	get := func(version string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -504,10 +525,12 @@ func (s *Service) readMirroredMCP(ctx context.Context, c *upstream.Client, srv m
 		doc, err := c.GetMCP(ctx, srv.Name, version)
 		switch {
 		case err == nil:
-			if !read[doc.Version] {
-				read[doc.Version] = true
-				docs = append(docs, doc)
+			if seen[doc.Version] {
+				return nil
 			}
+			seen[doc.Version] = true
+			read++
+			return apply(doc)
 		case errors.Is(err, upstream.ErrNotFound):
 		case answered(err):
 			unread[version] = true
@@ -517,17 +540,17 @@ func (s *Service) readMirroredMCP(ctx context.Context, c *upstream.Client, srv m
 		return nil
 	}
 	if err := get("latest"); err != nil {
-		return nil, nil, err
+		return 0, nil, err
 	}
 	for _, v := range local {
-		if read[v.Version] {
+		if seen[v.Version] {
 			continue
 		}
 		if err := get(v.Version); err != nil {
-			return nil, nil, err
+			return 0, nil, err
 		}
 	}
-	return docs, unread, nil
+	return read, unread, nil
 }
 
 // mirrorListedMCP applies a document that came with a listing page. Such a
@@ -867,7 +890,7 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 	have := map[string]model.Version{}
 	newest := ""
 	if exists {
-		versions, err := s.Store.ListVersions(ctx, local.ID)
+		versions, err := s.Store.ListVersionSummaries(ctx, local.ID)
 		if err != nil {
 			return err
 		}
@@ -1360,7 +1383,7 @@ func (s *Service) followLatest(ctx context.Context, actor string, local model.Sk
 	if version == "" || local.Status == model.StatusYanked {
 		return false, nil
 	}
-	versions, err := s.Store.ListVersions(ctx, local.ID)
+	versions, err := s.Store.ListVersionSummaries(ctx, local.ID)
 	if err != nil {
 		return false, err
 	}

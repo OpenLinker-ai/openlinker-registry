@@ -257,7 +257,7 @@ func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	versions, err := s.Svc.Store.ListVersions(r.Context(), sk.ID)
+	versions, err := s.Svc.Store.ListVersionSummaries(r.Context(), sk.ID)
 	if err == nil {
 		sk, err = s.confirmSkill(r, sk)
 	}

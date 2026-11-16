@@ -299,10 +299,7 @@ func (s *Server) uiSkill(w http.ResponseWriter, r *http.Request) {
 		s.uiError(w, r, err)
 		return
 	}
-	versions, err := s.Svc.Store.ListVersions(r.Context(), sk.ID)
-	if err == nil {
-		sk, err = s.confirmSkill(r, sk)
-	}
+	versions, err := s.Svc.Store.ListVersionSummaries(r.Context(), sk.ID)
 	if err != nil {
 		s.uiError(w, r, err)
 		return
@@ -326,7 +323,20 @@ func (s *Server) uiSkill(w http.ResponseWriter, r *http.Request) {
 		s.uiError(w, r, errNotFound)
 		return
 	}
-	v := d.Version
+	// The list holds summaries; the version shown is read in full, and the
+	// skill is confirmed after everything about it was loaded.
+	v, err := s.Svc.Store.GetVersion(r.Context(), sk.ID, d.Version.Version)
+	if errors.Is(err, model.ErrNotFound) {
+		err = errNotFound
+	}
+	if err == nil {
+		sk, err = s.confirmSkill(r, sk)
+	}
+	if err != nil {
+		s.uiError(w, r, err)
+		return
+	}
+	d.Skill, d.Version = sk, v
 	d.Access, d.SourceURL = registry.Access(v), s.Svc.SourceURL(v)
 	if d.Access.Artifact && v.YankedAt == nil && sk.Status != model.StatusYanked {
 		base := s.BasePath + "/ui/skills/" + url.PathEscape(sk.Namespace) + "/" + url.PathEscape(sk.Name) +

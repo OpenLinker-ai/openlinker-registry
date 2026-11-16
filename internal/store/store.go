@@ -46,6 +46,11 @@ type Store interface {
 	// source_mismatch, source_already_indexed, version_exists, skill_yanked.
 	PublishVersion(ctx context.Context, in model.PublishInput, audit model.AuditEvent) (model.Skill, model.Version, error)
 	ListVersions(ctx context.Context, skillID int64) ([]model.Version, error)
+	// ListVersionSummaries is ListVersions without what can be large in a
+	// version (its file manifest and license text): everything a list of
+	// versions shows. A skill may have many versions; code that serves
+	// requests lists summaries and reads the one version it needs.
+	ListVersionSummaries(ctx context.Context, skillID int64) ([]model.Version, error)
 	GetVersion(ctx context.Context, skillID int64, version string) (model.Version, error)
 	UpdateSkill(ctx context.Context, skillID int64, p model.SkillPatch, audit model.AuditEvent) (model.Skill, error)
 	SetSkillStatus(ctx context.Context, skillID int64, status, reason string, audit model.AuditEvent) (model.Skill, error)
