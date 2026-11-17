@@ -29,15 +29,26 @@ publishes only the `sha-` image and keeps the archives as workflow artifacts.
 
    ```sh
    make check
-   REGISTRY_TEST_DATABASE_URL='postgres://registry:registry@127.0.0.1:5432/registry_test?sslmode=disable' \
+   GOWORK=off REGISTRY_TEST_DATABASE_URL='postgres://registry:registry@127.0.0.1:5432/registry_test?sslmode=disable' \
      go test -count=1 -race ./...
    ```
 
-4. One archive builds and reports the version it was given:
+   `GOWORK=off` matters when this repository is checked out inside the
+   parent repository, whose `go.work` does not include it; the Makefile sets
+   it only for `make`.
+
+4. One archive builds, and its binary reports the version and commit it was
+   given (on Linux or macOS, for the machine you are on):
 
    ```sh
-   bash scripts/package-release.sh v0.x.y "$(git rev-parse HEAD)" linux amd64 "$(mktemp -d)"
+   out="$(mktemp -d)"
+   archive="$(bash scripts/package-release.sh v0.x.y "$(git rev-parse HEAD)" "$(go env GOOS)" "$(go env GOARCH)" "$out")"
+   tar -xzf "$archive" -C "$out"
+   "$out"/openlinker-registry-v0.x.y-*/openlinker-registry version
    ```
+
+   The script only builds the archive and prints its path. CI does the same
+   for Linux and checks the output.
 
 5. Database migrations are forward-only. A release that adds one says so in
    the changelog; never edit a migration that has been released.
@@ -63,9 +74,19 @@ The parent repository pins a commit of this repository as a submodule and
 builds its own deployments from that commit; it does not depend on a published
 release.
 
-When the parent publishes a formal release of its own, it tags every pinned
-submodule commit that carries no `v*` tag yet with the parent's version, and
-that tag push would start the release workflow here under the parent's version
-number. To keep this repository's own version line, release-tag the commit the
-parent pins before the parent's formal release; a commit that already carries
-a `v*` tag is left alone.
+When the parent publishes a formal release of its own, its release script
+looks at the commit it pins here and at the tags of this repository:
+
+- If a tag with the parent's version name already exists here, it must point
+  to the pinned commit. If it points anywhere else, the parent's release
+  fails. Releasing the pinned commit under another name does not help: the
+  two version lines must not use the same tag name for different commits.
+- Otherwise, if the pinned commit already carries any `v*` tag, it is left
+  alone.
+- Otherwise the parent tags the pinned commit with the parent's version, and
+  that tag push starts the release workflow here under the parent's version
+  number.
+
+So, to keep this repository's own version line, release-tag the commit the
+parent pins before the parent's formal release, and never give a commit here
+a version name that a later parent release will use.

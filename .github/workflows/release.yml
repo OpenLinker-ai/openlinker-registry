@@ -6,9 +6,10 @@ name: Images and Artifacts
 # commit and keeps the binaries as workflow artifacts; it is stamped
 # "sha-<commit>".
 #
-# The OpenLinker parent repository tags a pinned commit here with its own
-# version only when that commit carries no v* tag yet; RELEASE.md says how to
-# keep this repository's version line.
+# The OpenLinker parent repository's formal release may tag the commit it
+# pins here with the parent's version: it does so when that commit carries no
+# v* tag and the parent's tag name is not in use here. RELEASE.md has the
+# exact rule and how to keep this repository's version line.
 
 on:
   workflow_dispatch:

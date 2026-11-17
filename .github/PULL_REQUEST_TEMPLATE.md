@@ -11,7 +11,7 @@
 
 ## Validation
 
-- [ ] `make check` passes, and `go test -count=1 -race ./...` passes with `REGISTRY_TEST_DATABASE_URL` set.
+- [ ] `make check` passes, and `GOWORK=off go test -count=1 -race ./...` passes with `REGISTRY_TEST_DATABASE_URL` set.
 - [ ] Store changes are in both implementations and in the shared conformance suite, or the stores are unaffected.
 - [ ] English and Chinese READMEs were updated together, or no documentation change is needed.
 - [ ] `CHANGELOG.md` has an entry under `Unreleased`, or the change is not user-visible.
