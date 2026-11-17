@@ -132,7 +132,10 @@ Secrets are read from the environment only.
 
 This repository does not choose its own version numbers. A formal release of
 the OpenLinker parent repository tags the commit it pins here with the same
-`v*` tag, and that tag starts `.github/workflows/release.yml`, which:
+`v*` tag, unless that commit already carries a `v*` tag from an earlier
+release: an unchanged registry keeps its existing tag, image and archives and
+gets no new ones. A newly pushed tag starts `.github/workflows/release.yml`,
+which:
 
 1. runs gofmt, `go vet` and the test suite (with PostgreSQL) on the tagged
    commit, and publishes nothing if they fail;

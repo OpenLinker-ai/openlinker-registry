@@ -84,8 +84,9 @@ curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
 
 ## 发布
 
-本仓库不自己定版本号。OpenLinker 主仓库发布正式版本时，会给它固定的本仓库提交打上同名的 `v*` tag，
-这个 tag 触发 `.github/workflows/release.yml`：
+本仓库不自己定版本号。OpenLinker 主仓库发布正式版本时，会给它固定的本仓库提交打上同名的 `v*` tag；
+如果该提交已经带有更早版本的 `v*` tag（本仓库没有变化），就不再打新 tag，沿用已有的 tag、镜像和归档。
+新推送的 tag 触发 `.github/workflows/release.yml`：
 
 1. 先在该提交上跑 gofmt、`go vet` 和测试（含 PostgreSQL），不通过就什么都不发布。
 2. 推送 `linux/amd64` 与 `linux/arm64` 镜像到 `ghcr.io/openlinker-ai/openlinker-registry`，标签是
