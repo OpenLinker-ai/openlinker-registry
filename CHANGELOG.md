@@ -4,7 +4,12 @@ The registry has its own version numbers; see [RELEASE.md](./RELEASE.md).
 
 ## Unreleased
 
-No version has been released yet. `main` contains:
+Nothing since `v0.1.0-rc.1`.
+
+## v0.1.0-rc.1 — 2026-11-17
+
+Pre-release, and the first tagged version. There is no formal release yet. It
+contains:
 
 - Skills: hosted uploads and GitHub imports, GitHub-indexed entries (a
   locator, manifest and digests instead of stored content), immutable
@@ -16,9 +21,10 @@ No version has been released yet. `main` contains:
   a literal secret value is rejected.
 - Upstreams (pull only): forwarding to and mirroring of other
   openlinker-registry instances and the official MCP Registry, plus
-  mirroring of discovery indexes. Mirrored skill content is verified against its recorded digests
-  before it is served; upstream MCP documents are validated and have
-  credentials removed, and their digest is computed by this registry.
+  mirroring of discovery indexes. Mirrored skill content is verified against
+  its recorded digests before it is served; upstream MCP documents are
+  validated and have credentials removed, and their digest is computed by
+  this registry.
 - Read, write and forwarding rate limits, counted per token subject for
   authenticated callers and per client address for anonymous ones (behind
   trusted proxies, the address the proxy reports), and a per-address lockout
