@@ -1,0 +1,36 @@
+{{define "head"}}<!doctype html>
+<html lang="{{.Lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{.Title}} · {{.T "brand"}}</title>
+<link rel="stylesheet" href="{{.Base}}/ui/static/style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="{{.Base}}/ui/">{{.T "brand"}}</a>
+  <nav>
+    <a href="{{.Base}}/ui/"{{if eq .Tab "skills"}} aria-current="page"{{end}}>{{.T "nav.skills"}}</a>
+    <a href="{{.Base}}/ui/mcp"{{if eq .Tab "mcp"}} aria-current="page"{{end}}>{{.T "nav.mcp"}}</a>
+    {{if .User.Admin}}<a href="{{.Base}}/ui/upstreams"{{if eq .Tab "upstreams"}} aria-current="page"{{end}}>{{.T "nav.upstreams"}}</a>{{end}}
+  </nav>
+  <div class="who">
+    <span class="tag">{{if eq .Mode "public"}}{{.T "mode.public"}}{{else}}{{.T "mode.private"}}{{end}}</span>
+    {{if .User.Authenticated}}
+      <span class="muted">{{.User.Subject}}</span>
+      <form method="post" action="{{.Base}}/ui/logout"><button type="submit" class="link">{{.T "signout"}}</button></form>
+    {{else}}<a href="{{.Base}}/ui/login">{{.T "signin"}}</a>{{end}}
+  </div>
+</header>
+<main>
+{{if .Error}}<p class="alert">{{.Error}}</p>{{end}}
+{{end}}
+
+{{define "foot"}}
+</main>
+<footer class="muted">{{.T "footer"}}</footer>
+</body>
+</html>{{end}}
+
+{{define "status"}}{{if eq . "active"}}<span class="tag ok">active</span>{{else if eq . "deprecated"}}<span class="tag warn">deprecated</span>{{else}}<span class="tag bad">{{.}}</span>{{end}}{{end}}

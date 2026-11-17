@@ -1,0 +1,14 @@
+{{define "login"}}{{template "head" .}}
+<h1>{{.T "signin"}}</h1>
+<p class="muted">{{.T "login.note"}}</p>
+<form class="login" method="post" action="{{.Base}}/ui/login">
+  <label for="token">{{.T "login.token"}}</label>
+  <input id="token" type="password" name="token" autocomplete="off" required maxlength="512">
+  <button type="submit">{{.T "signin"}}</button>
+</form>
+{{template "foot" .}}{{end}}
+
+{{define "error"}}{{template "head" .}}
+<h1>{{.Data}}</h1>
+<p><a href="{{.Base}}/ui/">{{.T "back"}}</a></p>
+{{template "foot" .}}{{end}}

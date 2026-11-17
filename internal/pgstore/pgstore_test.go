@@ -31,6 +31,21 @@ func newStore(t *testing.T) *pgstore.Store {
 
 func newStoreSchema(t *testing.T) (*pgstore.Store, string) {
 	t.Helper()
+	st, schema := openSchema(t)
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate is not idempotent: %v", err)
+	}
+	return st, schema
+}
+
+// openSchema creates an isolated, empty schema (no migration applied) and a
+// store on it; the schema is dropped afterwards.
+func openSchema(t *testing.T) (*pgstore.Store, string) {
+	t.Helper()
 	dsn := os.Getenv(DSNEnv)
 	if dsn == "" {
 		t.Skip(DSNEnv + " is not set; skipping Postgres integration tests")
@@ -60,12 +75,6 @@ func newStoreSchema(t *testing.T) (*pgstore.Store, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	if err := st.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if err := st.Migrate(ctx); err != nil {
-		t.Fatalf("migrate is not idempotent: %v", err)
-	}
 	return st, schema
 }
 

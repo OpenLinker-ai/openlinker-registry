@@ -1,0 +1,283 @@
+package mcp
+
+import (
+	"strings"
+	"testing"
+	"unicode"
+)
+
+func TestURLsMustNotEmbedCredentials(t *testing.T) {
+	const secret = "ghp_0123456789abcdef"
+	docs := map[string]string{
+		"remote": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://user:` + secret + `@mcp.example.com/sse"}]}`,
+		"remote template": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://` + secret + `@{tenant}.example.com/sse"}]}`,
+		"package transport": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"sse","url":"http://` + secret + `@localhost:3000/sse"}}]}`,
+		"repository": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"repository":{"url":"https://` + secret + `@github.com/alice/w","source":"github"},
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		// A template may take the scheme, with its colon or with the
+		// slashes too, from a variable. What follows is still an authority.
+		"scheme and colon from a variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{scheme}//alice:` + secret + `@mcp.example.com/sse","variables":{"scheme":{"default":"https:"}}}]}`,
+		"origin prefix from a variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{origin}alice:` + secret + `@mcp.example.com/sse","variables":{"origin":{"default":"https://"}}}]}`,
+		"two leading variables": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{scheme}{slashes}alice:` + secret + `@mcp.example.com/sse",
+			"variables":{"scheme":{"default":"https:"},"slashes":{"default":"//"}}}]}`,
+		// Which leading variable is the scheme and which the credential
+		// cannot be told: none keeps a literal value.
+		"userinfo from a leading variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{origin}{who}@mcp.example.com/sse",
+			"variables":{"origin":{"default":"https://"},"who":{"default":"alice:` + secret + `"}}}]}`,
+		"userinfo from the only leading variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{who}@mcp.example.com/sse","variables":{"who":{"value":"alice:` + secret + `"}}}]}`,
+		"userinfo from a leading variable in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-alt":{"url":"{origin}{who}@alt.example.com/sse","variables":{"origin":{"default":"https://"},"who":{"default":"alice:` + secret + `"}}},
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		// A password may contain white space; it is userinfo all the same.
+		"password with a space": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"https://alice:literal ` + secret + `@downloads.example/tool.mcpb","transport":{"type":"stdio"}}]}`,
+		"password with a tab in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-mirror":"https://alice:a\tb ` + secret + `@mirror.example/w","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"template authority in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-alt":"{scheme}//alice:` + secret + `@alt.example.com/sse","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+	}
+	for name, doc := range docs {
+		// Known URL fields report it under their own code; the rest as a secret.
+		if _, err := Parse([]byte(doc), Options{Strict: true}); err == nil {
+			t.Errorf("%s: strict must refuse URL credentials", name)
+		} else if name == "package transport" && err.(*Error).Code != codeSecretValue {
+			t.Errorf("%s: code %s, want %s", name, err.(*Error).Code, codeSecretValue)
+		} else if strings.Contains(err.Error(), secret) {
+			t.Errorf("%s: the error repeats the credential", name)
+		}
+		p, err := Parse([]byte(doc), Options{})
+		if err != nil {
+			t.Errorf("%s: lenient: %v", name, err)
+			continue
+		}
+		if strings.Contains(string(p.Canonical), secret) || strings.Contains(string(p.Canonical), "@") {
+			t.Errorf("%s: lenient must remove URL credentials: %s", name, p.Canonical)
+		}
+		// What lenient stores passes strict's credential rule.
+		if _, err := Parse(p.Canonical, Options{Strict: true}); err != nil && err.(*Error).Code == codeSecretValue {
+			t.Errorf("%s: redacted document still fails: %v", name, err)
+		}
+	}
+	// An "@" outside the authority is not userinfo.
+	ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"remotes":[{"type":"sse","url":"https://mcp.example.com/users/@alice/sse?to=a@b.example"}]}`
+	p, err := Parse([]byte(ok), Options{Strict: true})
+	if err != nil || !strings.Contains(string(p.Canonical), "/users/@alice/sse?to=a@b.example") {
+		t.Fatalf("path and query may contain @: %v", err)
+	}
+	// Free text is not a URL, whatever it begins with; nor is text in a
+	// member this registry does not know that merely starts with a link.
+	// Both are kept as they are, by strict and by lenient parsing.
+	for name, member := range map[string]string{
+		"description":               `"description":"https://example.com contact alice@example.org"`,
+		"description with a query":  `"description":"https://example.com/docs?token=abc for alice@example.org"`,
+		"title":                     `"description":"d","title":"https://example.com by alice@example.org"`,
+		"text in an unknown member": `"description":"d","x-note":"https://example.com contact alice@example.org"`,
+		"list in an unknown member": `"description":"d","x-notes":["https://example.com contact alice@example.org"]`,
+		"scheme-relative text":      `"description":"d","x-note":"//example.com then mail alice@example.org"`,
+		"no-break spaces":           `"description":"d","x-note":"https://example.com\u00a0contact\u00a0alice@example.org"`,
+		"ideographic space":         `"description":"d","x-note":"https://example.com\u3000contact alice@example.org"`,
+		"line separator in a list":  `"description":"d","x-notes":["//example.com\u2028mail alice@example.org"]`,
+		"next line":                 `"description":"d","x-note":"https://example.com\u0085alice@example.org"`,
+		"description of a remote":   `"description":"d","x-remote":{"description":"https://a.example and b@c.example","url":"https://mcp.example.com/x"}`,
+	} {
+		doc := `{"name":"io.github.alice/w",` + member + `,"version":"1.0.0","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`
+		for _, o := range []Options{{Strict: true}, {}} {
+			p, err := Parse([]byte(doc), o)
+			if err != nil {
+				t.Errorf("%s (strict %v): %v", name, o.Strict, err)
+				continue
+			}
+			if !strings.Contains(string(p.Canonical), "@example.org") && !strings.Contains(string(p.Canonical), "b@c.example") {
+				t.Errorf("%s (strict %v): text was rewritten: %s", name, o.Strict, p.Canonical)
+			}
+		}
+	}
+	// In a member that holds URLs, white space does not end the userinfo.
+	spaced := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"packages":[{"registryType":"mcpb","identifier":"https://alice smith@downloads.example/tool.mcpb","transport":{"type":"stdio"}}]}`
+	if _, err := Parse([]byte(spaced), Options{Strict: true}); err == nil {
+		t.Error("userinfo with a space in a URL member must be refused")
+	}
+	if p, err := Parse([]byte(spaced), Options{}); err != nil || strings.Contains(string(p.Canonical), "smith") {
+		t.Errorf("userinfo with a space in a URL member must be removed: %v", err)
+	}
+	// Nor does any other white space, and a password may contain it in a
+	// member that is only taken for a URL by its form.
+	for name, member := range map[string]string{
+		"no-break space in a URL member":  `"packages":[{"registryType":"mcpb","identifier":"https://bob\u00a0smith@downloads.example/tool.mcpb","transport":{"type":"stdio"}}]`,
+		"no-break space in a password":    `"x-mirror":"https://bob:two\u00a0words@example.com/"`,
+		"ideographic space in a password": `"x-mirror":"https://bob:two\u3000words@example.com/"`,
+		"vertical tab in a password":      `"x-mirror":"https://bob:two\u000bwords@example.com/"`,
+		"userinfo before no-break text":   `"x-mirror":"https://bob@example.com/\u00a0see\u00a0the\u00a0docs"`,
+	} {
+		doc := `{"name":"io.github.alice/w","description":"d",` + member + `,"version":"1.0.0","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`
+		if _, err := Parse([]byte(doc), Options{Strict: true}); err == nil || err.(*Error).Code != codeSecretValue {
+			t.Errorf("%s: must be refused as a credential, got %v", name, err)
+		}
+		if p, err := Parse([]byte(doc), Options{}); err != nil || strings.Contains(string(p.Canonical), "bob") {
+			t.Errorf("%s: userinfo must be removed: %v", name, err)
+		}
+	}
+	// Text with no-break spaces that goes on to a URL with userinfo loses
+	// that userinfo and nothing else.
+	mixed := `{"name":"io.github.alice/w","description":"d","x-note":"//example.com\u00a0mail\u00a0bob@x.example\u00a0see://carol@host.example/",
+		"version":"1.0.0","remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`
+	if _, err := Parse([]byte(mixed), Options{Strict: true}); err == nil || err.(*Error).Code != codeSecretValue {
+		t.Errorf("userinfo after text with no-break spaces must be refused, got %v", err)
+	}
+	if p, err := Parse([]byte(mixed), Options{}); err != nil || strings.Contains(string(p.Canonical), "carol") || !strings.Contains(string(p.Canonical), "bob@x.example") {
+		t.Errorf("only the userinfo must be removed: %v %s", err, p.Canonical)
+	}
+	// Nor in a template, after its first slash.
+	for _, url := range []string{"{base}/users/@alice/sse", "{base}/a//b@c/sse", "{scheme}://mcp.example.com/a//b@c"} {
+		ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0","remotes":[{"type":"sse","url":"` + url + `",
+			"variables":{"base":{"default":"https://mcp.example.com"},"scheme":{"default":"https"}}}]}`
+		p, err := Parse([]byte(ok), Options{Strict: true})
+		if err != nil || !strings.Contains(string(p.Canonical), url) {
+			t.Fatalf("%s: a template path may contain @: %v", url, err)
+		}
+	}
+}
+
+func TestCredentialsByVariableNameAndQueryParameter(t *testing.T) {
+	const secret = "live-secret-0123456789"
+	docs := map[string]string{
+		// In a variables object the key is the input's name.
+		"variable key": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://{tenant}.example.com/sse","variables":{"API_TOKEN":{"default":"` + secret + `"}}}]}`,
+		"nested variable key": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse","headers":[{"name":"X-Trace","value":"{t}",
+			"variables":{"t":{"variables":{"db_password":{"value":"` + secret + `"}}}}}]}]}`,
+		// What is substituted into a credential is a credential.
+		"variable of a secret header": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse","headers":[{"name":"Authorization","isSecret":true,
+			"value":"Bearer {key}","variables":{"key":{"default":"` + secret + `"}}}]}]}`,
+		"nested variable of a credential by name": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"stdio"},"environmentVariables":[{"name":"API_KEY",
+			"value":"{a}","variables":{"a":{"value":"{b}","variables":{"b":{"value":"` + secret + `"}}}}}]}]}`,
+		"variable of a credential parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?api_key={key}","variables":{"key":{"default":"` + secret + `"}}}]}`,
+		"variable of a fragment credential": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"x-app":{"url":"https://app.example.com/start#access_token={t}","variables":{"t":{"value":"{u}","variables":{"u":{"default":"` + secret + `"}}}}},
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"variable in the userinfo of a template": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}],
+			"x-source":{"url":"{scheme}//{who}@git.example/w","variables":{"scheme":{"default":"https:"},"who":{"default":"` + secret + `"}}}}`,
+		"variable in the userinfo": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"sse","url":"http://localhost:{port}/sse",
+			"variables":{"port":{"default":"3000"}}}}],
+			"x-source":{"url":"https://{who}@git.example/w","variables":{"who":{"default":"` + secret + `"}}},
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		// An argument is named by its flag.
+		"flag named like a credential": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"stdio"},
+			"packageArguments":[{"type":"named","name":"--cookie","value":"sid=` + secret + `"}]}]}`,
+		"authorization flag with a variable": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"npm","identifier":"w","transport":{"type":"stdio"},
+			"runtimeArguments":[{"type":"named","name":"--authorization","value":"Bearer {k}","variables":{"k":{"default":"` + secret + `"}}}]}]}`,
+		"query parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?region=eu&api_key=` + secret + `"}]}`,
+		// A package identifier is a download URL for some package types.
+		"package identifier": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"https://downloads.example/tool.mcpb?api_key=` + secret + `","transport":{"type":"stdio"}}]}`,
+		"url in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-mirrors":["https://u:` + secret + `@mirror.example/w"],
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"user name with an at sign": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"https://alice@example.org:` + secret + `@downloads.example/w.mcpb","transport":{"type":"stdio"}}]}`,
+		"scheme-relative": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"packages":[{"registryType":"mcpb","identifier":"//user:` + secret + `@downloads.example/w.mcpb","transport":{"type":"stdio"}}]}`,
+		"scheme-relative in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-mirror":"//u:` + secret + `@mirror.example/w",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"compound scheme": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-db":"jdbc:postgresql://app:` + secret + `@db.example/w",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"fragment parameter": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"websiteUrl":"https://example.com/app#access_token=` + secret + `&state=1",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"template scheme": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{scheme}://user:` + secret + `@mcp.example.com/sse","variables":{"scheme":{"default":"https"}}}]}`,
+		// A remote URL may be a template; it is still a URL.
+		"template url": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"{base}/mcp?api_key=` + secret + `","variables":{"base":{"default":"https://mcp.example.com"}}}]}`,
+		"template in an unknown member": `{"name":"io.github.alice/w","description":"d","version":"1.0.0","x-alt":"{base}/mcp?access_token=` + secret + `",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse"}]}`,
+		"encoded query name": `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+			"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?access%5Ftoken=` + secret + `"}]}`,
+	}
+	for name, doc := range docs {
+		if _, err := Parse([]byte(doc), Options{Strict: true}); err == nil || err.(*Error).Code != codeSecretValue {
+			t.Errorf("%s: strict must refuse the credential, got %v", name, err)
+		} else if strings.Contains(err.Error(), secret) {
+			t.Errorf("%s: the error repeats the credential", name)
+		}
+		p, err := Parse([]byte(doc), Options{})
+		if err != nil {
+			t.Errorf("%s: lenient: %v", name, err)
+			continue
+		}
+		if strings.Contains(string(p.Canonical), secret) {
+			t.Errorf("%s: lenient must remove the credential: %s", name, p.Canonical)
+		}
+		if _, err := Parse(p.Canonical, Options{Strict: true}); err != nil {
+			t.Errorf("%s: what lenient stores must pass strict: %v", name, err)
+		}
+	}
+	// Fragments and parameters that are not credentials survive unchanged.
+	plain := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"websiteUrl":"https://example.com/docs?lang=en#install",
+		"remotes":[{"type":"sse","url":"https://mcp.example.com/sse#"}]}`
+	if p, err := Parse([]byte(plain), Options{}); err != nil || !strings.Contains(string(p.Canonical), "docs?lang=en#install") ||
+		!strings.Contains(string(p.Canonical), `"https://mcp.example.com/sse#"`) {
+		t.Fatalf("ordinary URLs must not be rewritten: %v", err)
+	}
+	// Variables used elsewhere in a URL are not credentials.
+	host := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"remotes":[{"type":"sse","url":"https://{tenant}.example.com/sse?region={region}&api_key={key}",
+		"variables":{"tenant":{"default":"acme"},"region":{"default":"eu"},"key":{"description":"Your key","isSecret":true}}}]}`
+	if p, err := Parse([]byte(host), Options{Strict: true}); err != nil || !strings.Contains(string(p.Canonical), `"default":"acme"`) ||
+		!strings.Contains(string(p.Canonical), `"default":"eu"`) {
+		t.Fatalf("variables outside credential positions must keep their defaults: %v", err)
+	}
+	// A variable of an input that is not a credential keeps its default.
+	region := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"remotes":[{"type":"sse","url":"https://mcp.example.com/sse","headers":[{"name":"X-Region","value":"{region}",
+		"variables":{"region":{"default":"eu-west-1"}}}]}]}`
+	if p, err := Parse([]byte(region), Options{Strict: true}); err != nil || !strings.Contains(string(p.Canonical), "eu-west-1") {
+		t.Fatalf("variables of ordinary inputs must pass: %v", err)
+	}
+	// Placeholders and ordinary parameters are untouched.
+	ok := `{"name":"io.github.alice/w","description":"d","version":"1.0.0",
+		"remotes":[{"type":"sse","url":"https://mcp.example.com/sse?api_key={key}&max_tokens=4096&region=eu",
+		"variables":{"key":{"description":"Your key","isSecret":true},"region":{"default":"eu"}}}]}`
+	p, err := Parse([]byte(ok), Options{Strict: true})
+	if err != nil || !strings.Contains(string(p.Canonical), "api_key={key}&max_tokens=4096&region=eu") {
+		t.Fatalf("placeholders and ordinary parameters must pass: %v", err)
+	}
+}
+
+// The userinfo of text that only looks like a URL has no white space, and
+// white space is the same thing everywhere this package asks about it.
+func TestUserinfoTokenHasNoWhiteSpace(t *testing.T) {
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if r >= 0xD800 && r <= 0xDFFF {
+			continue
+		}
+		switch r {
+		case '/', '?', '#', '@':
+			continue
+		}
+		got := userinfoTokenRe.MatchString("//a" + string(r) + "b@host")
+		if want := !unicode.IsSpace(r); got != want {
+			t.Fatalf("%U: userinfo matched = %v, want %v", r, got, want)
+		}
+	}
+}

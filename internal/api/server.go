@@ -12,10 +12,13 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/ratelimit"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/registry"
 )
 
@@ -27,6 +30,23 @@ type Server struct {
 	AllowAnonRead  bool
 	MaxUploadBytes int64
 	Log            *slog.Logger
+
+	// Per-client limits; nil limiters allow everything.
+	ReadLimit    *ratelimit.Limiter
+	WriteLimit   *ratelimit.Limiter
+	ForwardLimit *ratelimit.Limiter
+	// AuthFailLimit bounds failed authentications per client address, so
+	// guessing tokens cannot turn into unlimited database lookups.
+	AuthFailLimit *ratelimit.Limiter
+	// Clients resolves client addresses behind trusted proxies.
+	Clients ratelimit.ClientAddr
+	// UI serves the built-in web pages when enabled.
+	UI bool
+	// SecureCookies marks the UI session cookie Secure (https deployments).
+	SecureCookies bool
+	// Background is the lifetime of work started by a request but finished
+	// after it (asynchronous syncs); nil means context.Background().
+	Background context.Context
 }
 
 const maxJSONBody = 64 << 10
@@ -54,7 +74,55 @@ func (s *Server) Handler() http.Handler {
 		outer.HandleFunc("GET /healthz", s.healthz)
 		h = outer
 	}
-	return s.recoverer(s.headers(s.logger(s.authenticate(h))))
+	return s.recoverer(s.headers(s.logger(s.wellFormed(s.authenticate(s.limit(h))))))
+}
+
+// storable reports whether text can be used in a lookup or stored as it is:
+// valid UTF-8 without NUL (PostgreSQL text accepts neither).
+func storable(text string) bool {
+	return utf8.ValidString(text) && !strings.ContainsRune(text, 0)
+}
+
+// wellFormed refuses requests whose path or query carry text that no entry
+// can have (invalid UTF-8, NUL), before it reaches a lookup. Every store
+// then answers such a request the same way.
+func (s *Server) wellFormed(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ok := storable(r.URL.Path)
+		for key, values := range r.URL.Query() {
+			ok = ok && storable(key)
+			for _, v := range values {
+				ok = ok && storable(v)
+			}
+		}
+		if !ok {
+			s.reject(w, r, &registry.Error{Status: http.StatusBadRequest, Code: "invalid_request", Msg: "path and query must be valid UTF-8 without NUL"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// hasNUL reports whether a decoded JSON value has a NUL in any string or
+// object key.
+func hasNUL(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.ContainsRune(t, 0)
+	case []any:
+		for _, item := range t {
+			if hasNUL(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range t {
+			if strings.ContainsRune(key, 0) || hasNUL(item) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) routes(m *http.ServeMux) {
@@ -93,6 +161,12 @@ func (s *Server) routes(m *http.ServeMux) {
 	m.HandleFunc("PUT /v1/admin/skills/{ns}/{name}/alias", s.admin(s.setAlias))
 	m.HandleFunc("POST /v1/admin/skills/{ns}/{name}/versions/{version}/approve-license", s.admin(s.approveLicense))
 	m.HandleFunc("GET /v1/admin/audit", s.admin(s.listAudit))
+
+	s.mcpRoutes(m)
+	s.adminRoutes(m)
+	if s.UI {
+		s.uiRoutes(m)
+	}
 }
 
 // --- middleware ---
@@ -159,23 +233,54 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hdr := r.Header.Get("Authorization")
 		if hdr == "" {
+			// The built-in pages (and only they) authenticate by session
+			// cookie. A stale cookie means "signed out", not an error.
+			if s.isUIPath(r) {
+				if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+					// Guarded like a bearer token: a forged cookie is a
+					// guessed token.
+					addr := ratelimit.Key(s.Clients.From(r))
+					if over, _ := s.AuthFailLimit.Exhausted(addr); !over {
+						p, err := s.Auth.Authenticate(r.Context(), c.Value)
+						switch {
+						case err == nil:
+							r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, p))
+						case errors.Is(err, auth.ErrInvalidToken):
+							s.AuthFailLimit.Allow(addr)
+						}
+					}
+				}
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
 		scheme, tok, ok := strings.Cut(hdr, " ")
 		if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(tok) == "" {
-			writeError(w, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid authorization header"})
+			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid authorization header"})
+			return
+		}
+		// Rate limits are per subject and so apply after authentication.
+		// Before it, only failures are counted, by address. An address that
+		// keeps presenting bad tokens is refused without a lookup until its
+		// failures age out; that includes requests with a good token from
+		// the same address, which is the price of not doing the lookup.
+		addr := ratelimit.Key(s.Clients.From(r))
+		if over, wait := s.AuthFailLimit.Exhausted(addr); over {
+			s.reject(w, r, tooManyRequests(wait))
 			return
 		}
 		p, err := s.Auth.Authenticate(r.Context(), strings.TrimSpace(tok))
 		if err != nil {
+			if errors.Is(err, auth.ErrInvalidToken) {
+				s.AuthFailLimit.Allow(addr)
+			}
 			if !errors.Is(err, auth.ErrInvalidToken) {
 				s.Log.Error("authentication backend error", "err", err.Error())
-				writeError(w, &registry.Error{Status: http.StatusServiceUnavailable, Code: "unavailable", Msg: "authentication unavailable"})
+				s.reject(w, r, &registry.Error{Status: http.StatusServiceUnavailable, Code: "unavailable", Msg: "authentication unavailable"})
 				return
 			}
 			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-			writeError(w, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid or expired token"})
+			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid or expired token"})
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, p)))
@@ -188,7 +293,7 @@ func (s *Server) read(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !principal(r).Authenticated && !s.AllowAnonRead {
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeError(w, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "authentication required"})
+			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "authentication required"})
 			return
 		}
 		h(w, r)
@@ -230,6 +335,9 @@ func writeError(w http.ResponseWriter, e *registry.Error) {
 	if e.SourceURL != "" {
 		body["source_url"] = e.SourceURL
 	}
+	if e.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
+	}
 	writeJSON(w, e.Status, map[string]any{"error": body})
 }
 
@@ -246,14 +354,23 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(strings.ToLower(ct), "application/json") {
 		return &registry.Error{Status: http.StatusUnsupportedMediaType, Code: "content_type", Msg: "expected application/json"}
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxJSONBody))
+	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			return &registry.Error{Status: http.StatusRequestEntityTooLarge, Code: "body_too_large", Msg: "request body too large"}
 		}
+		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "request body could not be read"}
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
 		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "invalid JSON body: " + sanitizeJSONErr(err)}
+	}
+	// No field of any request holds a NUL, and PostgreSQL text cannot.
+	var generic any
+	if json.Unmarshal(body, &generic) == nil && hasNUL(generic) {
+		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "strings must not contain NUL"}
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return &registry.Error{Status: http.StatusBadRequest, Code: "invalid_json", Msg: "request body must contain a single JSON object"}
