@@ -1,0 +1,245 @@
+name: Images and Artifacts
+
+# Release versions follow the OpenLinker parent repository: its formal
+# release tags the commit it pins here with the same v* tag, and that tag
+# starts this workflow. A manual run publishes only the image, tagged with
+# the commit, and keeps the binaries as workflow artifacts.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: openlinker-registry
+  PLATFORMS: linux/amd64,linux/arm64
+  GOWORK: "off"
+
+jobs:
+  verify:
+    name: Verify the release commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    env:
+      REGISTRY_TEST_DATABASE_URL: postgres://registry:registry@localhost:5432/registry_test?sslmode=disable
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: registry_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U registry -d registry_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve the version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="sha-${GITHUB_SHA::12}"
+          prerelease=false
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+            # The same shape the parent repository accepts for a release tag.
+            if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "not a release tag: ${version}" >&2
+              exit 1
+            fi
+            if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              prerelease=true
+            fi
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (with Postgres)
+        run: go test -count=1 -race ./...
+
+  build-image:
+    name: Build image
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image metadata
+        id: meta
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          short_sha="${GITHUB_SHA::12}"
+          image="${REGISTRY}/${owner}/${IMAGE_NAME}"
+
+          {
+            echo "image=${image}"
+            echo "short_sha=${short_sha}"
+            echo "tags<<EOF"
+            # The parent repository resolves this image by its commit tag.
+            echo "${image}:sha-${short_sha}"
+            if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+              echo "${image}:${VERSION}"
+              if [[ "${PRERELEASE}" != "true" ]]; then
+                echo "${image}:latest"
+              fi
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            REGISTRY_VERSION=${{ needs.verify.outputs.version }}
+            REGISTRY_COMMIT=${{ github.sha }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+          cache-from: type=gha,scope=${{ env.IMAGE_NAME }}
+          cache-to: type=gha,scope=${{ env.IMAGE_NAME }},mode=max
+
+      - name: Inspect pushed manifest
+        shell: bash
+        run: docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short_sha }}"
+
+  package-binaries:
+    name: Package ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Package binary
+        id: package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET_GOOS: ${{ matrix.goos }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+        shell: bash
+        run: bash ./scripts/package-release.sh "${VERSION}" "${GITHUB_SHA}" "${TARGET_GOOS}" "${TARGET_GOARCH}" dist
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact_base }}
+          path: |
+            dist/${{ steps.package.outputs.artifact_base }}.*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Publish GitHub release artifacts
+    if: github.ref_type == 'tag'
+    needs:
+      - verify
+      - build-image
+      - package-binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: openlinker-registry-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            flags=(--title "${tag}" --generate-notes --verify-tag)
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              flags+=(--prerelease --latest=false)
+            fi
+            gh release create "${tag}" "${flags[@]}"
+          fi
+          gh release upload "${tag}" dist/* --clobber

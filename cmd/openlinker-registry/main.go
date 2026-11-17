@@ -4,16 +4,19 @@
 //
 //	openlinker-registry [flags]          serve (default)
 //	openlinker-registry migrate [flags]  apply database migrations and exit
+//	openlinker-registry version          print the version and exit
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -29,15 +32,54 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/safehttp"
 )
 
+// version and commit are set by release builds:
+//
+//	-ldflags "-X main.version=v1.2.3 -X main.commit=<full commit>"
+//
+// A release version is the tag the OpenLinker parent repository gave this
+// repository; any other build says "dev".
+var (
+	version = "dev"
+	commit  = ""
+)
+
+// buildCommit is the commit a release build was stamped with, else the one
+// the Go toolchain recorded when it built from a checkout, else "".
+func buildCommit() string {
+	if commit != "" {
+		return commit
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				return s.Value
+			}
+		}
+	}
+	return ""
+}
+
+func versionLine() string {
+	if c := buildCommit(); c != "" {
+		return "openlinker-registry " + version + " (" + c + ")"
+	}
+	return "openlinker-registry " + version
+}
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	if err := run(os.Args[1:], log); err != nil {
+	if err := run(os.Args[1:], log, os.Stdout); err != nil {
 		log.Error("fatal", "err", err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(args []string, log *slog.Logger) error {
+func run(args []string, log *slog.Logger, stdout io.Writer) error {
+	// Answered before the configuration is read: it needs no database.
+	if len(args) == 1 && (args[0] == "version" || args[0] == "--version" || args[0] == "-version") {
+		_, err := fmt.Fprintln(stdout, versionLine())
+		return err
+	}
 	migrateOnly := len(args) > 0 && args[0] == "migrate"
 	if migrateOnly || (len(args) > 0 && args[0] == "serve") {
 		args = args[1:]
@@ -131,7 +173,8 @@ func run(args []string, log *slog.Logger) error {
 	}
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", cfg.Listen, "base_path", cfg.BasePath, "mode", cfg.Mode, "ui", cfg.UI)
+		log.Info("listening", "addr", cfg.Listen, "base_path", cfg.BasePath, "mode", cfg.Mode, "ui", cfg.UI,
+			"version", version, "commit", buildCommit())
 		errc <- hs.ListenAndServe()
 	}()
 	select {

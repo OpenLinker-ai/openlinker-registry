@@ -27,7 +27,8 @@ the official MCP Registry read API under `/v0.1` (and `/v0`).
 The same binary serves a public instance (anonymous reads) and private
 deployments (authenticated reads by default, with built-in web pages).
 
-> Status: source only. Not released. See [Not included](#not-included).
+> Status: releases follow the OpenLinker parent repository's version tags; see
+> [Releases](#releases). See also [Not included](#not-included).
 
 ## Quick start (private instance)
 
@@ -126,6 +127,32 @@ Secrets are read from the environment only.
 | `REGISTRY_RATE_LIMIT_READ` / `_WRITE` / `_FORWARD` | flags | 600 / 60 / 30 | Requests per client per minute: reads, writes, and misses forwarded to upstreams (`0` = unlimited). Clients are the token subject, or the address when anonymous. Limits are per process |
 | `REGISTRY_RATE_LIMIT_AUTH_FAILURES` | `-rate-limit-auth-failures` | 30 | Failed authentications per client address per minute. An address over the limit is refused without a token lookup until its failures age out, requests with a valid token included |
 | `REGISTRY_TRUSTED_PROXIES` | `-trusted-proxies` | empty | Reverse proxies whose `X-Forwarded-For` identifies the client |
+
+## Releases
+
+This repository does not choose its own version numbers. A formal release of
+the OpenLinker parent repository tags the commit it pins here with the same
+`v*` tag, and that tag starts `.github/workflows/release.yml`, which:
+
+1. runs gofmt, `go vet` and the test suite (with PostgreSQL) on the tagged
+   commit, and publishes nothing if they fail;
+2. pushes a `linux/amd64` + `linux/arm64` image to
+   `ghcr.io/openlinker-ai/openlinker-registry`, tagged `sha-<first 12 of the
+   commit>` and the release tag; `latest` moves only for a tag without a
+   pre-release suffix;
+3. attaches archives for Linux, macOS and Windows (amd64 and arm64), each
+   with a `.sha256` file, to a GitHub release of the same tag. A tag with a
+   suffix (`v1.2.3-rc.1`) is published as a pre-release.
+
+```sh
+openlinker-registry version   # openlinker-registry v1.2.3 (<commit>)
+```
+
+A build that is not a release says `dev`; the `listening` log line carries
+the same version and commit. Running the workflow by hand publishes only the
+`sha-` image and keeps the archives as workflow artifacts. The Releases page
+and the package list of this repository show what has actually been
+published.
 
 ## API summary
 
