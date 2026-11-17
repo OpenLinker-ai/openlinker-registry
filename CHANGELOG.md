@@ -15,8 +15,8 @@ No version has been released yet. `main` contains:
   official MCP Registry read API under `/v0.1` and `/v0`. A document carrying
   a literal secret value is rejected.
 - Upstreams (pull only): forwarding to and mirroring of other
-  openlinker-registry instances, the official MCP Registry and discovery
-  indexes. Mirrored skill content is verified against its recorded digests
+  openlinker-registry instances and the official MCP Registry, plus
+  mirroring of discovery indexes. Mirrored skill content is verified against its recorded digests
   before it is served; upstream MCP documents are validated and have
   credentials removed, and their digest is computed by this registry.
 - Read, write and forwarding rate limits, counted per token subject for
