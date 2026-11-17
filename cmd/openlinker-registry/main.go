@@ -36,8 +36,8 @@ import (
 //
 //	-ldflags "-X main.version=v1.2.3 -X main.commit=<full commit>"
 //
-// A release version is the tag the OpenLinker parent repository gave this
-// repository; any other build says "dev".
+// A release version is the v* tag the release was cut from (see RELEASE.md);
+// an ordinary local build says "dev".
 var (
 	version = "dev"
 	commit  = ""

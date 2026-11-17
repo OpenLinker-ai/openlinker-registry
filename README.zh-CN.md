@@ -3,7 +3,7 @@
 独立的 Agent Skill 与 MCP 服务仓库。一个二进制、一个 PostgreSQL 数据库、一个存放内容的目录。
 完整的配置表、接口表和规则见 [README.md](README.md)（英文），本页是中文概览。
 
-> 状态：版本号跟随 OpenLinker 主仓库的正式版本 tag，见[发布](#发布)。未包含的功能见文末。
+> 状态：本仓库自己维护版本号，见[发布](#发布)和 [CHANGELOG.md](CHANGELOG.md)。未包含的功能见文末。
 
 ## 它做什么
 
@@ -84,20 +84,21 @@ curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
 
 ## 发布
 
-本仓库不自己定版本号。OpenLinker 主仓库发布正式版本时，会给它固定的本仓库提交打上同名的 `v*` tag；
-如果该提交已经带有更早版本的 `v*` tag（本仓库没有变化），就不再打新 tag，沿用已有的 tag、镜像和归档。
-新推送的 tag 触发 `.github/workflows/release.yml`：
+本仓库自己维护版本号，和 OpenLinker 的其他组件仓库一样。向本仓库推送一个 `v*` tag 就是一次发布，
+它触发 `.github/workflows/release.yml`：
 
 1. 先在该提交上跑 gofmt、`go vet` 和测试（含 PostgreSQL），不通过就什么都不发布。
 2. 推送 `linux/amd64` 与 `linux/arm64` 镜像到 `ghcr.io/openlinker-ai/openlinker-registry`，标签是
    `sha-<提交前 12 位>` 和版本 tag；只有不带预发布后缀的 tag 才会移动 `latest`。
 3. 把 Linux、macOS、Windows（amd64 与 arm64）的归档和各自的 `.sha256` 文件挂到同名的 GitHub release；
-   带后缀的 tag（如 `v1.2.3-rc.1`）发布为预发布版。
+   带后缀的 tag（如 `v0.1.0-rc.1`）发布为预发布版。
 
 `openlinker-registry version` 打印版本和提交。普通的本地构建（`make build`、`docker build`）显示 `dev`。
 只有 tag 推送才算发布：手动运行工作流（无论在分支还是 tag 上）只推送 `sha-` 镜像，归档留作工作流产物，
-两者的版本都是 `sha-<提交前 12 位>`；CI 冒烟打的归档版本是 `ci`。实际发布过哪些版本，以本仓库的
-Releases 页面和镜像列表为准。
+两者的版本都是 `sha-<提交前 12 位>`；CI 冒烟打的归档版本是 `ci`。
+
+发布前的检查清单，以及固定本仓库提交的 OpenLinker 主仓库与这些 tag 的关系，见 [RELEASE.md](RELEASE.md)
+（英文）。实际发布过哪些版本，以 [CHANGELOG.md](CHANGELOG.md)、本仓库的 Releases 页面和镜像列表为准。
 
 ## 未包含
 

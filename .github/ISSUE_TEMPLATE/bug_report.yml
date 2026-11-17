@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a reproducible openlinker-registry bug.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API tokens, upstream tokens, Authorization headers, database URLs, private URLs, private registry content, or vulnerability details. Use SECURITY.md for security reports.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest reproducible sequence with sanitized inputs.
+      placeholder: |
+        1. Start the registry with ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the HTTP status and the sanitized response body.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Registry version or commit
+      description: Output of `openlinker-registry version`, the image tag, or the commit SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration
+      description: Instance mode, base path, whether a reverse proxy is in front, and the kind of upstream involved. No secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, PostgreSQL version, and how the registry runs (binary, image, built from source).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Relevant registry log lines. Remove credentials and private content completely.
+    validations:
+      required: false

@@ -1,11 +1,14 @@
 name: Images and Artifacts
 
-# Release versions follow the OpenLinker parent repository: its formal
-# release tags the commit it pins here with the same v* tag (unless the
-# commit already has a v* tag from an earlier release), and that tag push
-# starts this workflow. Only a tag push is a release. A manual run, on a
-# branch or on a tag, publishes only the image tagged with the commit and
-# keeps the binaries as workflow artifacts; it is stamped "sha-<commit>".
+# The registry has its own version numbers. A release is a v* tag pushed to
+# this repository; see RELEASE.md. Only a tag push is a release. A manual
+# run, on a branch or on a tag, publishes only the image tagged with the
+# commit and keeps the binaries as workflow artifacts; it is stamped
+# "sha-<commit>".
+#
+# The OpenLinker parent repository tags a pinned commit here with its own
+# version only when that commit carries no v* tag yet; RELEASE.md says how to
+# keep this repository's version line.
 
 on:
   workflow_dispatch:
@@ -64,7 +67,7 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
             release=true
             version="${GITHUB_REF_NAME}"
-            # The same shape the parent repository accepts for a release tag.
+            # A semantic version, optionally with a pre-release suffix.
             if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
               echo "not a release tag: ${version}" >&2
               exit 1
@@ -135,7 +138,7 @@ jobs:
             echo "image=${image}"
             echo "short_sha=${short_sha}"
             echo "tags<<EOF"
-            # The parent repository resolves this image by its commit tag.
+            # A commit tag, so a deployment can pin the image of an exact commit.
             echo "${image}:sha-${short_sha}"
             if [[ "${RELEASE}" == "true" ]]; then
               echo "${image}:${VERSION}"
