@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest a change that fits the openlinker-registry boundary.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operator, publisher or client problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the endpoint, setting, or behavior you want.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope fit
+      options:
+        - Hosted skills
+        - MCP servers
+        - Discovery indexes or the MCP Registry API
+        - Upstreams (forwarding, mirroring)
+        - Visibility, tokens, namespaces or roles
+        - Rate limits or reverse proxies
+        - Built-in pages
+        - Packaging or release
+        - Documentation
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    id: risks
+    attributes:
+      label: Compatibility, migration, or security impact
+      description: Note any API, stored-data, database-migration, visibility or credential-handling impact.
+    validations:
+      required: false

@@ -27,8 +27,8 @@ the official MCP Registry read API under `/v0.1` (and `/v0`).
 The same binary serves a public instance (anonymous reads) and private
 deployments (authenticated reads by default, with built-in web pages).
 
-> Status: releases follow the OpenLinker parent repository's version tags; see
-> [Releases](#releases). See also [Not included](#not-included).
+> Status: the registry has its own version numbers; see [Releases](#releases)
+> and [CHANGELOG.md](CHANGELOG.md). See also [Not included](#not-included).
 
 ## Quick start (private instance)
 
@@ -130,12 +130,9 @@ Secrets are read from the environment only.
 
 ## Releases
 
-This repository does not choose its own version numbers. A formal release of
-the OpenLinker parent repository tags the commit it pins here with the same
-`v*` tag, unless that commit already carries a `v*` tag from an earlier
-release: an unchanged registry keeps its existing tag, image and archives and
-gets no new ones. A newly pushed tag starts `.github/workflows/release.yml`,
-which:
+The registry has its own version numbers, as the other OpenLinker component
+repositories do. A release is a `v*` tag pushed to this repository; the push
+starts `.github/workflows/release.yml`, which:
 
 1. runs gofmt, `go vet` and the test suite (with PostgreSQL) on the tagged
    commit, and publishes nothing if they fail;
@@ -145,10 +142,10 @@ which:
    pre-release suffix;
 3. attaches archives for Linux, macOS and Windows (amd64 and arm64), each
    with a `.sha256` file, to a GitHub release of the same tag. A tag with a
-   suffix (`v1.2.3-rc.1`) is published as a pre-release.
+   suffix (`v0.1.0-rc.1`) is published as a pre-release.
 
 ```sh
-openlinker-registry version   # openlinker-registry v1.2.3 (<commit>)
+openlinker-registry version   # openlinker-registry v0.1.0 (<commit>)
 ```
 
 The `listening` log line carries the same version and commit. An ordinary
@@ -156,8 +153,12 @@ local build (`make build`, `docker build`) says `dev`. Only a tag push is a
 release: running the workflow by hand, on a branch or on a tag, publishes
 only the `sha-` image and keeps the archives as workflow artifacts, both
 stamped `sha-<first 12 of the commit>`; the archive CI packages as a smoke
-test is stamped `ci`. The Releases page and the package list of this
-repository show what has actually been published.
+test is stamped `ci`.
+
+[RELEASE.md](RELEASE.md) has the checklist and explains how the OpenLinker
+parent repository, which pins a commit of this repository, relates to these
+tags. [CHANGELOG.md](CHANGELOG.md), the Releases page and the package list of
+this repository show what has actually been published.
 
 ## API summary
 
