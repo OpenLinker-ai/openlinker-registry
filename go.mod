@@ -1,6 +1,6 @@
 module github.com/OpenLinker-ai/openlinker-registry
 
-go 1.26
+go 1.27
 
 require (
 	github.com/jackc/pgx/v5 v5.13.0

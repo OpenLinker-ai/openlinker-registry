@@ -4,7 +4,19 @@ The registry has its own version numbers; see [RELEASE.md](./RELEASE.md).
 
 ## Unreleased
 
-Nothing since `v0.1.0-rc.1`.
+Nothing since `v0.1.0`.
+
+## v0.1.0 — 2026-11-18
+
+The first formal release. The registry behaves as in `v0.1.0-rc.1`; the
+changes since then are to how it is built:
+
+- Built with Go 1.27: `go.mod` now requires it, so the image
+  (`golang:1.27-bookworm`), the release archives and CI all use the same Go
+  release. In `v0.1.0-rc.1` everything was built with Go 1.26.
+- `github.com/jackc/pgx/v5` 5.13.0 (was 5.12.0).
+- Workflows use `actions/checkout@v7` and, in CI as already in the release
+  workflow, `actions/setup-go@v7`.
 
 ## v0.1.0-rc.1 — 2026-11-17
 
