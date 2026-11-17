@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 ENV GOWORK=off CGO_ENABLED=0
 COPY go.mod go.sum ./
