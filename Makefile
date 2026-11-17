@@ -2,11 +2,14 @@
 export GOWORK := off
 
 BIN := bin/openlinker-registry
+# Release builds set VERSION to the release tag; see .github/workflows/release.yml.
+VERSION ?= dev
+COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
 
 .PHONY: build test test-pg vet fmt check docker clean
 
 build:
-	go build -trimpath -o $(BIN) ./cmd/openlinker-registry
+	go build -trimpath -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT)" -o $(BIN) ./cmd/openlinker-registry
 
 test:
 	go test ./...
@@ -29,7 +32,7 @@ check:
 	go test ./...
 
 docker:
-	docker build -t openlinker-registry:dev .
+	docker build --build-arg REGISTRY_VERSION=$(VERSION) --build-arg REGISTRY_COMMIT=$(COMMIT) -t openlinker-registry:dev .
 
 clean:
 	rm -f $(BIN)

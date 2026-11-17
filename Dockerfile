@@ -5,7 +5,13 @@ ENV GOWORK=off CGO_ENABLED=0
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -trimpath -ldflags="-s -w" -o /out/openlinker-registry ./cmd/openlinker-registry
+# Release builds pass the version tag and the full commit; a plain
+# "docker build" says "dev".
+ARG REGISTRY_VERSION=dev
+ARG REGISTRY_COMMIT=
+RUN go build -trimpath \
+    -ldflags="-s -w -X main.version=${REGISTRY_VERSION} -X main.commit=${REGISTRY_COMMIT}" \
+    -o /out/openlinker-registry ./cmd/openlinker-registry
 # The runtime image has no shell, so the data directory is prepared here.
 RUN mkdir -p /out/data
 

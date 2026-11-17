@@ -42,3 +42,9 @@ jobs:
         run: go test -count=1 -race ./...
       - name: build
         run: go build ./cmd/openlinker-registry
+      # The release workflow packages with this script; keep it working.
+      - name: package (release path smoke)
+        run: |
+          archive="$(bash ./scripts/package-release.sh ci "${GITHUB_SHA}" linux amd64 "${RUNNER_TEMP}/dist")"
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/openlinker-registry-ci-linux-amd64/openlinker-registry" version | grep -Fx "openlinker-registry ci (${GITHUB_SHA})"

@@ -1,0 +1,5 @@
+# Nothing from the checkout's git data or CI configuration belongs in a build
+# context: a checkout may hold credentials there, and build layers are cached.
+.git
+.github
+bin
