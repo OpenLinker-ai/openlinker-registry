@@ -93,7 +93,9 @@ curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
 3. 把 Linux、macOS、Windows（amd64 与 arm64）的归档和各自的 `.sha256` 文件挂到同名的 GitHub release；
    带后缀的 tag（如 `v1.2.3-rc.1`）发布为预发布版。
 
-`openlinker-registry version` 打印版本和提交；非发布构建显示 `dev`。实际发布过哪些版本，以本仓库的
+`openlinker-registry version` 打印版本和提交。普通的本地构建（`make build`、`docker build`）显示 `dev`。
+只有 tag 推送才算发布：手动运行工作流（无论在分支还是 tag 上）只推送 `sha-` 镜像，归档留作工作流产物，
+两者的版本都是 `sha-<提交前 12 位>`；CI 冒烟打的归档版本是 `ci`。实际发布过哪些版本，以本仓库的
 Releases 页面和镜像列表为准。
 
 ## 未包含

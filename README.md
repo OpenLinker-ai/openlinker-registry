@@ -148,11 +148,13 @@ the OpenLinker parent repository tags the commit it pins here with the same
 openlinker-registry version   # openlinker-registry v1.2.3 (<commit>)
 ```
 
-A build that is not a release says `dev`; the `listening` log line carries
-the same version and commit. Running the workflow by hand publishes only the
-`sha-` image and keeps the archives as workflow artifacts. The Releases page
-and the package list of this repository show what has actually been
-published.
+The `listening` log line carries the same version and commit. An ordinary
+local build (`make build`, `docker build`) says `dev`. Only a tag push is a
+release: running the workflow by hand, on a branch or on a tag, publishes
+only the `sha-` image and keeps the archives as workflow artifacts, both
+stamped `sha-<first 12 of the commit>`; the archive CI packages as a smoke
+test is stamped `ci`. The Releases page and the package list of this
+repository show what has actually been published.
 
 ## API summary
 
