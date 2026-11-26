@@ -265,19 +265,20 @@ func runGateway(t *testing.T, newStore func(t *testing.T) store.Store) {
 				a.Iat = time.Now().Add(-100 * time.Second)
 				a.Exp = time.Now().Add(-40 * time.Second)
 			},
-			"future":         func(a *Assertion) { a.Iat = time.Now().Add(40 * time.Second); a.Exp = time.Now().Add(90 * time.Second) },
-			"too long":       func(a *Assertion) { a.Exp = a.Iat.Add(61 * time.Second) },
-			"exp before iat": func(a *Assertion) { a.Exp = a.Iat },
-			"method":         func(a *Assertion) { a.M = "POST" },
-			"target":         func(a *Assertion) { a.T = "/registry/v1/skills?q=x" },
-			"body hash":      func(a *Assertion) { a.BH = BodyHash([]byte("x")) },
-			"no read act":    func(a *Assertion) { a.Act = []string{"import"} },
-			"no subject":     func(a *Assertion) { a.Sub = "" },
-			"bad subject":    func(a *Assertion) { a.Sub = "root" },
-			"bad github id":  func(a *Assertion) { a.GH = "0x1" },
-			"short jti":      func(a *Assertion) { a.Jti = "abc" },
-			"alg":            func(a *Assertion) { a.Alg = "none" },
-			"typ":            func(a *Assertion) { a.Typ = "JWT" },
+			"future":          func(a *Assertion) { a.Iat = time.Now().Add(40 * time.Second); a.Exp = time.Now().Add(90 * time.Second) },
+			"too long":        func(a *Assertion) { a.Exp = a.Iat.Add(61 * time.Second) },
+			"exp before iat":  func(a *Assertion) { a.Exp = a.Iat },
+			"method":          func(a *Assertion) { a.M = "POST" },
+			"target":          func(a *Assertion) { a.T = "/registry/v1/skills?q=x" },
+			"body hash":       func(a *Assertion) { a.BH = BodyHash([]byte("x")) },
+			"no read act":     func(a *Assertion) { a.Act = []string{"import"} },
+			"no subject":      func(a *Assertion) { a.Sub = "" },
+			"bad subject":     func(a *Assertion) { a.Sub = "root" },
+			"bad github id":   func(a *Assertion) { a.GH = "0x1" },
+			"github overflow": func(a *Assertion) { a.GH = "9999999999999999999" },
+			"short jti":       func(a *Assertion) { a.Jti = "abc" },
+			"alg":             func(a *Assertion) { a.Alg = "none" },
+			"typ":             func(a *Assertion) { a.Typ = "JWT" },
 		}
 		for name, m := range bad {
 			r := e.Expect(g.read(path, m), 401, "assertion "+name)
@@ -430,6 +431,13 @@ func runGateway(t *testing.T, newStore func(t *testing.T) store.Store) {
 		path := "/v1/skills/io.github.x/y/versions?version=1"
 		te.Expect(tg.do("POST", path, body, "text/markdown", tg.assertion("POST", path, body, nil)), 429, "throttled before the body is read")
 		te.Expect(tg.do("GET", "/v1/skills", nil, "", ""), 200, "the gateway token itself keeps working")
+		te2 := NewEnv(t, newStore(t), Options{AuthFailuresPerMinute: 2})
+		tg2 := newGateway(t, te2, "core-u", []string{"skills:read"}, []string{"openlinker"})
+		huge := []byte(strings.Repeat("x", 5<<20))
+		for i := 0; i < 2; i++ {
+			te2.Expect(tg2.do("POST", path, huge, "text/markdown", "not.a.jws"), 413, "oversized body")
+		}
+		te2.Expect(tg2.do("POST", path, huge, "text/markdown", "not.a.jws"), 429, "oversized bodies count against the budget")
 	})
 
 	t.Run("key revocation and rotation", func(t *testing.T) {

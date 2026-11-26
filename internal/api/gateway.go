@@ -71,10 +71,12 @@ func (s *Server) withAssertion(w http.ResponseWriter, r *http.Request, p auth.Pr
 		}
 		data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 		if err != nil {
+			s.AuthFailLimit.Allow(budget)
 			s.reject(w, r, &registry.Error{Status: http.StatusBadRequest, Code: "invalid_request", Msg: "request body could not be read"})
 			return r, false
 		}
 		if int64(len(data)) > limit {
+			s.AuthFailLimit.Allow(budget)
 			s.reject(w, r, &registry.Error{Status: http.StatusRequestEntityTooLarge, Code: "too_large", Msg: "request body too large"})
 			return r, false
 		}

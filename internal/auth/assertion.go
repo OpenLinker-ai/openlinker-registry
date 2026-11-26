@@ -164,6 +164,14 @@ func (a *Authenticator) VerifyAssertion(ctx context.Context, p Principal, raw st
 	if err != nil || len(key.PublicKey) != ed25519.PublicKeySize || !ed25519.Verify(key.PublicKey, []byte(parts[0]+"."+parts[1]), sig) {
 		return Principal{}, ErrInvalidAssertion
 	}
+	var githubID int64
+	if c.GH != "" {
+		id, err := strconv.ParseInt(c.GH, 10, 64)
+		if err != nil || id <= 0 {
+			return Principal{}, ErrInvalidAssertion
+		}
+		githubID = id
+	}
 	now := a.Now()
 	iat, exp := time.Unix(c.Iat, 0), time.Unix(c.Exp, 0)
 	switch {
@@ -212,8 +220,7 @@ func (a *Authenticator) VerifyAssertion(ctx context.Context, p Principal, raw st
 			return Principal{}, err
 		}
 		merge(roles)
-		id, _ := strconv.ParseInt(c.GH, 10, 64)
-		ns, err := a.Store.NamespaceForGitHubID(ctx, id)
+		ns, err := a.Store.NamespaceForGitHubID(ctx, githubID)
 		switch {
 		case err == nil:
 			merge(map[string]model.Role{ns.Name: model.RoleOwner})
