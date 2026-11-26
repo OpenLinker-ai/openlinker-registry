@@ -98,6 +98,14 @@ type Store interface {
 	ListNamespaces(ctx context.Context) ([]model.Namespace, error)
 	// ListTokens returns every token (newest first). SecretHash is not set.
 	ListTokens(ctx context.Context) ([]model.Token, error)
+	CreateGateway(ctx context.Context, g model.Gateway, audit model.AuditEvent) error
+	ListGateways(ctx context.Context) ([]model.Gateway, []model.GatewayKey, error)
+	GatewayForToken(ctx context.Context, tokenID string) (model.Gateway, error)
+	AddGatewayKey(ctx context.Context, k model.GatewayKey, audit model.AuditEvent) error
+	RevokeGatewayKey(ctx context.Context, consumer, kid string, at time.Time, audit model.AuditEvent) error
+	GetGatewayKey(ctx context.Context, consumer, kid string) (model.GatewayKey, error)
+	ClaimAssertion(ctx context.Context, consumer, jti string, expires, now time.Time) (bool, error)
+	NamespaceForGitHubID(ctx context.Context, githubID int64) (model.Namespace, error)
 
 	// ListMirroredSkills pages through every skill in the namespaces of an
 	// upstream, in (namespace, name) byte order, whatever its listing,

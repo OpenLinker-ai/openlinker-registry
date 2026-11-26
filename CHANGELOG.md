@@ -4,7 +4,15 @@ The registry has its own version numbers; see [RELEASE.md](./RELEASE.md).
 
 ## Unreleased
 
-Nothing since `v0.1.0`.
+- Gateways: an API token registered as a gateway can read on behalf of its
+  users with a signed, single-use, request-bound Ed25519 user assertion
+  (`OpenLinker-User-Assertion`). Admin endpoints `/v1/admin/gateways`; role
+  grants accept `openlinker:<consumer>:<uuid>` and `github:<id>` subjects;
+  `GET /v1/whoami` shows the asserted user.
+- `GET …/artifact?purpose=import` lets a gateway user take a private copy of
+  an indexed version whose license withholds redistribution.
+- `REGISTRY_ASSERTION_AUDIENCE` (default: the public URL).
+- Migration `0005` (gateways, gateway keys, used assertion ids).
 
 ## v0.1.0 — 2026-11-18
 

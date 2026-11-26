@@ -76,6 +76,23 @@ func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Versi
 	if err := s.checkServable(sk, v, fullText); err != nil {
 		return nil, nil, err
 	}
+	return s.materialize(ctx, v)
+}
+
+func (s *Service) MaterializeForImport(ctx context.Context, sk model.Skill, v model.Version, bypassLicense bool) ([]skill.File, []byte, error) {
+	if err := s.checkServable(sk, v, false); err != nil {
+		var e *Error
+		if !bypassLicense || !errors.As(err, &e) || (e.Code != "license_unknown" && e.Code != "license_pending_review") {
+			return nil, nil, err
+		}
+	}
+	if v.Mode == skill.ModeHosted {
+		return s.materialize(ctx, v)
+	}
+	return s.verifyFromSource(ctx, v)
+}
+
+func (s *Service) materialize(ctx context.Context, v model.Version) ([]skill.File, []byte, error) {
 	if v.Mode == skill.ModeHosted {
 		data, err := s.Blobs.Get(ctx, blobstore.Artifacts, v.ArtifactDigest)
 		if err != nil {
@@ -92,6 +109,10 @@ func (s *Service) Materialize(ctx context.Context, sk model.Skill, v model.Versi
 			return nil, nil, err
 		}
 	}
+	return s.verifyFromSource(ctx, v)
+}
+
+func (s *Service) verifyFromSource(ctx context.Context, v model.Version) ([]skill.File, []byte, error) {
 	files, data, src, result := s.readSource(ctx, v)
 	if result != "" {
 		return nil, nil, s.markCheck(ctx, v, src, result)

@@ -19,16 +19,17 @@ import (
 
 // Config is the server configuration.
 type Config struct {
-	Listen        string
-	BasePath      string
-	DatabaseURL   string
-	StorageDir    string
-	PublicURL     string
-	Mode          string // public | private
-	AdminToken    string
-	AllowAnonRead bool
-	AllowPublic   bool
-	AutoMigrate   bool
+	Listen            string
+	BasePath          string
+	DatabaseURL       string
+	StorageDir        string
+	PublicURL         string
+	AssertionAudience string
+	Mode              string // public | private
+	AdminToken        string
+	AllowAnonRead     bool
+	AllowPublic       bool
+	AutoMigrate       bool
 
 	GitHubToken   string
 	GitHubAPIURL  string
@@ -99,6 +100,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	fs.StringVar(&c.DatabaseURL, "database-url", env("DATABASE_URL", ""), "PostgreSQL DSN (prefer the environment variable)")
 	fs.StringVar(&c.StorageDir, "storage-dir", env("STORAGE_DIR", "./data"), "local blob storage directory")
 	fs.StringVar(&c.PublicURL, "public-url", env("PUBLIC_URL", ""), "external URL of the registry root, including any base path")
+	fs.StringVar(&c.AssertionAudience, "assertion-audience", env("ASSERTION_AUDIENCE", ""), "audience gateway user assertions must name (default: the public URL)")
 	fs.StringVar(&c.Mode, "mode", env("MODE", "private"), "instance mode: public or private")
 	fs.StringVar(&c.GitHubAPIURL, "github-api-url", env("GITHUB_API_URL", "https://api.github.com"), "GitHub API base URL")
 	fs.StringVar(&c.GitHubRawURL, "github-raw-url", env("GITHUB_RAW_URL", "https://raw.githubusercontent.com"), "GitHub raw content base URL")
@@ -228,6 +230,9 @@ func (c *Config) Validate() error {
 	// Without a base path any public path is allowed (proxy strips it).
 	if c.BasePath != "" && !strings.HasSuffix(strings.TrimRight(u.Path, "/"), c.BasePath) {
 		return errors.New("REGISTRY_PUBLIC_URL path must end with REGISTRY_BASE_PATH (e.g. https://host" + c.BasePath + ")")
+	}
+	if c.AssertionAudience == "" {
+		c.AssertionAudience = c.PublicURL
 	}
 	if c.AdminToken != "" && len(c.AdminToken) < 32 {
 		return errors.New("REGISTRY_ADMIN_TOKEN must be at least 32 characters")

@@ -73,3 +73,17 @@ func TestProductSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestAssertionAudience(t *testing.T) {
+	env := map[string]string{"REGISTRY_DATABASE_URL": "postgres://x", "REGISTRY_PUBLIC_URL": "https://r.example/registry/"}
+	get := func(k string) string { return env[k] }
+	c, err := Load(nil, get)
+	if err != nil || c.AssertionAudience != "https://r.example/registry" {
+		t.Fatalf("default audience %q %v", c.AssertionAudience, err)
+	}
+	env["REGISTRY_ASSERTION_AUDIENCE"] = "https://openlinker.ai/registry"
+	c, err = Load(nil, get)
+	if err != nil || c.AssertionAudience != "https://openlinker.ai/registry" {
+		t.Fatalf("configured audience %q %v", c.AssertionAudience, err)
+	}
+}

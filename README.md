@@ -127,6 +127,7 @@ Secrets are read from the environment only.
 | `REGISTRY_RATE_LIMIT_READ` / `_WRITE` / `_FORWARD` | flags | 600 / 60 / 30 | Requests per client per minute: reads, writes, and misses forwarded to upstreams (`0` = unlimited). Clients are the token subject, or the address when anonymous. Limits are per process |
 | `REGISTRY_RATE_LIMIT_AUTH_FAILURES` | `-rate-limit-auth-failures` | 30 | Failed authentications per client address per minute. An address over the limit is refused without a token lookup until its failures age out, requests with a valid token included |
 | `REGISTRY_TRUSTED_PROXIES` | `-trusted-proxies` | empty | Reverse proxies whose `X-Forwarded-For` identifies the client |
+| `REGISTRY_ASSERTION_AUDIENCE` | `-assertion-audience` | the public URL | The `aud` that gateway user assertions must carry |
 
 ## Releases
 
@@ -225,6 +226,66 @@ under `_meta["ai.openlinker.registry/entry"]`.
 
 Upstreams: `GET|POST /v1/admin/upstreams`, `GET|PATCH|DELETE /v1/admin/upstreams/{name}`,
 `POST /v1/admin/upstreams/{name}/sync[?wait=true]`.
+
+## Gateways: reads on behalf of OpenLinker users
+
+An OpenLinker Core (or any service the operator trusts) can read on behalf of
+its signed-in users. The operator registers it as a **gateway**: an API token
+with `skills:read` (not `admin`), the Ed25519 public keys it signs with, and
+the identities it may vouch for.
+
+```sh
+curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"consumer":"core","token_id":"<token id>","identities":["openlinker","github"]}' $R/v1/admin/gateways
+curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"kid":"k1","public_key":"<base64 Ed25519 public key>"}' $R/v1/admin/gateways/core/keys
+```
+
+`GET /v1/admin/gateways` lists gateways and keys;
+`POST /v1/admin/gateways/{consumer}/keys/{kid}/revoke` revokes one key. Several
+keys can be active at once, for rotation.
+
+The gateway sends its own token in `Authorization` and, for a signed-in user,
+`OpenLinker-User-Assertion: <JWS>` (compact, `alg` `EdDSA`, `typ`
+`openlinker-user-assertion+jwt`, `kid`) with these claims:
+
+| Claim | Meaning |
+|---|---|
+| `aud` | `REGISTRY_ASSERTION_AUDIENCE` |
+| `cid` | The gateway's consumer name; must match the token |
+| `sub` | The user's id at the gateway (a UUID) |
+| `gh` | Optional numeric GitHub account id, when the gateway knows it from GitHub sign-in |
+| `act` | Allowed actions: `read`, `import`, `write` |
+| `req` | `m` method, `t` target (escaped path including the base path, then the query sorted by key and form-encoded with `+` for spaces; no `?` when empty), `bh` hex sha256 of the body (of the empty string for `GET`) |
+| `iat`, `exp` | Seconds; at most 60 s apart; ±30 s clock skew |
+| `jti` | 16–128 URL-safe characters, accepted once: kept in PostgreSQL until a minute after the end of the skew window, so a replay is refused for as long as the assertion could be accepted, also by another replica or after a restart |
+
+Any failure is `401 assertion_invalid`. An assertion without a gateway token,
+or with an ordinary or admin token, is refused.
+
+What the caller may see and do:
+
+- **Gateway token alone:** public entries, plus entries in namespaces where the
+  token itself holds a role (grant a `reader` role to share a namespace with
+  a gateway). Not `internal` entries.
+- **With an assertion:** additionally `internal` entries, and `private` entries
+  in namespaces where the **user** holds a role. User roles come from grants
+  to `openlinker:<consumer>:<sub>` (gateways allowed `openlinker`) or
+  `github:<id>` (gateways allowed `github`), and, for `github`, ownership of the
+  `io.github` namespace bound to that account id.
+- **Writes** use only the user's roles, need `write` in `act` and the
+  `skills:write` scope on the token; the gateway's own roles never allow a
+  write.
+- **Import read:** `GET …/versions/{v}/artifact?purpose=import` is for
+  gateways. An indexed version is always re-read from its source and
+  verified for this request (the recently-verified cache is not used), so an
+  import never takes bytes that no longer match the source. With `import` in
+  `act`, it also returns the artifact of an indexed version whose license
+  does not allow this registry to redistribute it (the user's gateway takes a
+  private copy, as if from the source). Visibility, yanks and status still
+  apply; the response is `private, no-store`.
+- **Signed queries** must not repeat a parameter; a malformed or repeated
+  query is refused.
 
 ## Upstreams: forwarding and mirroring
 
@@ -409,8 +470,8 @@ cookie, so downloads offered by the pages are served under `/ui/` as well. The p
 
 ## Not included
 
-OpenLinker Core integration (catalog proxy, gateway assertions, import into
-Core), GitHub OAuth login and namespace self-service, GitHub Actions OIDC,
+Writes by OpenLinker Core on behalf of its users (gateway assertions can
+carry `write`, but OpenLinker Core does not send them yet), GitHub OAuth login and namespace self-service, GitHub Actions OIDC,
 enterprise OIDC single sign-on, DNS/HTTP namespace verification, claims and
 shares, review queues and abuse reports, offline bundles, publisher
 signatures, S3 storage (the interface exists; blobs are on local disk, so one

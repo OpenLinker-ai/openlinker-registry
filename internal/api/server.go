@@ -46,7 +46,8 @@ type Server struct {
 	SecureCookies bool
 	// Background is the lifetime of work started by a request but finished
 	// after it (asynchronous syncs); nil means context.Background().
-	Background context.Context
+	Background        context.Context
+	AssertionAudience string
 }
 
 const maxJSONBody = 64 << 10
@@ -164,6 +165,7 @@ func (s *Server) routes(m *http.ServeMux) {
 
 	s.mcpRoutes(m)
 	s.adminRoutes(m)
+	s.gatewayRoutes(m)
 	if s.UI {
 		s.uiRoutes(m)
 	}
@@ -232,6 +234,10 @@ func (s *Server) logger(next http.Handler) http.Handler {
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hdr := r.Header.Get("Authorization")
+		if hdr == "" && r.Header.Get(auth.AssertionHeader) != "" {
+			s.reject(w, r, assertionError())
+			return
+		}
 		if hdr == "" {
 			// The built-in pages (and only they) authenticate by session
 			// cookie. A stale cookie means "signed out", not an error.
@@ -283,7 +289,14 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			s.reject(w, r, &registry.Error{Status: http.StatusUnauthorized, Code: "unauthorized", Msg: "invalid or expired token"})
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, p)))
+		r, ok = s.withAssertion(w, r, p)
+		if !ok {
+			return
+		}
+		if r.Context().Value(ctxKey{}) == nil {
+			r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, p))
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
