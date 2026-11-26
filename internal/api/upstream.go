@@ -83,8 +83,20 @@ func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
 		scopes = []string{}
 	}
 	s.setCache(w, r, false)
-	writeJSON(w, http.StatusOK, map[string]any{"subject": p.Subject, "authenticated": p.Authenticated, "admin": p.Admin,
-		"scopes": scopes, "roles": roles, "mode": s.Svc.Cfg.Mode, "anonymous_read": s.AllowAnonRead})
+	out := map[string]any{"subject": p.Subject, "authenticated": p.Authenticated, "admin": p.Admin,
+		"scopes": scopes, "roles": roles, "mode": s.Svc.Cfg.Mode, "anonymous_read": s.AllowAnonRead}
+	if p.Gateway != nil {
+		out["gateway"] = p.Gateway.Consumer
+	}
+	if p.User != nil {
+		userRoles := map[string]model.Role{}
+		for ns, role := range p.User.Roles {
+			userRoles[ns] = role
+		}
+		out["user"] = map[string]any{"consumer": p.User.Consumer, "sub": p.User.Sub, "github_id": p.User.GitHubID,
+			"act": p.User.Act, "roles": userRoles}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) listNamespaces(w http.ResponseWriter, r *http.Request) {

@@ -25,6 +25,7 @@ type Memory struct {
 	upstreams map[int64]model.Upstream
 	mcp       map[int64]model.MCPServer
 	mcpVers   map[int64]model.MCPVersion
+	gateways  *gatewayState
 }
 
 // NewMemory returns an empty in-memory store.

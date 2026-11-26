@@ -225,6 +225,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("upstreams", func(t *testing.T) { runUpstreams(t, newStore) })
 	t.Run("built-in pages", func(t *testing.T) { runUI(t, newStore) })
 	t.Run("hardening", func(t *testing.T) { runHardening(t, newStore) })
+	t.Run("gateway assertions", func(t *testing.T) { runGateway(t, newStore) })
 }
 
 func runPublic(t *testing.T, e *Env) {

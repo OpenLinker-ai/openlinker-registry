@@ -78,6 +78,8 @@ type Principal struct {
 	Admin         bool
 	Scopes        []string
 	Roles         map[string]model.Role
+	Gateway       *model.Gateway
+	User          *User
 }
 
 // Anonymous is the unauthenticated principal.
@@ -93,6 +95,9 @@ func (p Principal) HasRole(namespace string, min model.Role) bool {
 	if p.Admin {
 		return true
 	}
+	if p.Gateway != nil {
+		return p.User != nil && p.User.Roles[namespace].Rank() >= min.Rank()
+	}
 	return p.Roles[namespace].Rank() >= min.Rank()
 }
 
@@ -103,8 +108,17 @@ func (p Principal) Viewer() model.Viewer {
 	if !p.Authenticated || !(p.HasScope(ScopeRead) || p.HasScope(ScopeWrite)) {
 		return v
 	}
-	v.Authenticated = true
+	v.Authenticated = p.Gateway == nil || p.User != nil
+	seen := map[string]bool{}
 	for ns := range p.Roles {
+		seen[ns] = true
+	}
+	if p.User != nil {
+		for ns := range p.User.Roles {
+			seen[ns] = true
+		}
+	}
+	for ns := range seen {
 		v.Namespaces = append(v.Namespaces, ns)
 	}
 	slices.Sort(v.Namespaces)
@@ -167,6 +181,14 @@ func (a *Authenticator) Authenticate(ctx context.Context, tok string) (Principal
 	if err != nil {
 		return Principal{}, err
 	}
-	return Principal{Subject: subject, Authenticated: true, Admin: slices.Contains(t.Scopes, ScopeAdmin),
-		Scopes: slices.Clone(t.Scopes), Roles: roles}, nil
+	p := Principal{Subject: subject, Authenticated: true, Admin: slices.Contains(t.Scopes, ScopeAdmin),
+		Scopes: slices.Clone(t.Scopes), Roles: roles}
+	g, err := a.Store.GatewayForToken(ctx, t.ID)
+	switch {
+	case err == nil:
+		p.Gateway = &g
+	case !errors.Is(err, model.ErrNotFound):
+		return Principal{}, err
+	}
+	return p, nil
 }

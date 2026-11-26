@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/registry"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
@@ -336,12 +338,30 @@ func (s *Server) writeBlob(w http.ResponseWriter, r *http.Request, sk model.Skil
 }
 
 func (s *Server) getArtifact(w http.ResponseWriter, r *http.Request) {
+	purpose := r.URL.Query().Get("purpose")
+	if purpose != "" && purpose != "import" {
+		writeError(w, &registry.Error{Status: http.StatusBadRequest, Code: "purpose_invalid", Msg: "purpose must be import or absent"})
+		return
+	}
+	if purpose == "import" && principal(r).Gateway == nil {
+		writeError(w, &registry.Error{Status: http.StatusForbidden, Code: "import_not_allowed", Msg: "import reads are for gateways"})
+		return
+	}
 	sk, v, err := s.loadVisibleVersion(r)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	_, data, err := s.Svc.Materialize(r.Context(), sk, v, false)
+	materialize := s.Svc.Materialize
+	if purpose == "import" {
+		materialize = func(ctx context.Context, sk model.Skill, v model.Version, _ bool) ([]skill.File, []byte, error) {
+			return s.Svc.MaterializeForImport(ctx, sk, v, principal(r).User.Allows(auth.ActImport))
+		}
+	}
+	_, data, err := materialize(r.Context(), sk, v, false)
+	if err == nil && purpose == "import" {
+		sk.Visibility = model.VisibilityPrivate
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return

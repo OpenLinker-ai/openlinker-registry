@@ -315,8 +315,8 @@ func (s *Server) setRole(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if !subjectRe.MatchString(req.Subject) || req.Role.Rank() == 0 {
-		writeError(w, &registry.Error{Status: 422, Code: "role_invalid", Msg: "subject must be token:<id> and role owner, publisher or reader"})
+	if !(subjectRe.MatchString(req.Subject) || auth.ValidUserSubject(req.Subject)) || req.Role.Rank() == 0 {
+		writeError(w, &registry.Error{Status: 422, Code: "role_invalid", Msg: "subject must be token:<id>, openlinker:<consumer>:<user uuid> or github:<numeric id>, and role owner, publisher or reader"})
 		return
 	}
 	ns := r.PathValue("ns")

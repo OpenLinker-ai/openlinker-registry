@@ -122,8 +122,9 @@ func run(args []string, log *slog.Logger, stdout io.Writer) error {
 		AllowAnonRead: cfg.AllowAnonRead, MaxUploadBytes: cfg.MaxUploadBytes, Log: log,
 		ReadLimit: ratelimit.New(cfg.RateLimitRead), WriteLimit: ratelimit.New(cfg.RateLimitWrite),
 		ForwardLimit: ratelimit.New(cfg.RateLimitForward), AuthFailLimit: ratelimit.New(cfg.RateLimitAuthFailures),
-		Clients: ratelimit.ClientAddr{Trusted: cfg.TrustedProxies},
-		UI:      cfg.UI, SecureCookies: strings.HasPrefix(cfg.PublicURL, "https://"), Background: ctx}
+		Clients:           ratelimit.ClientAddr{Trusted: cfg.TrustedProxies},
+		AssertionAudience: cfg.AssertionAudience,
+		UI:                cfg.UI, SecureCookies: strings.HasPrefix(cfg.PublicURL, "https://"), Background: ctx}
 
 	if cfg.BackgroundSync {
 		go func() {
