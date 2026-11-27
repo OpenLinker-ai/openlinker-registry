@@ -144,6 +144,7 @@ func (s *Store) ApplySkillProjection(ctx context.Context, p model.Projection, au
 			}
 			out = model.ProjectionResult{Applied: true}
 		}
+		out.Namespace = p.Namespace
 		if err := recordResult(ctx, tx, p.Target.Consumer, p.Op, out); err != nil {
 			return err
 		}
@@ -204,6 +205,7 @@ func (s *Store) ApplyMCPProjection(ctx context.Context, p model.Projection, audi
 			}
 			out = model.ProjectionResult{Applied: true}
 		}
+		out.Namespace = p.Namespace
 		if err := recordResult(ctx, tx, p.Target.Consumer, p.Op, out); err != nil {
 			return err
 		}

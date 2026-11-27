@@ -505,7 +505,8 @@ type Projection struct {
 }
 
 type ProjectionResult struct {
-	Applied bool `json:"applied"`
+	Applied   bool   `json:"applied"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 func ErrManagedByCore() error {

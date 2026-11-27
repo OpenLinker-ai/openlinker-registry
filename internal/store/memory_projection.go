@@ -124,6 +124,7 @@ func (m *Memory) ApplySkillProjection(_ context.Context, p model.Projection, aud
 		m.skills[s.ID] = s
 		out.Applied = true
 	}
+	out.Namespace = p.Namespace
 	m.pj().ops[key] = out
 	m.appendAudit(audit)
 	return out, nil
@@ -173,6 +174,7 @@ func (m *Memory) ApplyMCPProjection(_ context.Context, p model.Projection, audit
 		m.stampMCPVersions(s.ID, now)
 		out.Applied = true
 	}
+	out.Namespace = p.Namespace
 	m.pj().ops[key] = out
 	m.appendAudit(audit)
 	return out, nil

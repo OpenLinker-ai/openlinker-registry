@@ -88,7 +88,7 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 			"owner": map[string]any{"sub": coreUser}, "state": "visible", "listed": true, "versions": []string{"1"}, "current_version": "1",
 			"display": map[string]any{"name": "PDF tools", "description": "Read PDFs"},
 			"legacy":  map[string]any{"core_instance": "c0ffee00", "package_id": "6c3b"}}), 200, "visible")
-		if r.JSON["applied"] != true {
+		if r.JSON["applied"] != true || r.JSON["namespace"] != ns {
 			t.Fatalf("applied: %s", r.Body)
 		}
 		r = e.Expect(e.Do("GET", entry, "", "", nil), 200, "public after the state")
