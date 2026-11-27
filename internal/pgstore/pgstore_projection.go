@@ -224,6 +224,9 @@ func (s *Store) ApplyMCPProjection(ctx context.Context, p model.Projection, audi
 				if _, err := insertMCPVersion(ctx, tx, srv.ID, *p.MCPVersion); err != nil {
 					return err
 				}
+				if _, err := tx.Exec(ctx, `UPDATE mcp_servers SET review_revision = review_revision + 1 WHERE id = $1`, srv.ID); err != nil {
+					return err
+				}
 			case err != nil:
 				return err
 			case digest != p.MCPVersion.Digest:

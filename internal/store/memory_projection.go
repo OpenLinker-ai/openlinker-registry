@@ -181,6 +181,7 @@ func (m *Memory) ApplyMCPProjection(_ context.Context, p model.Projection, audit
 	if p.MCPVersion != nil {
 		if _, dup := m.findMCPVersion(s.ID, p.MCPVersion.Version); !dup {
 			m.addMCPVersion(s.ID, *p.MCPVersion, now, now)
+			s.ReviewRevision++
 		}
 	}
 	s.Managed.Hidden, s.Managed.Revision, s.Managed.Phase = p.Hidden, p.Revision, p.Phase

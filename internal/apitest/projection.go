@@ -373,6 +373,16 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if legacy, _ := meta["ai.openlinker/legacy"].(map[string]any); legacy["agent_id"] != "1" {
 			t.Fatalf("legacy: %s", r.Body)
 		}
+		e.Expect(e.decide("mcp/servers", ns+"/m-weather", map[string]any{"decision": "reject", "reason": "check"}), 200, "reject")
+		before := e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather", AdminToken, "", nil), 200, "rejected detail").JSON["review"].(map[string]any)["revision"]
+		next, _ := json.Marshal(map[string]any{"op": "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd", "revision": 10, "phase": 1, "owner": map[string]any{"sub": coreUser},
+			"state": "visible", "listed": true, "version": "0.2.0",
+			"server": map[string]any{"description": "Weather v2", "remotes": []map[string]any{{"type": "streamable-http", "url": "https://openlinker.example/mcp/agents/1"}}}})
+		e.Expect(alice.send("PUT", "/v1/projections/mcp/m-weather", next, "application/json"), 200, "new version")
+		after := e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather", AdminToken, "", nil), 200, "detail after").JSON["review"].(map[string]any)
+		if after["revision"] != before.(float64)+1 || after["state"] != "rejected" {
+			t.Fatalf("review after a projected version: before %v after %v", before, after)
+		}
 	})
 
 	t.Run("validate and namespace preflight", func(t *testing.T) {
