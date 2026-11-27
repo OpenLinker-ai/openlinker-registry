@@ -184,7 +184,9 @@ func (m *Memory) ApplyMCPProjection(_ context.Context, p model.Projection, audit
 			v = m.addMCPVersion(s.ID, *p.MCPVersion, now, now)
 			s.ReviewRevision++
 		}
-		m.moveMCPLatest(s.ID, v.ID, now)
+		if v.Status != model.MCPStatusDeleted {
+			m.moveMCPLatest(s.ID, v.ID, now)
+		}
 	}
 	s.Managed.Hidden, s.Managed.Revision, s.Managed.Phase = p.Hidden, p.Revision, p.Phase
 	if len(p.Legacy) > 0 {

@@ -382,6 +382,16 @@ func (s *Store) SetMCPStatus(ctx context.Context, serverID int64, version, statu
 			return err
 		}
 		latest, ok := store.LatestMCPVersion(live)
+		var kept int64
+		err = tx.QueryRow(ctx, `SELECT v.id FROM mcp_server_versions v JOIN mcp_servers m ON m.id = v.server_id
+			WHERE v.server_id = $1 AND v.is_latest AND v.status <> 'deleted' AND m.managed_by IS NOT NULL`, serverID).Scan(&kept)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err == nil {
+			latest, ok = kept, true
+		}
+		err = nil
 		if err := clearMCPLatest(ctx, tx, serverID, latest, &at); err != nil {
 			return err
 		}

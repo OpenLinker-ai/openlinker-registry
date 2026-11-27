@@ -235,11 +235,17 @@ func (s *Store) ApplyMCPProjection(ctx context.Context, p model.Projection, audi
 			case digest != p.MCPVersion.Digest:
 				return conflict("version_exists", "version already exists and is immutable")
 			}
-			if err := clearMCPLatest(ctx, tx, srv.ID, versionID, nil); err != nil {
+			var deleted bool
+			if err := tx.QueryRow(ctx, `SELECT status = 'deleted' FROM mcp_server_versions WHERE id = $1`, versionID).Scan(&deleted); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET is_latest = true, updated_at = now() WHERE id = $1 AND NOT is_latest`, versionID); err != nil {
-				return err
+			if !deleted {
+				if err := clearMCPLatest(ctx, tx, srv.ID, versionID, nil); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET is_latest = true, updated_at = now() WHERE id = $1 AND NOT is_latest`, versionID); err != nil {
+					return err
+				}
 			}
 		} else if !p.Hidden {
 			var versions int

@@ -387,6 +387,11 @@ func (m *Memory) SetMCPStatus(ctx context.Context, serverID int64, version, stat
 		changed++
 	}
 	latest, _ := LatestMCPVersion(m.mcpVersionsOf(serverID))
+	if m.mcp[serverID].Managed.IsManaged() {
+		if cur, ok := m.latestMCP(serverID); ok && cur.Status != model.MCPStatusDeleted {
+			latest = cur.ID
+		}
+	}
 	m.moveMCPLatest(serverID, latest, at)
 	m.appendAudit(audit)
 	return changed, nil

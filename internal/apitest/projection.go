@@ -396,6 +396,20 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if v, _ := latest.JSON["server"].(map[string]any); v["version"] != "0.0.3" {
 			t.Fatalf("the projected version must be the latest: %s", latest.Body)
 		}
+		e.Expect(e.Do("POST", "/v1/mcp/servers/"+ns+"/m-weather/versions/0.2.0/status", AdminToken, "", map[string]any{"status": "deprecated"}), 200, "deprecate an older version")
+		latest = e.Expect(e.Do("GET", "/v0.1/servers/"+name+"/versions/latest", AdminToken, "", nil), 200, "latest after moderation")
+		if v, _ := latest.JSON["server"].(map[string]any); v["version"] != "0.0.3" {
+			t.Fatalf("moderation moved Core's latest: %s", latest.Body)
+		}
+		e.Expect(e.Do("POST", "/v1/mcp/servers/"+ns+"/m-weather/versions/0.0.3/status", AdminToken, "", map[string]any{"status": "deleted"}), 200, "delete the latest")
+		again, _ := json.Marshal(map[string]any{"op": "d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d0d0", "revision": 12, "phase": 1, "owner": map[string]any{"sub": coreUser},
+			"state": "visible", "listed": true, "version": "0.0.3",
+			"server": map[string]any{"description": "Weather v3", "remotes": []map[string]any{{"type": "streamable-http", "url": "https://openlinker.example/mcp/agents/1"}}}})
+		e.Expect(alice.send("PUT", "/v1/projections/mcp/m-weather", again, "application/json"), 200, "reproject a deleted version")
+		latest = e.Expect(e.Do("GET", "/v0.1/servers/"+name+"/versions/latest", AdminToken, "", nil), 200, "latest after deletion")
+		if v, _ := latest.JSON["server"].(map[string]any); v["version"] == "0.0.3" {
+			t.Fatalf("a deleted version became latest: %s", latest.Body)
+		}
 		detail := e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather", AdminToken, "", nil), 200, "detail without metadata")
 		if meta, _ := detail.JSON["_meta"].(map[string]any); meta["ai.openlinker/metadata"] != nil {
 			t.Fatalf("cleared metadata still shown: %s", detail.Body)
