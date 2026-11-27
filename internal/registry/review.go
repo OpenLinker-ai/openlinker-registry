@@ -197,6 +197,9 @@ func (s *Service) Report(ctx context.Context, actor string, rep model.Report, ad
 	if threshold <= 0 {
 		threshold = 3
 	}
+	if !s.Cfg.Review {
+		threshold, admin = 0, false
+	}
 	return s.Store.CreateReport(ctx, rep, threshold, admin, auditEvent(actor, "report.create", rep.Namespace, rep.Name,
 		map[string]any{"kind": rep.Kind, "category": rep.Category}))
 }
