@@ -481,6 +481,7 @@ type Managed struct {
 	Legacy           json.RawMessage
 	Metadata         json.RawMessage
 	MetadataRevision int64
+	DisplayName      string
 }
 
 func (m Managed) IsManaged() bool { return m.By != "" }
@@ -502,6 +503,7 @@ type Projection struct {
 	Versions    []string
 	Current     string
 	Description string
+	DisplayName string
 	Legacy      json.RawMessage
 	Metadata    json.RawMessage
 	MetadataRev int64

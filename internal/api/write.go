@@ -416,6 +416,9 @@ func (s *Server) setAlias(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sk, err := s.Svc.Store.GetSkill(r.Context(), r.PathValue("ns"), r.PathValue("name"))
+	if err == nil && sk.Managed.IsManaged() {
+		err = model.ErrManagedByCore()
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return

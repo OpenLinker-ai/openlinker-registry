@@ -910,7 +910,7 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			break
 		}
 	}
-	if tooMany == nil {
+	{
 		listed := map[string]bool{}
 		for _, ref := range d.Versions {
 			listed[ref.Version] = true

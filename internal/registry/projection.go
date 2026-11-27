@@ -192,7 +192,7 @@ func (s *Service) ApplySkillState(ctx context.Context, p Projector, name string,
 	}
 	return s.Store.ApplySkillProjection(ctx, model.Projection{Target: p.Target, Namespace: ns.Name, Name: name, Op: st.Op,
 		Revision: st.Revision, Phase: st.Phase, Hidden: st.State == "hidden", Listed: st.Listed, Versions: versions, Current: st.Current,
-		Description: st.Display.Description, Legacy: st.Legacy},
+		Description: st.Display.Description, DisplayName: st.Display.Name, Legacy: st.Legacy},
 		auditEvent(p.Actor, "projection.skill", ns.Name, name, map[string]any{"op": st.Op, "revision": st.Revision, "phase": st.Phase, "state": st.State}))
 }
 

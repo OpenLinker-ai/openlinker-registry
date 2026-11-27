@@ -306,6 +306,11 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(alice.state("p-long", state("c6c6c6c6-c6c6-4c6c-8c6c-c6c6c6c6c6c6", strings.Repeat("é", 2000), nil)), 200, "2000 characters")
 		e.Expect(alice.state("p-long", state("c7c7c7c7-c7c7-4c7c-8c7c-c7c7c7c7c7c7", strings.Repeat("é", 2001), nil)), 422, "2001 characters")
 		e.Expect(alice.state("p-long", state("c8c8c8c8-c8c8-4c8c-8c8c-c8c8c8c8c8c8", "ok", map[string]any{"x": strings.Repeat("a", 4100)})), 422, "legacy over 4 KiB")
+		e.Expect(alice.state("p-long", state("cbcbcbcb-cbcb-4bcb-8bcb-cbcbcbcbcbcb", "ok", map[string]any{"x": strings.Repeat("a", 4088)})), 200, "legacy of exactly 4 KiB")
+		long := []byte(`{"required_commands":[],"name":"pdf-tools","description":"Read PDFs","files":{"SKILL.md":"---\nname: pdf-tools\ndescription: Read PDFs\n---\nUse it.\n","` + strings.Repeat("a", 101) + `":"x"},"capability_ids":[],"providers":["codex"]}`)
+		if r := e.Expect(alice.send("POST", "/v1/projections/validate", long, bundleType), 200, "long path"); r.JSON["ok"] != false {
+			t.Fatalf("long path validated: %s", r.Body)
+		}
 		mismatch := []byte(`{"required_commands":[],"name":"pdf-tools","description":"Something else","files":{"SKILL.md":"---\nname: pdf-tools\ndescription: Read PDFs\n---\nUse it.\n"},"capability_ids":[],"providers":["codex"]}`)
 		r := e.Expect(alice.send("POST", "/v1/projections/validate", mismatch, bundleType), 200, "mismatched bundle")
 		if r.JSON["ok"] != false || r.JSON["code"] != "bundle_invalid" {
@@ -321,7 +326,7 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(alice.version("p-vis", "1", v1, "LicenseRef-openlinker-platform-terms"), 201, "ingest")
 		e.Expect(alice.state("p-vis", map[string]any{"op": "c9c9c9c9-c9c9-4c9c-8c9c-c9c9c9c9c9c9", "revision": 1, "phase": 1,
 			"owner": map[string]any{"sub": coreUser}, "state": "visible", "listed": true, "versions": []string{"1"}, "current_version": "1",
-			"legacy": map[string]any{"package_id": "vis"}}), 200, "visible")
+			"display": map[string]any{"name": "PDF tools", "description": "Read PDFs"}, "legacy": map[string]any{"package_id": "vis"}}), 200, "visible")
 		if r := e.Expect(e.Do("PATCH", vis, AdminToken, "", map[string]any{"listed": false}), 409, "admin patch"); errCode(r) != "managed_by_core" {
 			t.Fatalf("admin patch: %s", r.Body)
 		}
@@ -337,7 +342,13 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if strings.Contains(string(r.Body), "ai.openlinker/legacy") {
 			t.Fatalf("legacy in a listing: %s", r.Body)
 		}
+		if r := e.Expect(e.Do("PUT", "/v1/admin/skills/"+ns+"/p-vis/alias", AdminToken, "", map[string]any{"alias": "pdf"}), 409, "admin alias"); errCode(r) != "managed_by_core" {
+			t.Fatalf("alias: %s", r.Body)
+		}
 		r = e.Expect(e.Do("GET", vis, "", "", nil), 200, "detail")
+		if r.JSON["display_name"] != "PDF tools" {
+			t.Fatalf("display name: %s", r.Body)
+		}
 		if !strings.Contains(string(r.Body), "ai.openlinker/legacy") {
 			t.Fatalf("legacy missing from the detail: %s", r.Body)
 		}

@@ -395,7 +395,12 @@ with `skills:write`; only public instances accept projections.
   limit of 2000 characters; `validate` applies the same admission as
   ingestion.
 - Mirrors hide versions that disappear from their upstream and show them
-  again when they return.
+  again when they return, also past the version cap. Mirrors only append
+  versions newer than their newest one, so an older version that was already
+  hidden upstream when the mirror first synced is not backfilled later.
+- `display.name` is shown as `display_name` on projected entries; the path
+  keeps the generated name. Namespace allocation and handle claims for one
+  owner are serialized.
 
 ## Upstreams: forwarding and mirroring
 

@@ -399,6 +399,9 @@ func (s *Service) bundleFiles(body []byte) ([]skill.File, error) {
 	if _, err := skill.ValidateFiles(files, s.Cfg.Limits); err != nil {
 		return nil, err
 	}
+	if _, err := archive.CanonicalTar(files); err != nil {
+		return nil, err
+	}
 	return files, nil
 }
 

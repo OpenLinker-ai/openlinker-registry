@@ -38,6 +38,11 @@ func (s *Store) ClaimNamespace(ctx context.Context, ns model.Namespace, owner st
 	var out model.Namespace
 	created := false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if ns.OpenLinkerSubject != "" {
+			if err := lockOwner(ctx, tx, ns.OpenLinkerSubject); err != nil {
+				return err
+			}
+		}
 		existing, err := scanNamespace(tx.QueryRow(ctx, `SELECT `+nsCols+` FROM namespaces WHERE name = $1 FOR UPDATE`, ns.Name))
 		if err == nil {
 			if !sameOwner(existing, ns) {

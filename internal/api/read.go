@@ -165,6 +165,9 @@ func skillJSON(sk model.Skill, latest string) map[string]any {
 	}
 	if sk.Managed.IsManaged() {
 		out["managed"] = true
+		if sk.Managed.DisplayName != "" {
+			out["display_name"] = sk.Managed.DisplayName
+		}
 		if len(sk.Managed.Legacy) > 0 {
 			out["_meta"] = map[string]any{"ai.openlinker/legacy": json.RawMessage(sk.Managed.Legacy)}
 		}

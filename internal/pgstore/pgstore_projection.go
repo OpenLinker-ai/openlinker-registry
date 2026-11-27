@@ -25,6 +25,9 @@ func managedWrite(m model.Managed, p *model.ProjectionTarget) error {
 func (s *Store) ProjectionNamespace(ctx context.Context, owner string, candidates []string, create bool, audit model.AuditEvent) (model.Namespace, error) {
 	var out model.Namespace
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockOwner(ctx, tx, owner); err != nil {
+			return err
+		}
 		ns, err := scanNamespace(tx.QueryRow(ctx, `SELECT `+nsCols+` FROM namespaces WHERE openlinker_subject = $1 OR generated_for = $1
 			ORDER BY generated_for IS NOT DISTINCT FROM $1 DESC LIMIT 1`, owner))
 		if err == nil {
@@ -56,6 +59,11 @@ func (s *Store) ProjectionNamespace(ctx context.Context, owner string, candidate
 		return model.ErrProjectionNamespace()
 	})
 	return out, err
+}
+
+func lockOwner(ctx context.Context, tx pgx.Tx, owner string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "projection-owner:"+owner)
+	return err
 }
 
 func lockProjection(ctx context.Context, tx pgx.Tx, p model.Projection) (*model.ProjectionResult, error) {
@@ -142,8 +150,9 @@ func (s *Store) ApplySkillProjection(ctx context.Context, p model.Projection, au
 			}
 			hidden := p.Hidden || len(p.Versions) == 0
 			if _, err := tx.Exec(ctx, `UPDATE skills SET projection_hidden = $2, listed = $3, description = CASE WHEN $4 = '' THEN description ELSE $4 END,
-				current_version = $5, legacy = COALESCE($6, legacy), managed_revision = $7, managed_phase = $8, updated_at = now() WHERE id = $1`,
-				k.ID, hidden, p.Listed, p.Description, p.Current, rawOrNil(p.Legacy), p.Revision, p.Phase); err != nil {
+				current_version = $5, legacy = COALESCE($6, legacy), managed_revision = $7, managed_phase = $8,
+				display_name = CASE WHEN $9 = '' THEN display_name ELSE $9 END, updated_at = now() WHERE id = $1`,
+				k.ID, hidden, p.Listed, p.Description, p.Current, rawOrNil(p.Legacy), p.Revision, p.Phase, p.DisplayName); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `UPDATE skill_versions SET projection_hidden = NOT (version = ANY($2)) WHERE skill_id = $1`, k.ID, p.Versions); err != nil {

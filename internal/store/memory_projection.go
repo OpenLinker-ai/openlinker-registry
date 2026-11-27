@@ -122,6 +122,9 @@ func (m *Memory) ApplySkillProjection(_ context.Context, p model.Projection, aud
 		if p.Description != "" {
 			s.Description = p.Description
 		}
+		if p.DisplayName != "" {
+			s.Managed.DisplayName = p.DisplayName
+		}
 		m.skills[s.ID] = s
 		out.Applied = true
 	}
