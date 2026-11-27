@@ -505,6 +505,27 @@ func runProjectionReads(t *testing.T, newStore func(t *testing.T) store.Store) {
 		down.Expect(down.Do("GET", entry+"/versions/1", "", "", nil), 200, "stable after another sync")
 	})
 
+	t.Run("successive backfills keep the upstream's latest version", func(t *testing.T) {
+		up, alice := projectionEnv(t, newStore(t), Options{})
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		ns := generatedNamespace(coreUser, 12)
+		for _, v := range []string{"1", "2", "3"} {
+			up.Expect(alice.version("p-steps", v, coreBundle("pdf-tools", "Read PDFs v"+v, "Use it."), PlatformTerms), 201, "v"+v)
+		}
+		up.Expect(alice.state("p-steps", visibleState("f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1", 1, "3")), 200, "only v3")
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base}), 201, "upstream")
+		down.sync("hub")
+		up.Expect(alice.state("p-steps", visibleState("f2f2f2f2-f2f2-4f2f-8f2f-f2f2f2f2f2f2", 2, "2", "3")), 200, "restore v2")
+		down.sync("hub")
+		up.Expect(alice.state("p-steps", visibleState("f3f3f3f3-f3f3-4f3f-8f3f-f3f3f3f3f3f3", 3, "1", "2", "3")), 200, "restore v1")
+		down.sync("hub")
+		entry := "/v1/skills/" + ns + "/p-steps"
+		down.Expect(down.Do("GET", entry+"/versions/1", "", "", nil), 200, "v1 backfilled")
+		if r := down.Expect(down.Do("GET", entry, "", "", nil), 200, "detail"); r.JSON["latest_version"] != "3" {
+			t.Fatalf("latest after successive backfills: %s", r.Body)
+		}
+	})
+
 	t.Run("validation needs a public instance", func(t *testing.T) {
 		e := NewEnv(t, newStore(t), Options{Mode: "private"})
 		g := newGateway(t, e, "core", []string{"skills:read", "skills:write"}, []string{"openlinker"})
