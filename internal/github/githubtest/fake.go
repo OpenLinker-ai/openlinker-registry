@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,11 +37,83 @@ type Fake struct {
 	Raw      *httptest.Server
 	// Down makes every request fail with 503.
 	Down atomic.Bool
+
+	repoID  int64
+	owners  map[int64]account
+	lookups int
+	recycle *recyclePlan
+	users   map[int64][2]string
+}
+
+type account struct {
+	ID    int64  `json:"id"`
+	Login string `json:"login"`
+	Type  string `json:"type"`
+}
+
+func (f *Fake) repoJSON(id int64) map[string]any {
+	out := map[string]any{"default_branch": f.DefaultBranch}
+	if id != 0 {
+		out["id"] = id
+		if o, ok := f.owners[id]; ok {
+			out["owner"] = o
+		}
+	}
+	return out
+}
+
+func (f *Fake) SetOwner(id int64, kind string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.repoID == 0 {
+		f.repoID = 4242
+	}
+	if f.owners == nil {
+		f.owners = map[int64]account{}
+	}
+	f.owners[f.repoID] = account{ID: id, Login: f.Owner, Type: kind}
+}
+
+type recyclePlan struct {
+	after         int
+	repoID, owner int64
+	kind          string
+}
+
+func (f *Fake) RecycleOnLookup(after int, newRepoID, ownerID int64, kind string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookups = 0
+	f.recycle = &recyclePlan{after: after, repoID: newRepoID, owner: ownerID, kind: kind}
+}
+
+func (f *Fake) SetRepoID(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repoID = id
+}
+
+func (f *Fake) Recycle(newRepoID, ownerID int64, kind string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repoID = newRepoID
+	f.owners[newRepoID] = account{ID: ownerID, Login: f.Owner, Type: kind}
+}
+
+func (f *Fake) AddUser(id int64, login, kind string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.users == nil {
+		f.users = map[int64][2]string{}
+	}
+	f.users[id] = [2]string{login, kind}
 }
 
 // New starts API and raw servers.
 func New(owner, repo string) *Fake {
 	f := &Fake{Owner: owner, Repo: repo, DefaultBranch: "main", refs: map[string]string{}, commits: map[string]map[string]Entry{}, rawOver: map[string][]byte{}}
+	f.repoID = 4242
+	f.owners = map[int64]account{4242: {ID: 1, Login: owner, Type: "User"}}
 	f.API = httptest.NewServer(http.HandlerFunc(f.serveAPI))
 	f.Raw = httptest.NewServer(http.HandlerFunc(f.serveRaw))
 	return f
@@ -87,6 +160,25 @@ func (f *Fake) serveAPI(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	prefix := "/repos/" + f.Owner + "/" + f.Repo
 	p := r.URL.EscapedPath()
+	if id, ok := strings.CutPrefix(p, "/repositories/"); ok {
+		n, err := strconv.ParseInt(id, 10, 64)
+		if _, known := f.owners[n]; err != nil || !known {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(f.repoJSON(n))
+		return
+	}
+	if id, ok := strings.CutPrefix(p, "/user/"); ok {
+		for uid, u := range f.users {
+			if strconv.FormatInt(uid, 10) == id {
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": uid, "login": u[0], "type": u[1]})
+				return
+			}
+		}
+		http.NotFound(w, r)
+		return
+	}
 	if !strings.HasPrefix(p, prefix) {
 		http.NotFound(w, r)
 		return
@@ -94,7 +186,13 @@ func (f *Fake) serveAPI(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(p, prefix)
 	switch {
 	case rest == "":
-		_ = json.NewEncoder(w).Encode(map[string]any{"default_branch": f.DefaultBranch})
+		f.lookups++
+		if f.recycle != nil && f.lookups >= f.recycle.after {
+			f.repoID = f.recycle.repoID
+			f.owners[f.recycle.repoID] = account{ID: f.recycle.owner, Login: f.Owner, Type: f.recycle.kind}
+			f.recycle = nil
+		}
+		_ = json.NewEncoder(w).Encode(f.repoJSON(f.repoID))
 	case strings.HasPrefix(rest, "/commits/"):
 		ref := strings.TrimPrefix(rest, "/commits/")
 		c, ok := f.refs[ref]

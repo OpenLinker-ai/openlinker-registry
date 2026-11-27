@@ -142,6 +142,10 @@ func (s *Server) uiRender(w http.ResponseWriter, r *http.Request, status int, na
 
 func (s *Server) uiError(w http.ResponseWriter, r *http.Request, err error) {
 	e := registry.AsError(err)
+	if e.Location != "" {
+		http.Redirect(w, r, e.Location, e.Status)
+		return
+	}
 	if e.Status >= 500 && e.Code == "internal" {
 		s.Log.Error("page failed", "path", r.URL.Path, "err", err.Error())
 	}

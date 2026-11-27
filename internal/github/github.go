@@ -345,6 +345,8 @@ func escPath(p string) string {
 	return strings.Join(segs, "/")
 }
 
+func (c *Client) API(ctx context.Context, p string, out any) error { return c.apiJSON(ctx, p, out) }
+
 func (c *Client) apiJSON(ctx context.Context, p string, out any) error {
 	body, err := c.get(ctx, c.api, p, "application/vnd.github+json", 8<<20)
 	if err != nil {

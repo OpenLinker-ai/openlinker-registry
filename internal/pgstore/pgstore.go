@@ -165,6 +165,16 @@ func (s *Store) inTx(ctx context.Context, audit model.AuditEvent, fn func(tx pgx
 // caller read. It runs first, so the upstream row is always locked before
 // any entry row, the order UpdateUpstream uses.
 func contextGuard(ctx context.Context, tx pgx.Tx) error {
+	if skillID, ns, ok := model.SkillGuardFrom(ctx); ok {
+		var here bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skills s JOIN namespaces n ON n.id = s.namespace_id
+			WHERE s.id = $1 AND n.name = $2 FOR UPDATE OF s)`, skillID, ns).Scan(&here); err != nil {
+			return err
+		}
+		if !here {
+			return model.ErrEntryMoved()
+		}
+	}
 	id, version, ok := model.UpstreamGuardFrom(ctx)
 	if !ok {
 		return nil
@@ -201,11 +211,11 @@ func notFound(err error) error {
 	return err
 }
 
-const nsCols = `id, name, kind, github_id, display_name, COALESCE(upstream_id, 0), created_at`
+const nsCols = `id, name, kind, github_id, display_name, COALESCE(upstream_id, 0), COALESCE(openlinker_subject, ''), review_trusted, created_at`
 
 func scanNamespace(row pgx.Row) (model.Namespace, error) {
 	var ns model.Namespace
-	err := row.Scan(&ns.ID, &ns.Name, &ns.Kind, &ns.GitHubID, &ns.DisplayName, &ns.UpstreamID, &ns.CreatedAt)
+	err := row.Scan(&ns.ID, &ns.Name, &ns.Kind, &ns.GitHubID, &ns.DisplayName, &ns.UpstreamID, &ns.OpenLinkerSubject, &ns.ReviewTrusted, &ns.CreatedAt)
 	return ns, err
 }
 
@@ -379,7 +389,7 @@ func rowsOrNotFound(tag pgconn.CommandTag, err error) error {
 
 const skillCols = `s.id, n.name, s.name, s.description, s.visibility, s.listed, s.status, s.status_reason,
 	s.mode, COALESCE(s.source_key, ''), COALESCE(s.global_alias, ''), COALESCE(u.name, ''), s.current_version,
-	s.created_at, s.updated_at`
+	s.review_state, s.review_reason, s.review_revision, s.claimed, s.created_at, s.updated_at`
 
 // skillFrom joins what skillCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -388,7 +398,8 @@ const skillFrom = ` FROM skills s JOIN namespaces n ON n.id = s.namespace_id LEF
 func scanSkill(row pgx.Row, extra ...any) (model.Skill, error) {
 	var k model.Skill
 	dest := append([]any{&k.ID, &k.Namespace, &k.Name, &k.Description, &k.Visibility, &k.Listed, &k.Status,
-		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.Upstream, &k.CurrentVersion, &k.CreatedAt, &k.UpdatedAt}, extra...)
+		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.Upstream, &k.CurrentVersion,
+		&k.ReviewState, &k.ReviewReason, &k.ReviewRevision, &k.Claimed, &k.CreatedAt, &k.UpdatedAt}, extra...)
 	err := row.Scan(dest...)
 	return k, err
 }
@@ -440,7 +451,7 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 			sourceKey = &in.SourceKey
 		}
 		// Create the skill if missing; a concurrent creator wins and we re-read.
-		_, err = tx.Exec(ctx, `INSERT INTO skills (namespace_id, name, visibility, listed, mode, source_key)
+		tag, err := tx.Exec(ctx, `INSERT INTO skills (namespace_id, name, visibility, listed, mode, source_key)
 			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (namespace_id, name) DO NOTHING`,
 			nsID, in.Name, visibility, in.Listed, in.Mode, sourceKey)
 		if c, ok := uniqueViolation(err); ok && strings.Contains(c, "source_key") {
@@ -464,6 +475,21 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		if k.Status == model.StatusYanked {
 			return conflict("skill_yanked", "skill is yanked")
 		}
+		if tag.RowsAffected() == 1 {
+			var reserved bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skill_redirects WHERE from_namespace = $1 AND from_name = $2)`,
+				in.Namespace, in.Name).Scan(&reserved); err != nil {
+				return err
+			}
+			if reserved {
+				return conflict("name_reserved", "this name belonged to an entry that moved; it cannot be reused")
+			}
+		}
+		review, err := nextReview(ctx, tx, "skills", k.ID, nsID, tag.RowsAffected() == 1, k.ReviewState, in.Review)
+		if err != nil {
+			return err
+		}
+		k.ReviewState, k.ReviewReason, k.ReviewRevision = review.state, review.reason, review.revision
 		// Checked under the skill row lock, so a concurrent visibility
 		// change cannot interleave with this publish.
 		if in.Mode == "hosted" && k.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
@@ -805,6 +831,9 @@ func visibleSQL(col string, v model.Viewer, arg func(any) string) string {
 	if len(v.Namespaces) > 0 {
 		vis += " OR (" + col + " = 'private' AND n.name = ANY(" + arg(v.Namespaces) + "))"
 	}
+	if len(v.Members) > 0 {
+		vis += " OR (" + col + " = 'review' AND n.name = ANY(" + arg(v.Members) + "))"
+	}
 	return "(" + vis + ")"
 }
 
@@ -814,7 +843,7 @@ func (s *Store) Search(ctx context.Context, q model.SearchQuery) ([]model.SkillS
 	where := []string{"s.listed", "s.status <> 'yanked'"}
 	args := []any{}
 	arg := func(v any) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
-	if vis := visibleSQL("s.visibility", q.Viewer, arg); vis != "" {
+	if vis := visibleSQL("s.shown_visibility", q.Viewer, arg); vis != "" {
 		where = append(where, vis)
 	}
 	if q.Q != "" {
@@ -864,7 +893,7 @@ func likeEscape(s string) string {
 func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly bool) ([]model.IndexCandidate, error) {
 	rows, err := s.pool.Query(ctx, `SELECT s.id, v.version FROM skills s JOIN namespaces n ON n.id = s.namespace_id
 		JOIN LATERAL (SELECT version FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL `+latestOrder+`) v ON true
-		WHERE s.visibility = 'public' AND s.listed AND s.status = 'active'
+		WHERE s.shown_visibility = 'public' AND s.listed AND s.status = 'active'
 		AND ($1 = '' OR n.name = $1) AND (NOT $2 OR s.global_alias IS NOT NULL)
 		ORDER BY n.name, s.name`, namespace, aliasOnly)
 	if err != nil {
@@ -899,7 +928,7 @@ func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly
 		if err != nil {
 			return nil, err
 		}
-		if sk.Visibility != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive {
+		if sk.ShownVisibility() != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive {
 			continue
 		}
 		out = append(out, model.IndexCandidate{Skill: sk, Version: v})

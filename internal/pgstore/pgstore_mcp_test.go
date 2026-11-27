@@ -61,7 +61,7 @@ func TestMigration0004Fresh(t *testing.T) {
 	st, schema := newStoreSchema(t)
 	ctx := context.Background()
 	conn := connSchema(t, schema)
-	if got := appliedMigrations(t, conn); !slices.Equal(got, []int{1, 2, 3, 4, 5}) {
+	if got := appliedMigrations(t, conn); !slices.Equal(got, []int{1, 2, 3, 4, 5, 6}) {
 		t.Fatalf("applied migrations = %v", got)
 	}
 	for _, table := range []string{"upstreams", "mcp_servers", "mcp_server_versions"} {
@@ -135,7 +135,7 @@ func TestMigration0004Upgrade(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatalf("migrate is not idempotent: %v", err)
 	}
-	if got := appliedMigrations(t, conn); !slices.Equal(got, []int{1, 2, 3, 4, 5}) {
+	if got := appliedMigrations(t, conn); !slices.Equal(got, []int{1, 2, 3, 4, 5, 6}) {
 		t.Fatalf("applied migrations = %v", got)
 	}
 

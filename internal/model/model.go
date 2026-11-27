@@ -3,6 +3,7 @@ package model
 
 import (
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
@@ -102,8 +103,10 @@ type Namespace struct {
 	DisplayName string
 	// UpstreamID is the upstream that manages this namespace (0 for local
 	// namespaces). Kind is NSKindUpstream exactly when it is set.
-	UpstreamID int64
-	CreatedAt  time.Time
+	UpstreamID        int64
+	OpenLinkerSubject string
+	ReviewTrusted     bool
+	CreatedAt         time.Time
 }
 
 // Token is a stored API token (only the secret hash is persisted).
@@ -145,9 +148,15 @@ type Skill struct {
 	// index that returns to earlier content names a version recorded before
 	// the newest one. See LatestVersion.
 	CurrentVersion string
+	ReviewState    string
+	ReviewReason   string
+	ReviewRevision int64
+	Claimed        bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
+
+func (s Skill) ShownVisibility() string { return ShownVisibility(s.ReviewState, s.Visibility) }
 
 // CheckSource says where the content of an indexed version was read from
 // when it was verified. A check result is about that source only: the
@@ -209,6 +218,7 @@ type Locator struct {
 	Path       string `json:"path,omitempty"`
 	TreeSHA    string `json:"tree_sha,omitempty"`
 	SingleFile bool   `json:"single_file,omitempty"`
+	RepoID     int64  `json:"repo_id,omitempty"`
 	// URL: an entry of an external agent-skills discovery index. Digest is
 	// the sha256 of the bytes at URL; EntryType is "skill-md" or "archive".
 	URL       string `json:"url,omitempty"`
@@ -288,6 +298,7 @@ type Viewer struct {
 	Authenticated bool
 	// Namespaces where the caller holds any role.
 	Namespaces []string
+	Members    []string
 }
 
 // CanSee applies the visibility policy for one skill: public to anyone,
@@ -303,11 +314,9 @@ func (v Viewer) CanSee(namespace, visibility string) bool {
 	case VisibilityInternal:
 		return v.Authenticated
 	case VisibilityPrivate:
-		for _, ns := range v.Namespaces {
-			if ns == namespace {
-				return true
-			}
-		}
+		return slices.Contains(v.Namespaces, namespace)
+	case VisibilityReview:
+		return slices.Contains(v.Members, namespace)
 	}
 	return false
 }
@@ -349,6 +358,7 @@ type PublishInput struct {
 	// concurrent refreshes cannot interleave and leave versions out of the
 	// upstream's order; a mismatch is ConflictError version_order.
 	ExpectNewest *string
+	Review       ReviewRule
 	// A published version becomes the skill's latest: publishing clears
 	// Skill.CurrentVersion.
 	Version Version
@@ -358,4 +368,94 @@ type PublishInput struct {
 type SkillPatch struct {
 	Visibility *string
 	Listed     *bool
+}
+
+const (
+	ReviewApproved = "approved"
+	ReviewPending  = "pending"
+	ReviewRejected = "rejected"
+)
+
+const VisibilityReview = "review"
+
+func ShownVisibility(review, visibility string) string {
+	if review == "" || review == ReviewApproved {
+		return visibility
+	}
+	return VisibilityReview
+}
+
+func PresentedVisibility(shown string) string {
+	if shown == VisibilityReview {
+		return VisibilityPrivate
+	}
+	return shown
+}
+
+type ReviewRule struct {
+	Enabled bool
+	Always  bool
+}
+
+func (r ReviewRule) Initial(trusted bool) string {
+	if r.Enabled && (r.Always || !trusted) {
+		return ReviewPending
+	}
+	return ReviewApproved
+}
+
+func (r ReviewRule) Next(current string) string {
+	if r.Enabled && (r.Always || current == ReviewRejected) {
+		return ReviewPending
+	}
+	if current == "" {
+		return ReviewApproved
+	}
+	return current
+}
+
+type ReviewItem struct {
+	Kind        string
+	ID          int64
+	Namespace   string
+	Name        string
+	Mode        string
+	State       string
+	Reason      string
+	Revision    int64
+	Visibility  string
+	CreatedBy   string
+	OpenReports int
+	UpdatedAt   time.Time
+}
+
+type ReviewDecision struct {
+	Kind           string
+	ID             int64
+	State          string
+	Reason         string
+	Revision       int64
+	TrustNamespace bool
+}
+
+type Report struct {
+	ID         int64
+	Kind       string
+	EntryID    int64
+	Namespace  string
+	Name       string
+	Version    string
+	Reporter   string
+	Category   string
+	Details    string
+	State      string
+	CreatedAt  time.Time
+	ResolvedAt *time.Time
+	ResolvedBy string
+}
+
+type ReportResult struct {
+	Report   Report
+	Created  bool
+	Reopened bool
 }

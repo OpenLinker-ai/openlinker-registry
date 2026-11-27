@@ -13,6 +13,30 @@ The registry has its own version numbers; see [RELEASE.md](./RELEASE.md).
   an indexed version whose license withholds redistribution.
 - `REGISTRY_ASSERTION_AUDIENCE` (default: the public URL).
 - Migration `0005` (gateways, gateway keys, used assertion ids).
+- Review queue (`REGISTRY_REVIEW`, on by default in public mode): the first
+  entries of a namespace that is not yet trusted, and every indexed entry and
+  each of its new versions, wait for an administrator. An entry under review is
+  readable only by its namespace members (never through a gateway's shared
+  namespace roles) and administrators, on every read path; replication metadata
+  presents it as `private`, so downstream mirrors do not copy it.
+  `GET /v1/admin/review`, `POST /v1/admin/review/skills/{ns}/{name}` and
+  `…/mcp/servers/{ns}/{name}` (`approve` or `reject` the `review_revision` that
+  was reviewed, optionally trusting the namespace), `PATCH /v1/admin/namespaces/{ns}`.
+- Reports: `POST /v1/reports` for signed-in callers; distinct open reports
+  reaching `REGISTRY_REPORT_THRESHOLD` (default 3) send an approved entry back
+  to review. `GET /v1/admin/reports`, `POST /v1/admin/reports/{id}/resolve`.
+- Namespace self-service through a gateway: `POST /v1/namespaces` for
+  `ai.openlinker.<handle>` (one per user, public instance) and
+  `io.github.<login>` (login looked up by the asserted numeric GitHub id;
+  personal accounts only).
+- Claims: `POST /v1/skills/{ns}/{name}/claim` moves an entry indexed from a
+  GitHub repository owned by the asserted personal account into its
+  `io.github.<login>` namespace. Indexed versions now record the repository's
+  numeric id, and claims are checked against that id; older entries cannot be
+  claimed. The old coordinates answer `308` and stay reserved; writes
+  authorized before a claim cannot land after it.
+- Migration `0006` (review state, trusted namespaces, reports, redirects). All
+  existing entries are approved.
 
 ## v0.1.0 — 2026-11-18
 

@@ -45,10 +45,13 @@ func (s *Server) mcpRoutes(m *http.ServeMux) {
 // --- presentation ---
 
 func mcpServerJSON(srv model.MCPServer) map[string]any {
-	out := map[string]any{"name": srv.Name, "namespace": srv.Namespace, "mode": srv.Mode, "visibility": srv.Visibility,
+	out := map[string]any{"name": srv.Name, "namespace": srv.Namespace, "mode": srv.Mode, "visibility": model.PresentedVisibility(srv.ShownVisibility()),
 		"listed": srv.Listed, "created_at": srv.CreatedAt, "updated_at": srv.UpdatedAt}
 	if srv.Upstream != "" {
 		out["upstream"] = srv.Upstream
+	}
+	if review := reviewJSON(srv.ReviewState, srv.ReviewReason, srv.Visibility, srv.ReviewRevision); review != nil {
+		out["review"] = review
 	}
 	return out
 }
@@ -79,7 +82,7 @@ func v0Response(srv model.MCPServer, v model.MCPVersion) map[string]any {
 	}
 	// A downstream registry mirrors visibility and listing from here so that
 	// it never shows an entry more widely than this instance does.
-	entry := map[string]any{"mode": srv.Mode, "digest": v.Digest, "visibility": srv.Visibility, "listed": srv.Listed}
+	entry := map[string]any{"mode": srv.Mode, "digest": v.Digest, "visibility": model.PresentedVisibility(srv.ShownVisibility()), "listed": srv.Listed}
 	if srv.Upstream != "" {
 		entry["upstream"] = srv.Upstream
 	}
@@ -206,12 +209,12 @@ func (s *Server) loadVisibleMCP(r *http.Request, name, version string) (model.MC
 	if err != nil && !missing {
 		return srv, v, err
 	}
-	visible := !missing && viewer.CanSee(srv.Namespace, srv.Visibility)
+	visible := !missing && viewer.CanSee(srv.Namespace, srv.ShownVisibility())
 	// The server is here but the caller may not see it: whether one of its
 	// versions is stored must not show. Nothing is asked upstream for it (an
 	// upstream failure would answer differently from a stored version), but
 	// the request draws on the forwarding budget like any other miss.
-	hidden := srv.ID != 0 && !viewer.CanSee(srv.Namespace, srv.Visibility)
+	hidden := srv.ID != 0 && !viewer.CanSee(srv.Namespace, srv.ShownVisibility())
 	if !visible && s.Svc.CanForwardMCP(r.Context(), viewer, name) {
 		if err := s.chargeForward(r); err != nil {
 			return srv, v, err
@@ -224,7 +227,7 @@ func (s *Server) loadVisibleMCP(r *http.Request, name, version string) (model.MC
 			if err != nil {
 				return srv, v, err
 			}
-			visible = viewer.CanSee(srv.Namespace, srv.Visibility)
+			visible = viewer.CanSee(srv.Namespace, srv.ShownVisibility())
 		}
 	}
 	if !visible {
@@ -247,7 +250,7 @@ func (s *Server) confirmMCP(r *http.Request, srv model.MCPServer) (model.MCPServ
 	if err != nil {
 		return model.MCPServer{}, err
 	}
-	if now.ID != srv.ID || !principal(r).Viewer().CanSee(now.Namespace, now.Visibility) {
+	if now.ID != srv.ID || !principal(r).Viewer().CanSee(now.Namespace, now.ShownVisibility()) {
 		return model.MCPServer{}, errNotFound
 	}
 	return now, nil
@@ -339,7 +342,7 @@ func (s *Server) getMCPServer(w http.ResponseWriter, r *http.Request) {
 		// still exists.
 		var lerr error
 		if srv, lerr = s.Svc.Store.GetMCPServer(r.Context(), serverName(r)); lerr != nil ||
-			!principal(r).Viewer().CanSee(srv.Namespace, srv.Visibility) {
+			!principal(r).Viewer().CanSee(srv.Namespace, srv.ShownVisibility()) {
 			s.fail(w, r, err)
 			return
 		}
@@ -372,7 +375,7 @@ func (s *Server) getMCPVersion(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.setCache(w, r, srv.Visibility == model.VisibilityPublic)
+	s.setCache(w, r, srv.ShownVisibility() == model.VisibilityPublic)
 	writeJSON(w, http.StatusOK, mcpVersionJSON(srv, v))
 }
 
@@ -535,7 +538,7 @@ func (s *Server) v0Get(w http.ResponseWriter, r *http.Request, name, version str
 		s.v0Fail(w, r, err)
 		return
 	}
-	s.setCache(w, r, srv.Visibility == model.VisibilityPublic)
+	s.setCache(w, r, srv.ShownVisibility() == model.VisibilityPublic)
 	writeJSON(w, http.StatusOK, v0Response(srv, v))
 }
 
@@ -544,7 +547,7 @@ func (s *Server) v0Versions(w http.ResponseWriter, r *http.Request, name string)
 	if err != nil {
 		var lerr error
 		if srv, lerr = s.Svc.Store.GetMCPServer(r.Context(), name); lerr != nil ||
-			!principal(r).Viewer().CanSee(srv.Namespace, srv.Visibility) {
+			!principal(r).Viewer().CanSee(srv.Namespace, srv.ShownVisibility()) {
 			if err == errNotFound {
 				err = &registry.Error{Status: http.StatusNotFound, Code: "not_found", Msg: "Server not found"}
 			}

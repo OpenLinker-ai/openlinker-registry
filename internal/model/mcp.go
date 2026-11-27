@@ -43,11 +43,16 @@ type MCPServer struct {
 	Listed     bool
 	// Upstream is the name of the upstream that manages the namespace ("" for
 	// local entries).
-	Upstream  string
-	CreatedBy string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Upstream       string
+	ReviewState    string
+	ReviewReason   string
+	ReviewRevision int64
+	CreatedBy      string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
+
+func (m MCPServer) ShownVisibility() string { return ShownVisibility(m.ReviewState, m.Visibility) }
 
 // MCPVersion is one published version. ServerJSON, Digest, Version,
 // PublishedAt and CreatedBy never change; status fields and IsLatest may.
@@ -81,6 +86,7 @@ type MCPPublishInput struct {
 	Mode       string // registered | indexed
 	Visibility string // used only when creating the server
 	Listed     bool   // used only when creating the server
+	Review     ReviewRule
 	Version    MCPVersion
 }
 

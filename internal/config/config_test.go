@@ -87,3 +87,26 @@ func TestAssertionAudience(t *testing.T) {
 		t.Fatalf("configured audience %q %v", c.AssertionAudience, err)
 	}
 }
+
+func TestReviewSettings(t *testing.T) {
+	env := map[string]string{"REGISTRY_DATABASE_URL": "postgres://x", "REGISTRY_PUBLIC_URL": "https://r.example"}
+	get := func(k string) string { return env[k] }
+	c, err := Load(nil, get)
+	if err != nil || c.Review || c.ReportThreshold != 3 {
+		t.Fatalf("private defaults: review %v threshold %d %v", c.Review, c.ReportThreshold, err)
+	}
+	env["REGISTRY_MODE"] = "public"
+	if c, err := Load(nil, get); err != nil || !c.Review {
+		t.Fatalf("public instances review by default: %v", err)
+	}
+	env["REGISTRY_REVIEW"] = "false"
+	env["REGISTRY_REPORT_THRESHOLD"] = "5"
+	if c, err := Load(nil, get); err != nil || c.Review || c.ReportThreshold != 5 {
+		t.Fatalf("explicit settings: %+v %v", c, err)
+	}
+	for _, bad := range [][]string{{"-review", "maybe"}, {"-report-threshold", "0"}, {"-report-threshold", "x"}, {"-report-threshold", "1001"}} {
+		if _, err := Load(bad, get); err == nil {
+			t.Errorf("%v accepted", bad)
+		}
+	}
+}

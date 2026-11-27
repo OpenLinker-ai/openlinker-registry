@@ -100,10 +100,19 @@ curl -sS -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
 发布前的检查清单，以及固定本仓库提交的 OpenLinker 主仓库与这些 tag 的关系，见 [RELEASE.md](RELEASE.md)
 （英文）。实际发布过哪些版本，以 [CHANGELOG.md](CHANGELOG.md)、本仓库的 Releases 页面和镜像列表为准。
 
+## 审核、举报与认领
+
+公开模式默认开启审核（`REGISTRY_REVIEW`）：未受信任命名空间的新条目、所有收录条目及其每个新版本都先进入审核，
+审核中的条目只有命名空间成员（不含网关被共享的角色）和管理员能读，复制元数据里显示为 `private`，下游镜像不会复制。
+登录用户可以举报，不同举报者达到 `REGISTRY_REPORT_THRESHOLD`（默认 3）时条目回到审核。
+网关用户可以领取 `ai.openlinker.<handle>` 或 `io.github.<login>`，并认领从自己个人 GitHub 仓库收录的条目
+（按收录时记录的仓库数字 ID 校验）；旧地址 308 跳转并永久保留。接口细节见英文 README 的
+“Review, reports and claims”。
+
 ## 未包含
 
-OpenLinker Core 接入（目录代理、网关断言、导入 Core）、GitHub 登录与命名空间自助、GitHub Actions OIDC、
-企业 OIDC 单点登录、DNS/HTTP 命名空间验证、认领与共享、审核队列与举报、离线包、发布者签名、
+Registry 自身的 GitHub 登录、经网关的组织命名空间、GitHub Actions OIDC、
+企业 OIDC 单点登录、DNS/HTTP 命名空间验证（以及按域名认领 MCP 远程地址）、认领时合并到已有条目、条目级共享、离线包、发布者签名、
 S3 存储（接口已有，内容在本地磁盘，一个存储目录只能由一个进程使用）、多副本共享的限流、
 手工收录单个任意 URL（发现索引以上游方式同步）、网页上的写操作。
 
