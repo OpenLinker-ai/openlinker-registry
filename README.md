@@ -363,6 +363,7 @@ with `skills:write`; only public instances accept projections.
 | `PUT /v1/projections/skills/{name}/versions/{v}?license=` | Core bundle | Immutable version, created hidden; same bytes again is 200, other bytes 409 |
 | `PUT /v1/projections/skills/{name}` | `{op, revision, phase, owner:{sub}, state, listed, versions, current_version, display, legacy}` | The entry's complete state |
 | `PUT /v1/projections/mcp/{name}` | `{op, revision, phase, owner:{sub}, state, listed, version, server, metadata, metadata_revision, legacy}` | The MCP server's complete state; a new `version` adds an immutable version |
+| `GET /v1/projections/skills/{name}`, `GET /v1/projections/mcp/{name}` | — | The managed entry's projection state (revision, phase, hidden, listed, visible and ingested versions with digests, review state), for its own gateway and owner only; used for reconciliation |
 | `POST /v1/projections/validate` | Core bundle | `{ok, code, message}` without writing |
 | `POST /v1/projections/namespaces/preflight` | `{subjects}` | The namespace each owner would use, or a conflict |
 

@@ -16,6 +16,8 @@ func (s *Server) projectionRoutes(m *http.ServeMux) {
 	m.HandleFunc("PUT /v1/projections/skills/{name}/versions/{version}", s.projectVersion)
 	m.HandleFunc("PUT /v1/projections/skills/{name}", s.projectSkill)
 	m.HandleFunc("PUT /v1/projections/mcp/{name}", s.projectMCP)
+	m.HandleFunc("GET /v1/projections/skills/{name}", s.projectionState(false))
+	m.HandleFunc("GET /v1/projections/mcp/{name}", s.projectionState(true))
 	m.HandleFunc("POST /v1/projections/validate", s.projectValidate)
 	m.HandleFunc("POST /v1/projections/namespaces/preflight", s.projectNamespaces)
 	m.HandleFunc("PATCH /v1/admin/gateways/{consumer}", s.admin(s.patchGateway))
@@ -186,4 +188,30 @@ func (s *Server) patchGateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"consumer": consumer, "projection": *req.Projection})
+}
+
+func (s *Server) projectionState(mcp bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p, err := s.projector(r)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		var out map[string]any
+		if mcp {
+			out, err = s.Svc.MCPProjectionState(r.Context(), p, r.PathValue("name"))
+		} else {
+			out, err = s.Svc.SkillProjectionState(r.Context(), p, r.PathValue("name"))
+		}
+		var ce *model.ConflictError
+		if errors.Is(err, model.ErrNotFound) || errors.As(err, &ce) {
+			s.fail(w, r, errNotFound)
+			return
+		}
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}
 }

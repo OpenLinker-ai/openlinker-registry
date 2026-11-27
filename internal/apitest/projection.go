@@ -118,6 +118,13 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("stale applied: %s", r.Body)
 		}
 		e.Expect(e.Do("GET", entry+"/versions/1", "", "", nil), 404, "stale state changes nothing")
+		r = e.Expect(alice.send("GET", "/v1/projections/skills/p-tools", nil, ""), 200, "projection state")
+		if r.JSON["revision"] != float64(2) || r.JSON["hidden"] != false || r.JSON["current_version"] != "2" ||
+			strings.Join(toStrings(r.JSON["versions"]), ",") != "2" || strings.Join(toStrings(r.JSON["ingested"]), ",") != "1,2" {
+			t.Fatalf("projection state: %s", r.Body)
+		}
+		e.Expect(projector{g, otherUser}.send("GET", "/v1/projections/skills/p-tools", nil, ""), 404, "another owner's state")
+		e.Expect(projector{plain, coreUser}.send("GET", "/v1/projections/skills/p-tools", nil, ""), 403, "plain gateway state")
 		r = e.Expect(alice.state("p-tools", withdraw), 200, "replayed op")
 		if r.JSON["applied"] != true {
 			t.Fatalf("replay must return the first result: %s", r.Body)
@@ -204,6 +211,10 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		e.Expect(alice.send("PUT", "/v1/projections/mcp/m-weather", body, "application/json"), 200, "mcp hidden")
 		e.Expect(e.Do("GET", "/v0.1/servers/"+name+"/versions/latest", "", "", nil), 404, "hidden official read")
 		e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather", "", "", nil), 404, "hidden native read")
+		r := e.Expect(alice.send("GET", "/v1/projections/mcp/m-weather", nil, ""), 200, "mcp projection state")
+		if r.JSON["revision"] != float64(2) || r.JSON["hidden"] != true || r.JSON["version"] != "0.1.1" {
+			t.Fatalf("mcp projection state: %s", r.Body)
+		}
 	})
 
 	t.Run("validate and namespace preflight", func(t *testing.T) {
@@ -234,4 +245,13 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("reserved: %s", r.Body)
 		}
 	})
+}
+
+func toStrings(v any) []string {
+	var out []string
+	list, _ := v.([]any)
+	for _, x := range list {
+		out = append(out, x.(string))
+	}
+	return out
 }

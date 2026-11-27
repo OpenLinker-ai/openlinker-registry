@@ -293,3 +293,64 @@ func (s *Service) PreflightNamespaces(ctx context.Context, p Projector, subs []s
 	}
 	return out, nil
 }
+
+func (s *Service) managedSkill(ctx context.Context, p Projector, name string) (model.Skill, error) {
+	ns, err := s.projectionNamespace(ctx, p, false)
+	if err != nil {
+		return model.Skill{}, err
+	}
+	sk, err := s.Store.GetSkill(ctx, ns.Name, name)
+	if err != nil {
+		return model.Skill{}, err
+	}
+	if managedOwner(sk.Managed, p.Target) != nil {
+		return model.Skill{}, model.ErrNotFound
+	}
+	return sk, nil
+}
+
+func (s *Service) SkillProjectionState(ctx context.Context, p Projector, name string) (map[string]any, error) {
+	sk, err := s.managedSkill(ctx, p, name)
+	if err != nil {
+		return nil, err
+	}
+	versions, err := s.Store.ListVersionSummaries(ctx, sk.ID)
+	if err != nil {
+		return nil, err
+	}
+	visible, ingested := []string{}, []string{}
+	digests := map[string]string{}
+	for i := len(versions) - 1; i >= 0; i-- {
+		v := versions[i]
+		ingested = append(ingested, v.Version)
+		digests[v.Version] = v.ArtifactDigest
+		if !v.Hidden && v.YankedAt == nil {
+			visible = append(visible, v.Version)
+		}
+	}
+	return map[string]any{"namespace": sk.Namespace, "name": sk.Name, "revision": sk.Managed.Revision, "phase": sk.Managed.Phase,
+		"hidden": sk.Managed.Hidden, "listed": sk.Listed, "current_version": sk.CurrentVersion, "versions": visible,
+		"ingested": ingested, "digests": digests, "review": sk.ReviewState}, nil
+}
+
+func (s *Service) MCPProjectionState(ctx context.Context, p Projector, name string) (map[string]any, error) {
+	ns, err := s.projectionNamespace(ctx, p, false)
+	if err != nil {
+		return nil, err
+	}
+	srv, err := s.Store.GetMCPServer(ctx, ns.Name+"/"+name)
+	if err != nil {
+		return nil, err
+	}
+	if managedOwner(srv.Managed, p.Target) != nil {
+		return nil, model.ErrNotFound
+	}
+	out := map[string]any{"namespace": ns.Name, "name": srv.Name, "revision": srv.Managed.Revision, "phase": srv.Managed.Phase,
+		"hidden": srv.Managed.Hidden, "listed": srv.Listed, "version": "", "digest": "", "review": srv.ReviewState}
+	if v, err := s.Store.GetMCPVersion(ctx, srv.ID, "latest"); err == nil {
+		out["version"], out["digest"] = v.Version, v.Digest
+	} else if !errors.Is(err, model.ErrNotFound) {
+		return nil, err
+	}
+	return out, nil
+}
