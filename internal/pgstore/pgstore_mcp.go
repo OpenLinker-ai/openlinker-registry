@@ -14,7 +14,7 @@ import (
 )
 
 const mcpServerCols = `m.id, n.name, m.name, m.mode, m.visibility, m.listed, COALESCE(u.name, ''), m.review_state,
-	m.review_reason, m.created_by, m.created_at, m.updated_at`
+	m.review_reason, m.review_revision, m.created_by, m.created_at, m.updated_at`
 
 // mcpServerFrom joins what mcpServerCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -26,7 +26,7 @@ const mcpVersionCols = `v.id, v.server_id, v.version, v.server_json, v.digest, v
 
 func mcpServerDest(s *model.MCPServer) []any {
 	return []any{&s.ID, &s.Namespace, &s.Name, &s.Mode, &s.Visibility, &s.Listed, &s.Upstream, &s.ReviewState,
-		&s.ReviewReason, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt}
+		&s.ReviewReason, &s.ReviewRevision, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt}
 }
 
 func mcpVersionDest(v *model.MCPVersion) []any {

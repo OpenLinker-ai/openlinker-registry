@@ -131,11 +131,16 @@ func (m *Memory) PublishMCPVersion(_ context.Context, in model.MCPPublishInput, 
 		s = model.MCPServer{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
 			Listed: in.Listed, CreatedBy: in.Version.CreatedBy, CreatedAt: now}
 	}
+	prev := s.ReviewState
 	if ok {
 		s.ReviewState = in.Review.Next(s.ReviewState)
 	} else {
 		s.ReviewState = in.Review.Initial(ns.ReviewTrusted)
 	}
+	if s.ReviewState != prev {
+		s.ReviewReason = ""
+	}
+	s.ReviewRevision++
 	at := now
 	if !in.Version.PublishedAt.IsZero() {
 		at = micro(in.Version.PublishedAt)

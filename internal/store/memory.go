@@ -300,14 +300,16 @@ func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audi
 		m.appendAudit(model.AuditEvent{Actor: audit.Actor, Action: "namespace.mirror", Namespace: in.Namespace,
 			Details: map[string]any{"upstream_id": in.UpstreamID}})
 	}
+	prev := s.ReviewState
 	if ok {
 		s.ReviewState = in.Review.Next(s.ReviewState)
 	} else {
 		s.ReviewState = in.Review.Initial(ns.ReviewTrusted)
 	}
-	if s.ReviewState != model.ReviewApproved {
+	if s.ReviewState != prev {
 		s.ReviewReason = ""
 	}
+	s.ReviewRevision++
 	v := in.Version
 	v.ID, v.SkillID, v.CreatedAt, v.Mode = m.id(), s.ID, now, in.Mode
 	v.Files = slices.Clone(v.Files)

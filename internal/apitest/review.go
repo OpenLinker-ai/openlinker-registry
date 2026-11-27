@@ -34,6 +34,19 @@ func (a actor) get(path string) Resp {
 	return a.g.read(path, func(x *Assertion) { x.Sub, x.GH = a.sub, a.gh })
 }
 
+func (e *Env) decide(kind, entry string, body map[string]any) Resp {
+	e.T.Helper()
+	read := "/v1/skills/" + entry
+	if kind == "mcp/servers" {
+		read = "/v1/mcp/servers/" + entry
+	}
+	r := e.Expect(e.Do("GET", read, AdminToken, "", nil), 200, "admin reads "+entry)
+	if review, ok := r.JSON["review"].(map[string]any); ok {
+		body["revision"] = review["revision"]
+	}
+	return e.Do("POST", "/v1/admin/review/"+kind+"/"+entry, AdminToken, "", body)
+}
+
 func reviewState(r Resp) string {
 	m, _ := r.JSON["review"].(map[string]any)
 	if m == nil {
@@ -126,8 +139,11 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 		e.Expect(e.Do("GET", "/v1/admin/review", "", "", nil), 401, "anonymous queue")
 		e.Expect(alice.json("POST", "/v1/admin/review/skills/ai.openlinker.alice/first", `{"decision":"approve"}`), 403, "user cannot approve")
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.alice/first", AdminToken, "", map[string]any{"decision": "maybe"}), 422, "bad decision")
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.alice/first", AdminToken, "", map[string]any{"decision": "approve", "trust_namespace": true}), 200, "approve")
+		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.alice/first", AdminToken, "", map[string]any{"decision": "maybe", "revision": 1}), 422, "bad decision")
+		if r := e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.alice/first", AdminToken, "", map[string]any{"decision": "approve", "revision": 99}), 409, "stale revision"); errCode(r) != "review_stale" {
+			t.Fatalf("stale: %s", r.Body)
+		}
+		e.Expect(e.decide("skills", "ai.openlinker.alice/first", map[string]any{"decision": "approve", "trust_namespace": true}), 200, "approve")
 		for _, p := range hidden[:4] {
 			if strings.Contains(p, "purpose=import") {
 				e.Expect(g.do("GET", p, nil, "", ""), 200, "gateway import after approval")
@@ -177,7 +193,7 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("indexed: %s", r.Body)
 		}
 		e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.alice/demo", "", "", nil), 404, "indexed hidden")
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.alice/demo", AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve indexed")
+		e.Expect(e.decide("skills", "ai.openlinker.alice/demo", map[string]any{"decision": "approve"}), 200, "approve indexed")
 		e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.alice/demo", "", "", nil), 200, "indexed visible")
 		p = e.Expect(alice.json("POST", "/v1/skills/ai.openlinker.alice/indexes/preview", body), 200, "preview again")
 		r = e.Expect(alice.json("POST", "/v1/skills/ai.openlinker.alice/indexes", `{"url":"`+demo+`","commit":"`+p.JSON["commit"].(string)+
@@ -186,12 +202,21 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("new indexed version: %s", r.Body)
 		}
 		e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.alice/demo", "", "", nil), 404, "indexed hidden again")
+		seen := e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.alice/demo", AdminToken, "", nil), 200, "reviewer looks")
+		revision := seen.JSON["review"].(map[string]any)["revision"]
+		p = e.Expect(alice.json("POST", "/v1/skills/ai.openlinker.alice/indexes/preview", body), 200, "preview third")
+		e.Expect(alice.json("POST", "/v1/skills/ai.openlinker.alice/indexes", `{"url":"`+demo+`","commit":"`+p.JSON["commit"].(string)+
+			`","expected_tree_sha":"`+p.JSON["tree_sha"].(string)+`","version":"3"}`), 201, "submitted after the reviewer looked")
+		if r := e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.alice/demo", AdminToken, "", map[string]any{"decision": "approve", "revision": revision}), 409, "approval of what was seen"); errCode(r) != "review_stale" {
+			t.Fatalf("stale approval: %s", r.Body)
+		}
+		e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.alice/demo", "", "", nil), 404, "still hidden")
 	})
 
 	bobSkill := "/v1/skills/ai.openlinker.bob/spam"
 	t.Run("rejection and resubmission", func(t *testing.T) {
 		e.Expect(bob.send("POST", bobSkill+"/versions?version=1", md("spam", "Spam", "MIT"), "text/markdown"), 201, "bob publish")
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.bob/spam", AdminToken, "", map[string]any{"decision": "reject", "reason": "spam"}), 200, "reject")
+		e.Expect(e.decide("skills", "ai.openlinker.bob/spam", map[string]any{"decision": "reject", "reason": "spam"}), 200, "reject")
 		r := e.Expect(bob.get(bobSkill), 200, "bob reads rejected")
 		review := r.JSON["review"].(map[string]any)
 		if review["state"] != "rejected" || review["reason"] != "spam" {
@@ -232,7 +257,7 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 		rid := url.PathEscape(jsonNumber(reports[0].(map[string]any)["id"]))
 		e.Expect(e.Do("POST", "/v1/admin/reports/"+rid+"/resolve", AdminToken, "", map[string]any{"resolution": "dismissed"}), 200, "resolve")
 		e.Expect(e.Do("POST", "/v1/admin/reports/"+rid+"/resolve", AdminToken, "", map[string]any{"resolution": "dismissed"}), 409, "resolve twice")
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.alice/first", AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve again")
+		e.Expect(e.decide("skills", "ai.openlinker.alice/first", map[string]any{"decision": "approve"}), 200, "approve again")
 		e.Expect(e.Do("GET", first, "", "", nil), 200, "visible again")
 		e.Expect(e.Do("POST", "/v1/reports", AdminToken, "", []byte(`{"kind":"skill","namespace":"ai.openlinker.alice","name":"second","category":"other","details":""}`)), 201, "admin report")
 		e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.alice/second", "", "", nil), 404, "admin report reopens at once")
@@ -255,7 +280,7 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 				t.Fatalf("pending listed in %s", p)
 			}
 		}
-		e.Expect(e.Do("POST", "/v1/admin/review/mcp/servers/ai.openlinker.bob/weather", AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve mcp")
+		e.Expect(e.decide("mcp/servers", "ai.openlinker.bob/weather", map[string]any{"decision": "approve"}), 200, "approve mcp")
 		e.Expect(e.Do("GET", "/v0.1/servers/"+esc+"/versions/latest", "", "", nil), 200, "approved mcp")
 		indexed := `{"name":"ai.openlinker.bob/other","description":"Other","version":"1","remotes":[{"type":"sse","url":"https://mcp.other.example/sse"}]}`
 		r = e.Expect(bob.json("POST", "/v1/mcp/servers/ai.openlinker.bob?indexed=true", indexed), 201, "mcp indexed")
@@ -270,7 +295,7 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 		owner := actor{cg, coreUser, ""}
 		ce.Expect(owner.json("POST", "/v1/namespaces", `{"name":"ai.openlinker.owner"}`), 201, "handle")
 		ce.Expect(owner.send("POST", "/v1/skills/ai.openlinker.owner/x/versions?version=1", md("x", "X", "MIT"), "text/markdown"), 201, "publish")
-		ce.Expect(ce.Do("POST", "/v1/admin/review/skills/ai.openlinker.owner/x", AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve")
+		ce.Expect(ce.decide("skills", "ai.openlinker.owner/x", map[string]any{"decision": "approve"}), 200, "approve")
 		subs := []string{"0d5c3c1e-0000-4000-8000-000000000001", "0d5c3c1e-0000-4000-8000-000000000002", "0d5c3c1e-0000-4000-8000-000000000003"}
 		assertions := make([]string, len(subs))
 		body := []byte(`{"kind":"skill","namespace":"ai.openlinker.owner","name":"x","category":"spam","details":""}`)
@@ -322,13 +347,13 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 		path := "/v1/skills/ai.openlinker.author/tool"
 		down.sync("hub")
 		down.Expect(down.Do("GET", path, reader, "", nil), 404, "pending is not mirrored")
-		up.Expect(up.Do("POST", "/v1/admin/review/skills/ai.openlinker.author/tool", AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve")
+		up.Expect(up.decide("skills", "ai.openlinker.author/tool", map[string]any{"decision": "approve"}), 200, "approve")
 		down.sync("hub")
 		down.Expect(down.Do("GET", path, reader, "", nil), 200, "approved is mirrored")
 		up.Expect(up.Do("POST", "/v1/reports", AdminToken, "", []byte(`{"kind":"skill","namespace":"ai.openlinker.author","name":"tool","category":"malware","details":""}`)), 201, "admin report")
 		down.sync("hub")
 		down.Expect(down.Do("GET", path, reader, "", nil), 404, "reopened entry is withdrawn downstream")
-		up.Expect(up.Do("POST", "/v1/admin/review/skills/ai.openlinker.author/tool", AdminToken, "", map[string]any{"decision": "reject", "reason": "malware"}), 200, "reject")
+		up.Expect(up.decide("skills", "ai.openlinker.author/tool", map[string]any{"decision": "reject", "reason": "malware"}), 200, "reject")
 		down.sync("hub")
 		down.Expect(down.Do("GET", path, reader, "", nil), 404, "rejected stays withdrawn")
 	})
@@ -408,7 +433,7 @@ func runClaims(t *testing.T, newStore func(t *testing.T) store.Store) {
 	index(nolic)
 	e.Fake.SetRepoID(4242)
 	for _, n := range []string{"demo", "single", "nolic"} {
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.bob/"+n, AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve "+n)
+		e.Expect(e.decide("skills", "ai.openlinker.bob/"+n, map[string]any{"decision": "approve"}), 200, "approve "+n)
 	}
 	before := e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.bob/demo/versions/1", "", "", nil), 200, "before claim")
 
@@ -417,7 +442,7 @@ func runClaims(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("not owner: %s", r.Body)
 		}
 		e.Expect(bob.send("POST", "/v1/skills/ai.openlinker.bob/hosted/versions?version=1", md("hosted", "Hosted", "MIT"), "text/markdown"), 201, "hosted")
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.bob/hosted", AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve hosted")
+		e.Expect(e.decide("skills", "ai.openlinker.bob/hosted", map[string]any{"decision": "approve"}), 200, "approve hosted")
 		if r := e.Expect(author.json("POST", "/v1/skills/ai.openlinker.bob/hosted/claim", `{}`), 422, "hosted"); errCode(r) != "claim_not_indexed" {
 			t.Fatalf("hosted: %s", r.Body)
 		}
@@ -493,7 +518,7 @@ func runClaims(t *testing.T, newStore func(t *testing.T) store.Store) {
 
 	t.Run("a recycled repository path cannot claim", func(t *testing.T) {
 		index("https://github.com/acme/skills/tree/main/skills/custom")
-		e.Expect(e.Do("POST", "/v1/admin/review/skills/ai.openlinker.bob/custom", AdminToken, "", map[string]any{"decision": "approve"}), 200, "approve custom")
+		e.Expect(e.decide("skills", "ai.openlinker.bob/custom", map[string]any{"decision": "approve"}), 200, "approve custom")
 		e.Fake.Recycle(999, 9, "User")
 		if r := e.Expect(impostor.json("POST", "/v1/skills/ai.openlinker.bob/custom/claim", `{}`), 403, "new owner of the path"); errCode(r) != "claim_not_owner" {
 			t.Fatalf("recycled: %s", r.Body)

@@ -209,7 +209,7 @@ func (s *Service) ResolveReport(ctx context.Context, actor string, id int64, res
 		map[string]any{"resolution": resolution}))
 }
 
-func (s *Service) DecideReview(ctx context.Context, actor, kind string, id int64, ns, name, decision, reason string, trust bool) error {
+func (s *Service) DecideReview(ctx context.Context, actor, kind string, id, revision int64, ns, name, decision, reason string, trust bool) error {
 	state := ""
 	switch decision {
 	case "approve":
@@ -222,6 +222,6 @@ func (s *Service) DecideReview(ctx context.Context, actor, kind string, id int64
 	if len(reason) > 500 {
 		return fail(http.StatusUnprocessableEntity, "reason_too_long", "reason is limited to 500 bytes")
 	}
-	return s.Store.DecideReview(ctx, model.ReviewDecision{Kind: kind, ID: id, State: state, Reason: reason, TrustNamespace: trust},
+	return s.Store.DecideReview(ctx, model.ReviewDecision{Kind: kind, ID: id, State: state, Reason: reason, Revision: revision, TrustNamespace: trust},
 		auditEvent(actor, "review."+decision, ns, name, map[string]any{"kind": kind, "trust_namespace": trust}))
 }

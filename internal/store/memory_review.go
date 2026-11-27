@@ -92,7 +92,7 @@ func (m *Memory) ListReview(_ context.Context, kind, state string, limit int) ([
 				creator = vs[len(vs)-1].CreatedBy
 			}
 			out = append(out, model.ReviewItem{Kind: "skill", ID: s.ID, Namespace: s.Namespace, Name: s.Name, Mode: s.Mode,
-				State: reviewOf(s.ReviewState), Reason: s.ReviewReason, Visibility: s.Visibility, CreatedBy: creator,
+				State: reviewOf(s.ReviewState), Reason: s.ReviewReason, Revision: s.ReviewRevision, Visibility: s.Visibility, CreatedBy: creator,
 				OpenReports: m.openCount("skill", s.ID), UpdatedAt: s.UpdatedAt})
 		}
 	}
@@ -102,7 +102,7 @@ func (m *Memory) ListReview(_ context.Context, kind, state string, limit int) ([
 				continue
 			}
 			out = append(out, model.ReviewItem{Kind: "mcp", ID: s.ID, Namespace: s.Namespace, Name: s.Name, Mode: s.Mode,
-				State: reviewOf(s.ReviewState), Reason: s.ReviewReason, Visibility: s.Visibility, CreatedBy: s.CreatedBy,
+				State: reviewOf(s.ReviewState), Reason: s.ReviewReason, Revision: s.ReviewRevision, Visibility: s.Visibility, CreatedBy: s.CreatedBy,
 				OpenReports: m.openCount("mcp", s.ID), UpdatedAt: s.UpdatedAt})
 		}
 	}
@@ -149,6 +149,9 @@ func (m *Memory) DecideReview(_ context.Context, d model.ReviewDecision, audit m
 		if !ok {
 			return model.ErrNotFound
 		}
+		if s.ReviewRevision != d.Revision {
+			return conflict("review_stale", "the entry changed since it was reviewed; review it again")
+		}
 		s.ReviewState, s.ReviewReason, s.UpdatedAt = d.State, d.Reason, now
 		m.skills[d.ID] = s
 		ns = s.Namespace
@@ -156,6 +159,9 @@ func (m *Memory) DecideReview(_ context.Context, d model.ReviewDecision, audit m
 		s, ok := m.mcp[d.ID]
 		if !ok {
 			return model.ErrNotFound
+		}
+		if s.ReviewRevision != d.Revision {
+			return conflict("review_stale", "the entry changed since it was reviewed; review it again")
 		}
 		s.ReviewState, s.ReviewReason, s.UpdatedAt = d.State, d.Reason, now
 		m.mcp[d.ID] = s
@@ -213,10 +219,12 @@ func (m *Memory) CreateReport(_ context.Context, rep model.Report, threshold int
 	if rep.Kind == "skill" {
 		s := m.skills[rep.EntryID]
 		s.ReviewState, s.ReviewReason, s.UpdatedAt = model.ReviewPending, "reports", now
+		s.ReviewRevision++
 		m.skills[rep.EntryID] = s
 	} else {
 		s := m.mcp[rep.EntryID]
 		s.ReviewState, s.ReviewReason, s.UpdatedAt = model.ReviewPending, "reports", now
+		s.ReviewRevision++
 		m.mcp[rep.EntryID] = s
 	}
 	res.Reopened = true

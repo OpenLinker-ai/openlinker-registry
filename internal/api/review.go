@@ -190,7 +190,7 @@ func (s *Server) listReview(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0, len(items))
 	for _, it := range items {
 		out = append(out, map[string]any{"kind": it.Kind, "namespace": it.Namespace, "name": it.Name, "mode": it.Mode,
-			"state": it.State, "reason": it.Reason, "visibility": it.Visibility, "created_by": it.CreatedBy,
+			"state": it.State, "reason": it.Reason, "review_revision": it.Revision, "visibility": it.Visibility, "created_by": it.CreatedBy,
 			"open_reports": it.OpenReports, "updated_at": it.UpdatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
@@ -198,6 +198,7 @@ func (s *Server) listReview(w http.ResponseWriter, r *http.Request) {
 
 type decisionRequest struct {
 	Decision       string `json:"decision"`
+	Revision       *int64 `json:"revision"`
 	Reason         string `json:"reason"`
 	TrustNamespace bool   `json:"trust_namespace"`
 }
@@ -208,7 +209,11 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, kind string, id 
 		s.fail(w, r, err)
 		return
 	}
-	if err := s.Svc.DecideReview(r.Context(), principal(r).Subject, kind, id, ns, name, req.Decision, req.Reason, req.TrustNamespace); err != nil {
+	if req.Revision == nil {
+		s.fail(w, r, &registry.Error{Status: http.StatusUnprocessableEntity, Code: "revision_required", Msg: "revision must be the review_revision that was reviewed"})
+		return
+	}
+	if err := s.Svc.DecideReview(r.Context(), principal(r).Subject, kind, id, *req.Revision, ns, name, req.Decision, req.Reason, req.TrustNamespace); err != nil {
 		s.fail(w, r, err)
 		return
 	}

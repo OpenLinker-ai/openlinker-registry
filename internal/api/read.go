@@ -149,7 +149,7 @@ func skillJSON(sk model.Skill, latest string) map[string]any {
 	if sk.GlobalAlias != "" {
 		out["global_alias"] = sk.GlobalAlias
 	}
-	if review := reviewJSON(sk.ReviewState, sk.ReviewReason, sk.Visibility); review != nil {
+	if review := reviewJSON(sk.ReviewState, sk.ReviewReason, sk.Visibility, sk.ReviewRevision); review != nil {
 		out["review"] = review
 	}
 	if sk.Claimed {
@@ -161,11 +161,11 @@ func skillJSON(sk model.Skill, latest string) map[string]any {
 	return out
 }
 
-func reviewJSON(state, reason, visibility string) map[string]any {
+func reviewJSON(state, reason, visibility string, revision int64) map[string]any {
 	if state == "" || state == model.ReviewApproved {
 		return nil
 	}
-	return map[string]any{"state": state, "reason": reason, "visibility": visibility}
+	return map[string]any{"state": state, "reason": reason, "visibility": visibility, "revision": revision}
 }
 
 func nullable(s string) any {
@@ -191,7 +191,7 @@ func (s *Server) versionJSON(sk model.Skill, v model.Version) map[string]any {
 	if acc.Artifact {
 		out["artifact"].(map[string]any)["url"] = s.Svc.VersionURL(sk.Namespace, sk.Name, v.Version, "artifact")
 	}
-	if review := reviewJSON(sk.ReviewState, sk.ReviewReason, sk.Visibility); review != nil {
+	if review := reviewJSON(sk.ReviewState, sk.ReviewReason, sk.Visibility, sk.ReviewRevision); review != nil {
 		out["review"] = review
 	}
 	if v.ArchiveDigest != "" {

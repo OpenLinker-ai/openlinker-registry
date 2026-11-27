@@ -150,6 +150,7 @@ type Skill struct {
 	CurrentVersion string
 	ReviewState    string
 	ReviewReason   string
+	ReviewRevision int64
 	Claimed        bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
@@ -421,6 +422,7 @@ type ReviewItem struct {
 	Mode        string
 	State       string
 	Reason      string
+	Revision    int64
 	Visibility  string
 	CreatedBy   string
 	OpenReports int
@@ -432,6 +434,7 @@ type ReviewDecision struct {
 	ID             int64
 	State          string
 	Reason         string
+	Revision       int64
 	TrustNamespace bool
 }
 

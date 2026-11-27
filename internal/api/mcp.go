@@ -50,7 +50,7 @@ func mcpServerJSON(srv model.MCPServer) map[string]any {
 	if srv.Upstream != "" {
 		out["upstream"] = srv.Upstream
 	}
-	if review := reviewJSON(srv.ReviewState, srv.ReviewReason, srv.Visibility); review != nil {
+	if review := reviewJSON(srv.ReviewState, srv.ReviewReason, srv.Visibility, srv.ReviewRevision); review != nil {
 		out["review"] = review
 	}
 	return out

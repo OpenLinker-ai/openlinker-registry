@@ -309,7 +309,11 @@ With `REGISTRY_REVIEW` on (the default in public mode):
   approved entry that goes back to review.
 - `GET /v1/admin/review?state=pending&kind=` lists the queue;
   `POST /v1/admin/review/skills/{ns}/{name}` or `…/mcp/servers/{ns}/{name}`
-  with `{"decision":"approve"|"reject","reason","trust_namespace"}` decides.
+  with `{"decision":"approve"|"reject","revision","reason","trust_namespace"}` decides.
+  `revision` is the entry's `review_revision` as the reviewer saw it (in the
+  queue and in `review.revision`); every new version and every reopening by
+  reports increases it, so an approval of what was seen cannot publish a
+  version submitted afterwards (`409 review_stale`).
   A trusted namespace publishes its next entries directly;
   `PATCH /v1/admin/namespaces/{ns}` `{"review_trusted":false}` revokes that.
   A rejected entry goes back to `pending` when a new version is published.

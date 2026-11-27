@@ -8,6 +8,7 @@ ALTER TABLE skills
         CHECK (review_state IN ('approved', 'pending', 'rejected')),
     ADD COLUMN review_reason TEXT NOT NULL DEFAULT '' CHECK (length(review_reason) <= 500),
     ADD COLUMN claimed BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN review_revision BIGINT NOT NULL DEFAULT 0 CHECK (review_revision >= 0),
     ADD COLUMN shown_visibility TEXT GENERATED ALWAYS AS
         (CASE WHEN review_state = 'approved' THEN visibility ELSE 'review' END) STORED;
 
@@ -15,6 +16,7 @@ ALTER TABLE mcp_servers
     ADD COLUMN review_state TEXT NOT NULL DEFAULT 'approved'
         CHECK (review_state IN ('approved', 'pending', 'rejected')),
     ADD COLUMN review_reason TEXT NOT NULL DEFAULT '' CHECK (length(review_reason) <= 500),
+    ADD COLUMN review_revision BIGINT NOT NULL DEFAULT 0 CHECK (review_revision >= 0),
     ADD COLUMN shown_visibility TEXT GENERATED ALWAYS AS
         (CASE WHEN review_state = 'approved' THEN visibility ELSE 'review' END) STORED;
 

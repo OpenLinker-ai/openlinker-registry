@@ -20,8 +20,8 @@ The registry has its own version numbers; see [RELEASE.md](./RELEASE.md).
   namespace roles) and administrators, on every read path; replication metadata
   presents it as `private`, so downstream mirrors do not copy it.
   `GET /v1/admin/review`, `POST /v1/admin/review/skills/{ns}/{name}` and
-  `…/mcp/servers/{ns}/{name}` (`approve` or `reject`, optionally trusting the
-  namespace), `PATCH /v1/admin/namespaces/{ns}`.
+  `…/mcp/servers/{ns}/{name}` (`approve` or `reject` the `review_revision` that
+  was reviewed, optionally trusting the namespace), `PATCH /v1/admin/namespaces/{ns}`.
 - Reports: `POST /v1/reports` for signed-in callers; distinct open reports
   reaching `REGISTRY_REPORT_THRESHOLD` (default 3) send an approved entry back
   to review. `GET /v1/admin/reports`, `POST /v1/admin/reports/{id}/resolve`.

@@ -43,12 +43,13 @@ type MCPServer struct {
 	Listed     bool
 	// Upstream is the name of the upstream that manages the namespace ("" for
 	// local entries).
-	Upstream     string
-	ReviewState  string
-	ReviewReason string
-	CreatedBy    string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	Upstream       string
+	ReviewState    string
+	ReviewReason   string
+	ReviewRevision int64
+	CreatedBy      string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 func (m MCPServer) ShownVisibility() string { return ShownVisibility(m.ReviewState, m.Visibility) }

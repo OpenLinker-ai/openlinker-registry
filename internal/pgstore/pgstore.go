@@ -389,7 +389,7 @@ func rowsOrNotFound(tag pgconn.CommandTag, err error) error {
 
 const skillCols = `s.id, n.name, s.name, s.description, s.visibility, s.listed, s.status, s.status_reason,
 	s.mode, COALESCE(s.source_key, ''), COALESCE(s.global_alias, ''), COALESCE(u.name, ''), s.current_version,
-	s.review_state, s.review_reason, s.claimed, s.created_at, s.updated_at`
+	s.review_state, s.review_reason, s.review_revision, s.claimed, s.created_at, s.updated_at`
 
 // skillFrom joins what skillCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -399,7 +399,7 @@ func scanSkill(row pgx.Row, extra ...any) (model.Skill, error) {
 	var k model.Skill
 	dest := append([]any{&k.ID, &k.Namespace, &k.Name, &k.Description, &k.Visibility, &k.Listed, &k.Status,
 		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.Upstream, &k.CurrentVersion,
-		&k.ReviewState, &k.ReviewReason, &k.Claimed, &k.CreatedAt, &k.UpdatedAt}, extra...)
+		&k.ReviewState, &k.ReviewReason, &k.ReviewRevision, &k.Claimed, &k.CreatedAt, &k.UpdatedAt}, extra...)
 	err := row.Scan(dest...)
 	return k, err
 }

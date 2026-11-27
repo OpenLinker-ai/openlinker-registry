@@ -20,10 +20,9 @@ func nextReview(ctx context.Context, tx pgx.Tx, table string, id, nsID int64, cr
 		}
 		next = rule.Initial(trusted)
 	}
-	if next == current {
-		return current, nil
-	}
-	_, err := tx.Exec(ctx, `UPDATE `+table+` SET review_state = $2, review_reason = '' WHERE id = $1`, id, next)
+	_, err := tx.Exec(ctx, `UPDATE `+table+` SET review_state = $2,
+		review_reason = CASE WHEN review_state = $2 THEN review_reason ELSE '' END,
+		review_revision = review_revision + 1 WHERE id = $1`, id, next)
 	return next, err
 }
 
@@ -104,22 +103,22 @@ func reviewTable(kind string) (string, error) {
 }
 
 func (s *Store) ListReview(ctx context.Context, kind, state string, limit int) ([]model.ReviewItem, error) {
-	query := `SELECT 'skill', s.id, n.name, s.name, s.mode, s.review_state, s.review_reason, s.visibility,
+	query := `SELECT 'skill', s.id, n.name, s.name, s.mode, s.review_state, s.review_reason, s.review_revision, s.visibility,
 			COALESCE((SELECT created_by FROM skill_versions v WHERE v.skill_id = s.id ORDER BY v.id LIMIT 1), ''), s.updated_at,
 			(SELECT count(*) FROM reports r WHERE r.kind = 'skill' AND r.entry_id = s.id AND r.state = 'open')
 		FROM skills s JOIN namespaces n ON n.id = s.namespace_id WHERE s.review_state = $1 AND ($2 = '' OR $2 = 'skill')
 		UNION ALL
-		SELECT 'mcp', m.id, n.name, m.name, m.mode, m.review_state, m.review_reason, m.visibility, m.created_by, m.updated_at,
+		SELECT 'mcp', m.id, n.name, m.name, m.mode, m.review_state, m.review_reason, m.review_revision, m.visibility, m.created_by, m.updated_at,
 			(SELECT count(*) FROM reports r WHERE r.kind = 'mcp' AND r.entry_id = m.id AND r.state = 'open')
 		FROM mcp_servers m JOIN namespaces n ON n.id = m.namespace_id WHERE m.review_state = $1 AND ($2 = '' OR $2 = 'mcp')
-		ORDER BY 10, 1, 2 LIMIT $3`
+		ORDER BY 11, 1, 2 LIMIT $3`
 	rows, err := s.pool.Query(ctx, query, state, kind, limit)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.ReviewItem, error) {
 		var it model.ReviewItem
-		err := row.Scan(&it.Kind, &it.ID, &it.Namespace, &it.Name, &it.Mode, &it.State, &it.Reason, &it.Visibility,
+		err := row.Scan(&it.Kind, &it.ID, &it.Namespace, &it.Name, &it.Mode, &it.State, &it.Reason, &it.Revision, &it.Visibility,
 			&it.CreatedBy, &it.UpdatedAt, &it.OpenReports)
 		return it, err
 	})
@@ -131,11 +130,16 @@ func (s *Store) DecideReview(ctx context.Context, d model.ReviewDecision, audit 
 		return err
 	}
 	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
-		var nsID int64
-		err := tx.QueryRow(ctx, `UPDATE `+table+` SET review_state = $2, review_reason = $3, updated_at = now()
-			WHERE id = $1 RETURNING namespace_id`, d.ID, d.State, d.Reason).Scan(&nsID)
-		if err != nil {
+		var nsID, revision int64
+		if err := tx.QueryRow(ctx, `SELECT namespace_id, review_revision FROM `+table+` WHERE id = $1 FOR UPDATE`, d.ID).Scan(&nsID, &revision); err != nil {
 			return notFound(err)
+		}
+		if revision != d.Revision {
+			return conflict("review_stale", "the entry changed since it was reviewed; review it again")
+		}
+		_, err := tx.Exec(ctx, `UPDATE `+table+` SET review_state = $2, review_reason = $3, updated_at = now() WHERE id = $1`, d.ID, d.State, d.Reason)
+		if err != nil {
+			return err
 		}
 		if d.TrustNamespace && d.State == model.ReviewApproved {
 			_, err = tx.Exec(ctx, `UPDATE namespaces SET review_trusted = true WHERE id = $1 AND upstream_id IS NULL`, nsID)
@@ -194,7 +198,8 @@ func (s *Store) CreateReport(ctx context.Context, rep model.Report, threshold in
 		if !reopenNow && (threshold <= 0 || open < threshold) {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `UPDATE `+table+` SET review_state = 'pending', review_reason = 'reports', updated_at = now() WHERE id = $1`, rep.EntryID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE `+table+` SET review_state = 'pending', review_reason = 'reports',
+			review_revision = review_revision + 1, updated_at = now() WHERE id = $1`, rep.EntryID); err != nil {
 			return err
 		}
 		res.Reopened = true
