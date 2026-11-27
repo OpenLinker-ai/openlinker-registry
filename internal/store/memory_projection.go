@@ -179,18 +179,18 @@ func (m *Memory) ApplyMCPProjection(_ context.Context, p model.Projection, audit
 		m.mcp[s.ID] = s
 	}
 	if p.MCPVersion != nil {
-		if _, dup := m.findMCPVersion(s.ID, p.MCPVersion.Version); !dup {
-			m.addMCPVersion(s.ID, *p.MCPVersion, now, now)
+		v, dup := m.findMCPVersion(s.ID, p.MCPVersion.Version)
+		if !dup {
+			v = m.addMCPVersion(s.ID, *p.MCPVersion, now, now)
 			s.ReviewRevision++
 		}
+		m.moveMCPLatest(s.ID, v.ID, now)
 	}
 	s.Managed.Hidden, s.Managed.Revision, s.Managed.Phase = p.Hidden, p.Revision, p.Phase
 	if len(p.Legacy) > 0 {
 		s.Managed.Legacy = p.Legacy
 	}
-	if len(p.Metadata) > 0 {
-		s.Managed.Metadata, s.Managed.MetadataRevision = p.Metadata, p.MetadataRev
-	}
+	s.Managed.Metadata, s.Managed.MetadataRevision = p.Metadata, p.MetadataRev
 	s.Listed, s.UpdatedAt = p.Listed, now
 	m.mcp[s.ID] = s
 	m.stampMCPVersions(s.ID, now)

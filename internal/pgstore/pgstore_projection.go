@@ -218,12 +218,15 @@ func (s *Store) ApplyMCPProjection(ctx context.Context, p model.Projection, audi
 		}
 		if p.MCPVersion != nil {
 			var digest string
-			err := tx.QueryRow(ctx, `SELECT digest FROM mcp_server_versions WHERE server_id = $1 AND version = $2`, srv.ID, p.MCPVersion.Version).Scan(&digest)
+			var versionID int64
+			err := tx.QueryRow(ctx, `SELECT id, digest FROM mcp_server_versions WHERE server_id = $1 AND version = $2`, srv.ID, p.MCPVersion.Version).Scan(&versionID, &digest)
 			switch {
 			case errors.Is(err, pgx.ErrNoRows):
-				if _, err := insertMCPVersion(ctx, tx, srv.ID, *p.MCPVersion); err != nil {
+				inserted, err := insertMCPVersion(ctx, tx, srv.ID, *p.MCPVersion)
+				if err != nil {
 					return err
 				}
+				versionID = inserted.ID
 				if _, err := tx.Exec(ctx, `UPDATE mcp_servers SET review_revision = review_revision + 1 WHERE id = $1`, srv.ID); err != nil {
 					return err
 				}
@@ -231,6 +234,12 @@ func (s *Store) ApplyMCPProjection(ctx context.Context, p model.Projection, audi
 				return err
 			case digest != p.MCPVersion.Digest:
 				return conflict("version_exists", "version already exists and is immutable")
+			}
+			if err := clearMCPLatest(ctx, tx, srv.ID, versionID, nil); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET is_latest = true, updated_at = now() WHERE id = $1 AND NOT is_latest`, versionID); err != nil {
+				return err
 			}
 		} else if !p.Hidden {
 			var versions int
@@ -242,7 +251,7 @@ func (s *Store) ApplyMCPProjection(ctx context.Context, p model.Projection, audi
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE mcp_servers SET projection_hidden = $2, listed = $3, legacy = COALESCE($4, legacy),
-			metadata = COALESCE($5, metadata), metadata_revision = CASE WHEN $5::jsonb IS NULL THEN metadata_revision ELSE $6 END,
+			metadata = $5, metadata_revision = $6,
 			managed_revision = $7, managed_phase = $8, updated_at = now() WHERE id = $1`,
 			srv.ID, p.Hidden, p.Listed, rawOrNil(p.Legacy), rawOrNil(p.Metadata), p.MetadataRev, p.Revision, p.Phase); err != nil {
 			return err

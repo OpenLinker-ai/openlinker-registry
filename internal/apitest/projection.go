@@ -388,6 +388,18 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if after["revision"] != before.(float64)+1 || after["state"] != "rejected" {
 			t.Fatalf("review after a projected version: before %v after %v", before, after)
 		}
+		lower, _ := json.Marshal(map[string]any{"op": "cfcfcfcf-cfcf-4fcf-8fcf-cfcfcfcfcfcf", "revision": 11, "phase": 1, "owner": map[string]any{"sub": coreUser},
+			"state": "visible", "listed": true, "version": "0.0.3", "metadata": nil, "metadata_revision": 0,
+			"server": map[string]any{"description": "Weather v3", "remotes": []map[string]any{{"type": "streamable-http", "url": "https://openlinker.example/mcp/agents/1"}}}})
+		e.Expect(alice.send("PUT", "/v1/projections/mcp/m-weather", lower, "application/json"), 200, "lower version number")
+		latest := e.Expect(e.Do("GET", "/v0.1/servers/"+name+"/versions/latest", AdminToken, "", nil), 200, "latest")
+		if v, _ := latest.JSON["server"].(map[string]any); v["version"] != "0.0.3" {
+			t.Fatalf("the projected version must be the latest: %s", latest.Body)
+		}
+		detail := e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather", AdminToken, "", nil), 200, "detail without metadata")
+		if meta, _ := detail.JSON["_meta"].(map[string]any); meta["ai.openlinker/metadata"] != nil {
+			t.Fatalf("cleared metadata still shown: %s", detail.Body)
+		}
 	})
 
 	t.Run("validate and namespace preflight", func(t *testing.T) {
