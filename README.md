@@ -367,21 +367,35 @@ with `skills:write`; only public instances accept projections.
 | `POST /v1/projections/validate` | Core bundle | `{ok, code, message}` without writing |
 | `POST /v1/projections/namespaces/preflight` | `{subjects}` | The namespace each owner would use, or a conflict |
 
-- Entries go to the owner's `ai.openlinker.*` namespace, or a generated
-  `ai.openlinker.u<first 12 (or 16) hex digits of the owner id>` bound to the
-  owner; those names are reserved from self-service.
+- Entries go to the owner's generated `ai.openlinker.u<first 12 (or 16) hex
+  digits of the owner id>` namespace, or, when the owner had an
+  `ai.openlinker.*` handle before the first projection, to that handle. Once
+  generated, the namespace never changes, also after a later handle claim.
+  Generated names are reserved from self-service.
 - Projected entries are managed: only the same gateway and owner may project
-  them; ordinary writes are `409 managed_by_core`. Administrators can still
-  review, reject and yank.
+  them; ordinary writes, settings changes, claims and indexing are
+  `409 managed_by_core`, also for administrators, who can still review,
+  reject, deprecate and yank.
 - A state applies only when its `(revision, phase)` is newer than the last
-  one; `op` replays return the first answer. A hidden state for an entry that
-  does not exist yet records a tombstone, so older requests cannot reveal it.
+  one; `op` replays return the first answer, also when they arrive at once.
+  A state for an entry that does not exist yet records a hidden tombstone
+  with its revision (a visible one then answers `409 version_missing`), so
+  older requests cannot reveal it. An MCP state checks its revision before it
+  writes its version, in the same transaction.
 - `state: hidden`, and versions left out of `versions`, are hidden from
   everyone but administrators on every read path (stronger than any role or
   share), reversibly. Projection never changes the review state: new entries
   start approved, later holds stay.
 - `license=LicenseRef-openlinker-platform-terms` stores an approved custom
   license, for projected versions only.
+- `legacy` (at most 4 KiB) and an MCP server's `metadata` (at most 64 KiB)
+  with `metadata_revision` appear only in details, under `_meta` keys
+  `ai.openlinker/legacy`, `ai.openlinker/metadata` and
+  `ai.openlinker/metadata_revision`. Display descriptions follow the SKILL.md
+  limit of 2000 characters; `validate` applies the same admission as
+  ingestion.
+- Mirrors hide versions that disappear from their upstream and show them
+  again when they return.
 
 ## Upstreams: forwarding and mirroring
 

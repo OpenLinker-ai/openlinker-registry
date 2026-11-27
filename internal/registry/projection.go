@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/archive"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/mcp"
@@ -17,7 +18,8 @@ import (
 const (
 	PlatformTermsLicense = "LicenseRef-openlinker-platform-terms"
 	platformTermsText    = "Published on OpenLinker under the OpenLinker platform terms; redistributable on OpenLinker and its registry."
-	maxLegacyBytes       = 16 << 10
+	maxLegacyBytes       = 4 << 10
+	maxMetadataBytes     = 64 << 10
 )
 
 var (
@@ -132,10 +134,10 @@ func (st SkillState) check(p Projector) error {
 		return fail(http.StatusForbidden, "owner_mismatch", "the owner must be the asserted user")
 	case st.State != "visible" && st.State != "hidden":
 		return fail(http.StatusUnprocessableEntity, "state_invalid", "state must be visible or hidden")
-	case len(st.Legacy) > maxLegacyBytes || (len(st.Legacy) > 0 && st.Legacy[0] != '{'):
-		return fail(http.StatusUnprocessableEntity, "legacy_invalid", "legacy must be a JSON object of at most 16 KiB")
-	case len(st.Display.Description) > 1024:
-		return fail(http.StatusUnprocessableEntity, "display_invalid", "the description is limited to 1024 bytes")
+	case !jsonObject(st.Legacy, maxLegacyBytes):
+		return fail(http.StatusUnprocessableEntity, "legacy_invalid", "legacy must be a JSON object of at most 4 KiB")
+	case utf8.RuneCountInString(st.Display.Description) > skill.MaxDescriptionRunes || utf8.RuneCountInString(st.Display.Name) > skill.MaxNameRunes:
+		return fail(http.StatusUnprocessableEntity, "display_invalid", "the display name and description follow the SKILL.md limits")
 	}
 	for _, v := range st.Versions {
 		if !skill.ValidVersion(v) {
@@ -146,6 +148,21 @@ func (st SkillState) check(p Projector) error {
 		return fail(http.StatusUnprocessableEntity, "current_invalid", "current_version must be one of versions")
 	}
 	return nil
+}
+
+func jsonObject(raw json.RawMessage, limit int) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var obj map[string]json.RawMessage
+	return len(raw) <= limit && raw[0] == '{' && json.Unmarshal(raw, &obj) == nil
+}
+
+func withoutNull(raw json.RawMessage) json.RawMessage {
+	if string(raw) == "null" {
+		return nil
+	}
+	return raw
 }
 
 func contains(list []string, v string) bool {
@@ -161,6 +178,7 @@ func (s *Service) ApplySkillState(ctx context.Context, p Projector, name string,
 	if err := validProjectionName(name); err != nil {
 		return model.ProjectionResult{}, err
 	}
+	st.Legacy = withoutNull(st.Legacy)
 	if err := st.check(p); err != nil {
 		return model.ProjectionResult{}, err
 	}
@@ -198,30 +216,21 @@ func (s *Service) ApplyMCPState(ctx context.Context, p Projector, name string, s
 	if err := validProjectionName(name); err != nil {
 		return model.ProjectionResult{}, err
 	}
+	st.Legacy, st.Metadata = withoutNull(st.Legacy), withoutNull(st.Metadata)
 	base := SkillState{Op: st.Op, Revision: st.Revision, Phase: st.Phase, State: st.State, Legacy: st.Legacy}
 	base.Owner.Sub = st.Owner.Sub
 	if err := base.check(p); err != nil {
 		return model.ProjectionResult{}, err
+	}
+	if !jsonObject(st.Metadata, maxMetadataBytes) || st.MetadataRevision < 0 {
+		return model.ProjectionResult{}, fail(http.StatusUnprocessableEntity, "metadata_invalid", "metadata must be a JSON object of at most 64 KiB")
 	}
 	ns, err := s.projectionNamespace(ctx, p, true)
 	if err != nil {
 		return model.ProjectionResult{}, err
 	}
 	full := ns.Name + "/" + name
-	legacy := map[string]json.RawMessage{}
-	if len(st.Legacy) > 0 {
-		if err := json.Unmarshal(st.Legacy, &legacy); err != nil {
-			return model.ProjectionResult{}, fail(http.StatusUnprocessableEntity, "legacy_invalid", "legacy must be a JSON object")
-		}
-	}
-	if len(st.Metadata) > 0 {
-		legacy["metadata"] = st.Metadata
-		legacy["metadata_revision"], _ = json.Marshal(st.MetadataRevision)
-	}
-	merged, _ := json.Marshal(legacy)
-	if len(merged) > maxLegacyBytes {
-		return model.ProjectionResult{}, fail(http.StatusUnprocessableEntity, "legacy_invalid", "legacy and metadata are limited to 16 KiB")
-	}
+	var version *model.MCPVersion
 	if st.State == "visible" {
 		doc := map[string]json.RawMessage{}
 		if err := json.Unmarshal(st.Server, &doc); err != nil {
@@ -234,46 +243,23 @@ func (s *Service) ApplyMCPState(ctx context.Context, p Projector, name string, s
 		if err != nil {
 			return model.ProjectionResult{}, err
 		}
-		target := p.Target
-		_, _, err = s.Store.PublishMCPVersion(ctx, model.MCPPublishInput{Namespace: ns.Name, Name: full, Mode: model.MCPModeRegistered,
-			Visibility: model.VisibilityPublic, Listed: st.Listed, Projection: &target,
-			Version: model.MCPVersion{Version: parsed.Version, ServerJSON: parsed.Canonical, Digest: parsed.Digest, CreatedBy: p.Actor}},
-			auditEvent(p.Actor, "projection.mcp.version", ns.Name, full+"@"+parsed.Version, map[string]any{"digest": parsed.Digest}))
-		var ce *model.ConflictError
-		if errors.As(err, &ce) && ce.Code == "version_exists" {
-			srv, gerr := s.Store.GetMCPServer(ctx, full)
-			if gerr != nil {
-				return model.ProjectionResult{}, gerr
-			}
-			existing, gerr := s.Store.GetMCPVersion(ctx, srv.ID, parsed.Version)
-			if gerr != nil {
-				return model.ProjectionResult{}, gerr
-			}
-			if existing.Digest != parsed.Digest {
-				return model.ProjectionResult{}, err
-			}
-		} else if err != nil {
-			return model.ProjectionResult{}, err
-		}
+		version = &model.MCPVersion{Version: parsed.Version, ServerJSON: parsed.Canonical, Digest: parsed.Digest, CreatedBy: p.Actor}
 	}
 	return s.Store.ApplyMCPProjection(ctx, model.Projection{Target: p.Target, Namespace: ns.Name, Name: name, Op: st.Op,
-		Revision: st.Revision, Phase: st.Phase, Hidden: st.State == "hidden", Listed: st.Listed, Legacy: merged},
+		Revision: st.Revision, Phase: st.Phase, Hidden: st.State == "hidden", Listed: st.Listed, Legacy: st.Legacy,
+		Metadata: st.Metadata, MetadataRev: st.MetadataRevision, MCPVersion: version},
 		auditEvent(p.Actor, "projection.mcp", ns.Name, full, map[string]any{"op": st.Op, "revision": st.Revision, "phase": st.Phase, "state": st.State}))
 }
 
-func (s *Service) ValidateProjection(body []byte) (bool, string, string) {
-	_, files, err := archive.ParseBundle(body, s.Cfg.Limits)
-	if err == nil {
-		_, err = skill.ValidateFiles(files, s.Cfg.Limits)
+func (s *Service) ValidateProjection(body []byte) (bool, string, string, error) {
+	if s.Cfg.Mode != "public" {
+		return false, "", "", fail(http.StatusUnprocessableEntity, "projection_public_only", "projection targets must be public instances")
 	}
-	if err == nil {
-		_, err = skill.ParseFrontmatter(fileData(files, skill.SkillFile))
-	}
-	if err != nil {
+	if _, err := s.bundleFiles(body); err != nil {
 		e := AsError(err)
-		return false, e.Code, e.Msg
+		return false, e.Code, e.Msg, nil
 	}
-	return true, "", ""
+	return true, "", "", nil
 }
 
 func (s *Service) PreflightNamespaces(ctx context.Context, p Projector, subs []string, owner func(sub string) string) ([]map[string]string, error) {

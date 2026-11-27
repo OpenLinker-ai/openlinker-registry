@@ -1,15 +1,22 @@
 package apitest
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
 )
 
-const bundleType = "application/vnd.openlinker.skill-bundle.v1+json"
+const (
+	bundleType    = "application/vnd.openlinker.skill-bundle.v1+json"
+	PlatformTerms = "LicenseRef-openlinker-platform-terms"
+)
 
 func coreBundle(name, description, body string) []byte {
 	files, _ := json.Marshal(map[string]string{"SKILL.md": "---\nname: " + name + "\ndescription: " + description + "\n---\n" + body + "\n"})
@@ -28,6 +35,25 @@ func (p projector) send(method, path string, body []byte, ct string, acts ...str
 	return p.g.do(method, path, body, ct, p.g.assertion(method, path, body, func(x *Assertion) {
 		x.Sub, x.GH, x.Act = p.sub, "", acts
 	}))
+}
+
+func (p projector) concurrent(method, path string, body []byte) Resp {
+	assertion := p.g.assertion(method, path, body, func(x *Assertion) {
+		x.Sub, x.GH, x.Act = p.sub, "", []string{"read", "write", "project"}
+	})
+	req, _ := http.NewRequest(method, p.g.e.Base+path, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+p.g.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("OpenLinker-User-Assertion", assertion)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return Resp{Status: 0, Body: []byte(err.Error())}
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	out := Resp{Status: res.StatusCode, Body: raw}
+	_ = json.Unmarshal(raw, &out.JSON)
+	return out
 }
 
 func (p projector) state(name string, doc map[string]any) Resp {
@@ -217,6 +243,127 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("a later handle claim does not move projections", func(t *testing.T) {
+		e.Expect(actor{g, coreUser, ""}.json("POST", "/v1/namespaces", `{"name":"ai.openlinker.alicehandle"}`), 201, "alice handle")
+		r := e.Expect(alice.state("p-tools", map[string]any{"op": "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1", "revision": 8, "phase": 0,
+			"owner": map[string]any{"sub": coreUser}, "state": "hidden", "listed": false, "versions": []string{}}), 200, "withdraw after the claim")
+		if r.JSON["namespace"] != ns || r.JSON["applied"] != true {
+			t.Fatalf("projection moved: %s", r.Body)
+		}
+		if r := e.Expect(alice.version("p-after", "1", v1, "LicenseRef-openlinker-platform-terms"), 201, "new entry after the claim"); r.JSON["namespace"] != ns {
+			t.Fatalf("new entry moved: %s", r.Body)
+		}
+	})
+
+	t.Run("a visible state for a missing entry leaves a tombstone", func(t *testing.T) {
+		state := func(rev int, op string) map[string]any {
+			return map[string]any{"op": op, "revision": rev, "phase": 1, "owner": map[string]any{"sub": coreUser},
+				"state": "visible", "listed": true, "versions": []string{"1"}, "current_version": "1"}
+		}
+		if r := e.Expect(alice.state("p-tomb2", state(5, "c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2")), 409, "versions not ingested"); errCode(r) != "version_missing" {
+			t.Fatalf("missing: %s", r.Body)
+		}
+		e.Expect(alice.version("p-tomb2", "1", v1, "LicenseRef-openlinker-platform-terms"), 201, "late ingest")
+		if r := e.Expect(alice.state("p-tomb2", state(4, "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3")), 200, "older state"); r.JSON["applied"] != false {
+			t.Fatalf("older state applied: %s", r.Body)
+		}
+		e.Expect(e.Do("GET", "/v1/skills/"+ns+"/p-tomb2", "", "", nil), 404, "still hidden")
+		e.Expect(e.Do("GET", "/v1/skills/"+ns+"/p-tomb2", AdminToken, "", nil), 200, "tombstone exists")
+	})
+
+	t.Run("concurrent replays of one op agree", func(t *testing.T) {
+		body, _ := json.Marshal(map[string]any{"op": "c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4", "revision": 1, "phase": 0,
+			"owner": map[string]any{"sub": coreUser}, "state": "hidden", "listed": false, "versions": []string{}})
+		mcpBody, _ := json.Marshal(map[string]any{"op": "c5c5c5c5-c5c5-4c5c-8c5c-c5c5c5c5c5c5", "revision": 1, "phase": 0,
+			"owner": map[string]any{"sub": coreUser}, "state": "hidden", "listed": false})
+		for _, c := range []struct {
+			path string
+			body []byte
+		}{{"/v1/projections/skills/p-race", body}, {"/v1/projections/mcp/m-race", mcpBody}} {
+			var wg sync.WaitGroup
+			results := make([]Resp, 8)
+			for i := range results {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					results[i] = alice.concurrent("PUT", c.path, c.body)
+				}(i)
+			}
+			wg.Wait()
+			for _, r := range results {
+				if r.Status != 200 || r.JSON["applied"] != true {
+					t.Fatalf("%s replay: %d %s", c.path, r.Status, r.Body)
+				}
+			}
+		}
+	})
+
+	t.Run("limits follow bundle admission and the contract", func(t *testing.T) {
+		state := func(op, description string, legacy map[string]any) map[string]any {
+			return map[string]any{"op": op, "revision": 9, "phase": 0, "owner": map[string]any{"sub": coreUser}, "state": "hidden",
+				"listed": false, "versions": []string{}, "display": map[string]any{"name": "Long", "description": description}, "legacy": legacy}
+		}
+		e.Expect(alice.state("p-long", state("c6c6c6c6-c6c6-4c6c-8c6c-c6c6c6c6c6c6", strings.Repeat("é", 2000), nil)), 200, "2000 characters")
+		e.Expect(alice.state("p-long", state("c7c7c7c7-c7c7-4c7c-8c7c-c7c7c7c7c7c7", strings.Repeat("é", 2001), nil)), 422, "2001 characters")
+		e.Expect(alice.state("p-long", state("c8c8c8c8-c8c8-4c8c-8c8c-c8c8c8c8c8c8", "ok", map[string]any{"x": strings.Repeat("a", 4100)})), 422, "legacy over 4 KiB")
+		mismatch := []byte(`{"required_commands":[],"name":"pdf-tools","description":"Something else","files":{"SKILL.md":"---\nname: pdf-tools\ndescription: Read PDFs\n---\nUse it.\n"},"capability_ids":[],"providers":["codex"]}`)
+		r := e.Expect(alice.send("POST", "/v1/projections/validate", mismatch, bundleType), 200, "mismatched bundle")
+		if r.JSON["ok"] != false || r.JSON["code"] != "bundle_invalid" {
+			t.Fatalf("mismatch: %s", r.Body)
+		}
+		if r := e.Expect(alice.version("p-mismatch", "1", mismatch, "LicenseRef-openlinker-platform-terms"), 422, "ingest refuses the same bundle"); errCode(r) != "bundle_invalid" {
+			t.Fatalf("ingest mismatch: %s", r.Body)
+		}
+	})
+
+	t.Run("managed entries refuse ordinary writes, admins included", func(t *testing.T) {
+		vis := "/v1/skills/" + ns + "/p-vis"
+		e.Expect(alice.version("p-vis", "1", v1, "LicenseRef-openlinker-platform-terms"), 201, "ingest")
+		e.Expect(alice.state("p-vis", map[string]any{"op": "c9c9c9c9-c9c9-4c9c-8c9c-c9c9c9c9c9c9", "revision": 1, "phase": 1,
+			"owner": map[string]any{"sub": coreUser}, "state": "visible", "listed": true, "versions": []string{"1"}, "current_version": "1",
+			"legacy": map[string]any{"package_id": "vis"}}), 200, "visible")
+		if r := e.Expect(e.Do("PATCH", vis, AdminToken, "", map[string]any{"listed": false}), 409, "admin patch"); errCode(r) != "managed_by_core" {
+			t.Fatalf("admin patch: %s", r.Body)
+		}
+		claimer := actor{plain, thirdUser, ""}
+		if r := e.Expect(claimer.json("POST", vis+"/claim", `{}`), 409, "claim"); errCode(r) != "managed_by_core" {
+			t.Fatalf("claim: %s", r.Body)
+		}
+		writer := actor{plain, coreUser, ""}
+		if r := e.Expect(writer.json("POST", "/v1/skills/"+ns+"/indexes", `{"url":"https://github.com/acme/skills/tree/main/skills/demo","commit":"`+C1+`","name":"p-vis"}`), 409, "index"); errCode(r) != "managed_by_core" {
+			t.Fatalf("index: %s", r.Body)
+		}
+		r := e.Expect(e.Do("GET", "/v1/skills?namespace="+ns, AdminToken, "", nil), 200, "listing")
+		if strings.Contains(string(r.Body), "ai.openlinker/legacy") {
+			t.Fatalf("legacy in a listing: %s", r.Body)
+		}
+		r = e.Expect(e.Do("GET", vis, "", "", nil), 200, "detail")
+		if !strings.Contains(string(r.Body), "ai.openlinker/legacy") {
+			t.Fatalf("legacy missing from the detail: %s", r.Body)
+		}
+		e.Expect(e.decide("skills", ns+"/p-vis", map[string]any{"decision": "reject", "reason": "moderation"}), 200, "moderation stays possible")
+	})
+
+	t.Run("mcp state is atomic and keeps its metadata", func(t *testing.T) {
+		name := url.PathEscape(ns + "/m-weather")
+		stale, _ := json.Marshal(map[string]any{"op": "cacacaca-caca-4aca-8aca-cacacacacaca", "revision": 1, "phase": 1, "owner": map[string]any{"sub": coreUser},
+			"state": "visible", "listed": true, "version": "0.1.9",
+			"server": map[string]any{"description": "Weather", "remotes": []map[string]any{{"type": "streamable-http", "url": "https://openlinker.example/mcp/agents/1"}}}})
+		if r := e.Expect(alice.send("PUT", "/v1/projections/mcp/m-weather", stale, "application/json"), 200, "stale visible"); r.JSON["applied"] != false {
+			t.Fatalf("stale applied: %s", r.Body)
+		}
+		e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather/versions/0.1.9", AdminToken, "", nil), 404, "stale version not written")
+		e.Expect(e.Do("GET", "/v0.1/servers/"+name+"/versions/0.1.9", AdminToken, "", nil), 404, "stale version not written, official API")
+		r := e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather", AdminToken, "", nil), 200, "detail")
+		meta, _ := r.JSON["_meta"].(map[string]any)
+		if md, _ := meta["ai.openlinker/metadata"].(map[string]any); md["homepage"] != "https://example.com" || meta["ai.openlinker/metadata_revision"] != float64(1) {
+			t.Fatalf("metadata: %s", r.Body)
+		}
+		if legacy, _ := meta["ai.openlinker/legacy"].(map[string]any); legacy["agent_id"] != "1" {
+			t.Fatalf("legacy: %s", r.Body)
+		}
+	})
+
 	t.Run("validate and namespace preflight", func(t *testing.T) {
 		r := e.Expect(alice.send("POST", "/v1/projections/validate", v1, bundleType), 200, "valid")
 		if r.JSON["ok"] != true {
@@ -237,7 +384,7 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 			m := it.(map[string]any)
 			got[m["sub"].(string)] = m["namespace"].(string)
 		}
-		if got[coreUser] != ns || got[bobSub] != "ai.openlinker.bobby" || got[dave] != generatedNamespace(dave, 16) {
+		if got[coreUser] != ns || got[bobSub] != generatedNamespace(bobSub, 12) || got[dave] != generatedNamespace(dave, 16) {
 			t.Fatalf("preflight: %s", r.Body)
 		}
 		carol := actor{g, thirdUser, ""}
@@ -254,4 +401,70 @@ func toStrings(v any) []string {
 		out = append(out, x.(string))
 	}
 	return out
+}
+
+func projectionEnv(t *testing.T, st store.Store, o Options) (*Env, projector) {
+	e := NewEnv(t, st, o)
+	g := newGateway(t, e, "core", []string{"skills:read", "skills:write"}, []string{"openlinker"})
+	e.Expect(e.Do("PATCH", "/v1/admin/gateways/core", AdminToken, "", map[string]any{"projection": true}), 200, "projection gateway")
+	return e, projector{g, coreUser}
+}
+
+func visibleState(op string, rev int, versions ...string) map[string]any {
+	return map[string]any{"op": op, "revision": rev, "phase": 1, "owner": map[string]any{"sub": coreUser}, "state": "visible",
+		"listed": true, "versions": versions, "current_version": versions[len(versions)-1]}
+}
+
+func runProjectionReads(t *testing.T, newStore func(t *testing.T) store.Store) {
+	const marker = "withdrawn-0123456789"
+	t.Run("a page that loads a version withdrawn meanwhile shows nothing of it", func(t *testing.T) {
+		h := &hookStore{Store: newStore(t), hooks: map[string]func(){}}
+		e, alice := projectionEnv(t, h, Options{UI: true})
+		e.Expect(alice.version("p-split", "1", coreBundle("pdf-tools", "Read PDFs", "Use it."), PlatformTerms), 201, "v1")
+		e.Expect(alice.version("p-split", "2", coreBundle("pdf-tools", marker, "Use it."), PlatformTerms), 201, "v2")
+		e.Expect(alice.state("p-split", visibleState("d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1", 1, "1", "2")), 200, "visible")
+		h.before("GetVersion", func() {
+			e.Expect(alice.state("p-split", visibleState("d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2", 2, "1")), 200, "withdraw v2")
+		})
+		path := "/ui/skills/" + generatedNamespace(coreUser, 12) + "/p-split/versions/2"
+		r := e.Do("GET", path, "", "", nil)
+		if h.waiting("GetVersion") {
+			t.Fatal("the page never read the version; the case tests nothing")
+		}
+		if r.Status != 404 || strings.Contains(string(r.Body), marker) {
+			t.Fatalf("withdrawn version rendered: %d %s", r.Status, r.Body)
+		}
+	})
+
+	t.Run("mirrors follow withdrawn and restored versions", func(t *testing.T) {
+		up, alice := projectionEnv(t, newStore(t), Options{})
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		ns := generatedNamespace(coreUser, 12)
+		up.Expect(alice.version("p-mirror", "1", coreBundle("pdf-tools", "Read PDFs", "Use it."), PlatformTerms), 201, "v1")
+		up.Expect(alice.version("p-mirror", "2", coreBundle("pdf-tools", "Read and split PDFs", "Use it."), PlatformTerms), 201, "v2")
+		up.Expect(alice.state("p-mirror", visibleState("d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3", 1, "1", "2")), 200, "visible")
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base}), 201, "upstream")
+		v1 := "/v1/skills/" + ns + "/p-mirror/versions/1"
+		down.sync("hub")
+		reader := ""
+		down.Expect(down.Do("GET", v1, reader, "", nil), 200, "mirrored v1")
+		up.Expect(alice.state("p-mirror", visibleState("d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4", 2, "2")), 200, "withdraw v1")
+		down.sync("hub")
+		down.Expect(down.Do("GET", v1, reader, "", nil), 404, "withdrawn upstream")
+		down.Expect(down.Do("GET", v1+"/artifact", reader, "", nil), 404, "withdrawn artifact")
+		down.Expect(down.Do("GET", "/v1/skills/"+ns+"/p-mirror/versions/2", reader, "", nil), 200, "kept version")
+		up.Expect(alice.state("p-mirror", visibleState("d5d5d5d5-d5d5-4d5d-8d5d-d5d5d5d5d5d5", 3, "1", "2")), 200, "restore v1")
+		down.sync("hub")
+		down.Expect(down.Do("GET", v1, reader, "", nil), 200, "restored upstream")
+	})
+
+	t.Run("validation needs a public instance", func(t *testing.T) {
+		e := NewEnv(t, newStore(t), Options{Mode: "private"})
+		g := newGateway(t, e, "core", []string{"skills:read", "skills:write"}, []string{"openlinker"})
+		e.Do("PATCH", "/v1/admin/gateways/core", AdminToken, "", map[string]any{"projection": true})
+		r := projector{g, coreUser}.send("POST", "/v1/projections/validate", coreBundle("pdf-tools", "Read PDFs", "Use it."), bundleType)
+		if r.Status != 422 || errCode(r) != "projection_public_only" {
+			t.Fatalf("private validate: %d %s", r.Status, r.Body)
+		}
+	})
 }

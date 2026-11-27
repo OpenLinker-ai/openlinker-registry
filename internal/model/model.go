@@ -473,12 +473,14 @@ type ReportResult struct {
 }
 
 type Managed struct {
-	By       string
-	Owner    string
-	Revision int64
-	Phase    int
-	Hidden   bool
-	Legacy   json.RawMessage
+	By               string
+	Owner            string
+	Revision         int64
+	Phase            int
+	Hidden           bool
+	Legacy           json.RawMessage
+	Metadata         json.RawMessage
+	MetadataRevision int64
 }
 
 func (m Managed) IsManaged() bool { return m.By != "" }
@@ -501,7 +503,9 @@ type Projection struct {
 	Current     string
 	Description string
 	Legacy      json.RawMessage
-	MCPVersion  MCPVersion
+	Metadata    json.RawMessage
+	MetadataRev int64
+	MCPVersion  *MCPVersion
 }
 
 type ProjectionResult struct {

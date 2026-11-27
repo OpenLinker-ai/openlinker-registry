@@ -71,11 +71,6 @@ func (s *Server) claimNamespace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) claimSkill(w http.ResponseWriter, r *http.Request) {
-	c, err := s.claimant(r)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
 	var req struct {
 		Name string `json:"name"`
 	}
@@ -88,6 +83,15 @@ func (s *Server) claimSkill(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errNotFound)
 		return
 	}
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if sk.Managed.IsManaged() {
+		s.fail(w, r, model.ErrManagedByCore())
+		return
+	}
+	c, err := s.claimant(r)
 	if err != nil {
 		s.fail(w, r, err)
 		return

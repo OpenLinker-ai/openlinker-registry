@@ -331,7 +331,7 @@ func (s *Server) uiSkill(w http.ResponseWriter, r *http.Request) {
 	// The list holds summaries; the version shown is read in full, and the
 	// skill is confirmed after everything about it was loaded.
 	v, err := s.Svc.Store.GetVersion(r.Context(), sk.ID, d.Version.Version)
-	if errors.Is(err, model.ErrNotFound) {
+	if errors.Is(err, model.ErrNotFound) || (err == nil && v.Hidden && !principal(r).Admin) {
 		err = errNotFound
 	}
 	if err == nil {

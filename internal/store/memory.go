@@ -714,6 +714,10 @@ func (m *Memory) LockMirror(ctx context.Context, key string) (func(), error) {
 }
 
 // SetVersionMirrorServed implements Store.
+func (m *Memory) SetVersionMirrorHidden(ctx context.Context, id int64, hidden bool, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.Hidden = hidden })
+}
+
 func (m *Memory) SetVersionMirrorServed(ctx context.Context, id int64, served bool, audit model.AuditEvent) error {
 	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.MirrorServed = &served })
 }

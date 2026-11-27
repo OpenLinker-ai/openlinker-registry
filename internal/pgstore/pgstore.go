@@ -942,7 +942,7 @@ func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly
 		if err != nil {
 			return nil, err
 		}
-		if sk.ShownVisibility() != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive {
+		if sk.ShownVisibility() != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive || v.Hidden {
 			continue
 		}
 		out = append(out, model.IndexCandidate{Skill: sk, Version: v})
@@ -1052,6 +1052,10 @@ func (s *Store) LockMirror(ctx context.Context, key string) (func(), error) {
 }
 
 // SetVersionMirrorServed implements store.Store.
+func (s *Store) SetVersionMirrorHidden(ctx context.Context, id int64, hidden bool, audit model.AuditEvent) error {
+	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET projection_hidden = $2 WHERE id = $1`, id, hidden)
+}
+
 func (s *Store) SetVersionMirrorServed(ctx context.Context, id int64, served bool, audit model.AuditEvent) error {
 	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET mirror_served = $2 WHERE id = $1`, id, served)
 }

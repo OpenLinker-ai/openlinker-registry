@@ -371,16 +371,8 @@ func (s *Service) PublishUpload(ctx context.Context, o PublishOptions, format st
 			return model.Skill{}, model.Version{}, err
 		}
 	case archive.FormatBundle:
-		var bundle archive.Bundle
-		if bundle, files, err = archive.ParseBundle(body, s.Cfg.Limits); err != nil {
+		if files, err = s.bundleFiles(body); err != nil {
 			return model.Skill{}, model.Version{}, err
-		}
-		fm, err := skill.ParseFrontmatter(fileData(files, skill.SkillFile))
-		if err != nil {
-			return model.Skill{}, model.Version{}, err
-		}
-		if bundle.Name != fm.Name || bundle.Description != fm.Description {
-			return model.Skill{}, model.Version{}, fail(http.StatusUnprocessableEntity, "bundle_invalid", "bundle name and description must match SKILL.md frontmatter")
 		}
 		artifact, artifactType = body, archive.TypeBundle
 	default:
@@ -390,6 +382,24 @@ func (s *Service) PublishUpload(ctx context.Context, o PublishOptions, format st
 		return model.Skill{}, model.Version{}, err
 	}
 	return s.publishHosted(ctx, o, files, artifactType, artifact, model.Source{Kind: "upload", Format: format})
+}
+
+func (s *Service) bundleFiles(body []byte) ([]skill.File, error) {
+	bundle, files, err := archive.ParseBundle(body, s.Cfg.Limits)
+	if err != nil {
+		return nil, err
+	}
+	fm, err := skill.ParseFrontmatter(fileData(files, skill.SkillFile))
+	if err != nil {
+		return nil, err
+	}
+	if bundle.Name != fm.Name || bundle.Description != fm.Description {
+		return nil, fail(http.StatusUnprocessableEntity, "bundle_invalid", "bundle name and description must match SKILL.md frontmatter")
+	}
+	if _, err := skill.ValidateFiles(files, s.Cfg.Limits); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 func fileData(files []skill.File, p string) []byte {

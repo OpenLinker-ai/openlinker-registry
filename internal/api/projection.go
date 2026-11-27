@@ -134,7 +134,11 @@ func (s *Server) projectValidate(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	ok, code, msg := s.Svc.ValidateProjection(body)
+	ok, code, msg, err := s.Svc.ValidateProjection(body)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	out := map[string]any{"ok": ok}
 	if !ok {
 		out["code"], out["message"] = code, msg

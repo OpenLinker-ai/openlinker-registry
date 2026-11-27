@@ -73,6 +73,7 @@ type Store interface {
 	// SetVersionMirrorServed records whether the upstream of a mirrored
 	// version serves its content (see model.Version.MirrorServed).
 	SetVersionMirrorServed(ctx context.Context, versionID int64, served bool, audit model.AuditEvent) error
+	SetVersionMirrorHidden(ctx context.Context, versionID int64, hidden bool, audit model.AuditEvent) error
 
 	// SetVersionLocatorURL records where the content of a URL-indexed
 	// version is served now (ErrNotFound for any other version), together

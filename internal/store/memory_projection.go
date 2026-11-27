@@ -38,18 +38,18 @@ func (m *Memory) pj() *projectionState {
 func (m *Memory) ProjectionNamespace(_ context.Context, owner string, candidates []string, create bool, audit model.AuditEvent) (model.Namespace, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var generated *model.Namespace
+	var handle *model.Namespace
 	for _, ns := range m.ns {
-		if ns.OpenLinkerSubject == owner {
+		if ns.GeneratedFor == owner {
 			return ns, nil
 		}
-		if ns.GeneratedFor == owner {
+		if ns.OpenLinkerSubject == owner {
 			n := ns
-			generated = &n
+			handle = &n
 		}
 	}
-	if generated != nil {
-		return *generated, nil
+	if handle != nil {
+		return *handle, nil
 	}
 	for _, name := range candidates {
 		if _, taken := m.ns[name]; taken {
@@ -81,14 +81,15 @@ func (m *Memory) ApplySkillProjection(_ context.Context, p model.Projection, aud
 	s, ok := m.findSkill(p.Namespace, p.Name)
 	switch {
 	case !ok:
-		if !p.Hidden && len(p.Versions) > 0 {
-			return model.ProjectionResult{}, model.ErrProjectionVersionMissing()
-		}
 		now := time.Now().UTC()
 		s = model.Skill{ID: m.id(), Namespace: p.Namespace, Name: p.Name, Visibility: model.VisibilityPublic, Status: model.StatusActive,
 			Mode: "hosted", ReviewState: model.ReviewApproved, CreatedAt: now, UpdatedAt: now,
 			Managed: model.Managed{By: p.Target.Consumer, Owner: p.Target.Owner, Revision: p.Revision, Phase: p.Phase, Hidden: true, Legacy: p.Legacy}}
 		m.skills[s.ID] = s
+		if !p.Hidden && len(p.Versions) > 0 {
+			m.appendAudit(audit)
+			return model.ProjectionResult{}, model.ErrProjectionVersionMissing()
+		}
 		out.Applied = true
 	default:
 		if err := managedWrite(s.Managed, &p.Target); err != nil {
@@ -141,40 +142,55 @@ func (m *Memory) ApplyMCPProjection(_ context.Context, p model.Projection, audit
 		return model.ProjectionResult{}, model.ErrNotFound
 	}
 	full := p.Namespace + "/" + p.Name
-	var out model.ProjectionResult
+	now := micro(time.Now())
 	s, ok := m.findMCP(full)
-	switch {
-	case !ok:
-		if !p.Hidden {
-			return model.ProjectionResult{}, model.ErrProjectionVersionMissing()
-		}
-		now := micro(time.Now())
+	if !ok {
 		s = model.MCPServer{ID: m.id(), Namespace: p.Namespace, Name: full, Mode: model.MCPModeRegistered, Visibility: model.VisibilityPublic,
 			ReviewState: model.ReviewApproved, CreatedBy: p.Target.Consumer, CreatedAt: now, UpdatedAt: now,
-			Managed: model.Managed{By: p.Target.Consumer, Owner: p.Target.Owner, Revision: p.Revision, Phase: p.Phase, Hidden: true, Legacy: p.Legacy}}
-		m.mcp[s.ID] = s
-		out.Applied = true
-	default:
-		if s.Name != full {
-			return model.ProjectionResult{}, model.ErrProjectionNameConflict()
-		}
-		if err := managedWrite(s.Managed, &p.Target); err != nil {
-			return model.ProjectionResult{}, err
-		}
-		if !newer(p, s.Managed) {
-			break
-		}
-		now := time.Now().UTC()
-		s.Managed.Hidden, s.Managed.Revision, s.Managed.Phase = p.Hidden, p.Revision, p.Phase
-		if len(p.Legacy) > 0 {
-			s.Managed.Legacy = p.Legacy
-		}
-		s.Listed, s.UpdatedAt = p.Listed, micro(now)
-		m.mcp[s.ID] = s
-		m.stampMCPVersions(s.ID, now)
-		out.Applied = true
+			Managed: model.Managed{By: p.Target.Consumer, Owner: p.Target.Owner, Hidden: true}}
 	}
-	out.Namespace = p.Namespace
+	if s.Name != full || s.Namespace != p.Namespace {
+		return model.ProjectionResult{}, model.ErrProjectionNameConflict()
+	}
+	if err := managedWrite(s.Managed, &p.Target); err != nil {
+		return model.ProjectionResult{}, err
+	}
+	out := model.ProjectionResult{Namespace: p.Namespace}
+	if !newer(p, s.Managed) {
+		m.pj().ops[key] = out
+		m.appendAudit(audit)
+		return out, nil
+	}
+	if p.MCPVersion != nil {
+		if existing, dup := m.findMCPVersion(s.ID, p.MCPVersion.Version); dup {
+			if existing.Digest != p.MCPVersion.Digest {
+				return model.ProjectionResult{}, conflict("version_exists", "version already exists and is immutable")
+			}
+		}
+	} else if !p.Hidden {
+		if _, has := m.latestMCP(s.ID); !has {
+			return model.ProjectionResult{}, model.ErrProjectionVersionMissing()
+		}
+	}
+	if !ok {
+		m.mcp[s.ID] = s
+	}
+	if p.MCPVersion != nil {
+		if _, dup := m.findMCPVersion(s.ID, p.MCPVersion.Version); !dup {
+			m.addMCPVersion(s.ID, *p.MCPVersion, now, now)
+		}
+	}
+	s.Managed.Hidden, s.Managed.Revision, s.Managed.Phase = p.Hidden, p.Revision, p.Phase
+	if len(p.Legacy) > 0 {
+		s.Managed.Legacy = p.Legacy
+	}
+	if len(p.Metadata) > 0 {
+		s.Managed.Metadata, s.Managed.MetadataRevision = p.Metadata, p.MetadataRev
+	}
+	s.Listed, s.UpdatedAt = p.Listed, now
+	m.mcp[s.ID] = s
+	m.stampMCPVersions(s.ID, now)
+	out.Applied = true
 	m.pj().ops[key] = out
 	m.appendAudit(audit)
 	return out, nil

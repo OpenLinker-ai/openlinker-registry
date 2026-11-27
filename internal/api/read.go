@@ -311,7 +311,9 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
-		items = append(items, skillJSON(row.Skill, row.LatestVersion))
+		item := skillJSON(row.Skill, row.LatestVersion)
+		delete(item, "_meta")
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"skills": items, "next_cursor": next})
 }

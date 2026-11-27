@@ -42,7 +42,7 @@ func requireRole(r *http.Request, namespace string, min model.Role) error {
 
 // loadForWrite authorizes then loads the skill. Authorization happens first
 // so callers without a role learn nothing about private skills.
-func (s *Server) loadForWrite(r *http.Request, min model.Role) (model.Skill, *http.Request, error) {
+func (s *Server) loadForWrite(r *http.Request, min model.Role, moderation bool) (model.Skill, *http.Request, error) {
 	if err := requireRole(r, r.PathValue("ns"), min); err != nil {
 		return model.Skill{}, r, err
 	}
@@ -53,7 +53,7 @@ func (s *Server) loadForWrite(r *http.Request, min model.Role) (model.Skill, *ht
 	if err != nil {
 		return sk, r, err
 	}
-	if sk.Managed.IsManaged() && !principal(r).Admin {
+	if sk.Managed.IsManaged() && !(moderation && principal(r).Admin) {
 		return sk, r, model.ErrManagedByCore()
 	}
 	return sk, r.WithContext(model.WithSkillGuard(r.Context(), sk.ID, sk.Namespace)), nil
@@ -171,6 +171,12 @@ func (s *Server) githubWrite(w http.ResponseWriter, r *http.Request, fn func(ctx
 		s.fail(w, r, err)
 		return
 	}
+	if req.Name != "" {
+		if existing, err := s.Svc.Store.GetSkill(r.Context(), ns, req.Name); err == nil && existing.Managed.IsManaged() {
+			s.fail(w, r, model.ErrManagedByCore())
+			return
+		}
+	}
 	sk, v, err := fn(r.Context(), principal(r).Subject, ns, req)
 	if err != nil {
 		s.fail(w, r, err)
@@ -199,7 +205,7 @@ func readReason(w http.ResponseWriter, r *http.Request) (string, error) {
 
 func (s *Server) setStatus(status string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		sk, r, err := s.loadForWrite(r, model.RolePublisher)
+		sk, r, err := s.loadForWrite(r, model.RolePublisher, true)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -219,7 +225,7 @@ func (s *Server) setStatus(status string) http.HandlerFunc {
 }
 
 func (s *Server) yankVersion(w http.ResponseWriter, r *http.Request) {
-	sk, r, err := s.loadForWrite(r, model.RolePublisher)
+	sk, r, err := s.loadForWrite(r, model.RolePublisher, true)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -252,7 +258,7 @@ type patchRequest struct {
 }
 
 func (s *Server) patchSkill(w http.ResponseWriter, r *http.Request) {
-	sk, r, err := s.loadForWrite(r, model.RoleOwner)
+	sk, r, err := s.loadForWrite(r, model.RoleOwner, false)
 	if err != nil {
 		s.fail(w, r, err)
 		return

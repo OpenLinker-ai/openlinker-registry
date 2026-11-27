@@ -151,15 +151,7 @@ func (m *Memory) PublishMCPVersion(_ context.Context, in model.MCPPublishInput, 
 	if !in.Version.PublishedAt.IsZero() {
 		at = micro(in.Version.PublishedAt)
 	}
-	v := model.MCPVersion{ID: m.id(), ServerID: s.ID, Version: in.Version.Version, ServerJSON: slices.Clone(in.Version.ServerJSON),
-		Digest: in.Version.Digest, Status: model.MCPStatusActive, StatusChangedAt: at, PublishedAt: at, UpdatedAt: at,
-		CreatedBy: in.Version.CreatedBy}
-	cur, hasLatest := m.latestMCP(s.ID)
-	v.IsLatest = !hasLatest || model.CompareVersions(v.Version, cur.Version) >= 0
-	m.mcpVers[v.ID] = v
-	if v.IsLatest {
-		m.moveMCPLatest(s.ID, v.ID, now)
-	}
+	v := m.addMCPVersion(s.ID, in.Version, at, now)
 	s.UpdatedAt = now
 	m.mcp[s.ID] = s
 	m.appendAudit(audit)
@@ -530,4 +522,17 @@ func (m *Memory) ListMirroredMCP(_ context.Context, upstreamID int64, afterName 
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (m *Memory) addMCPVersion(serverID int64, in model.MCPVersion, at, now time.Time) model.MCPVersion {
+	v := model.MCPVersion{ID: m.id(), ServerID: serverID, Version: in.Version, ServerJSON: slices.Clone(in.ServerJSON),
+		Digest: in.Digest, Status: model.MCPStatusActive, StatusChangedAt: at, PublishedAt: at, UpdatedAt: at,
+		CreatedBy: in.CreatedBy}
+	cur, hasLatest := m.latestMCP(serverID)
+	v.IsLatest = !hasLatest || model.CompareVersions(v.Version, cur.Version) >= 0
+	m.mcpVers[v.ID] = v
+	if v.IsLatest {
+		m.moveMCPLatest(serverID, v.ID, now)
+	}
+	return v
 }

@@ -910,6 +910,22 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			break
 		}
 	}
+	if tooMany == nil {
+		listed := map[string]bool{}
+		for _, ref := range d.Versions {
+			listed[ref.Version] = true
+		}
+		for _, v := range have {
+			if v.Hidden == !listed[v.Version] {
+				continue
+			}
+			if err := s.Store.SetVersionMirrorHidden(ctx, v.ID, !listed[v.Version], auditEvent(actor, "version.mirror_hidden", d.Namespace,
+				d.Name+"@"+v.Version, map[string]any{"hidden": !listed[v.Version]})); err != nil {
+				return err
+			}
+			changed = true
+		}
+	}
 	// What can change about a version after it was published: it is yanked,
 	// a license is approved, and with that the upstream starts serving it.
 	for _, ref := range d.Versions[fresh:] {

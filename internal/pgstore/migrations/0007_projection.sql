@@ -9,7 +9,7 @@ ALTER TABLE skills
     ADD COLUMN managed_revision BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN managed_phase SMALLINT NOT NULL DEFAULT 0,
     ADD COLUMN projection_hidden BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN legacy JSONB CHECK (legacy IS NULL OR (jsonb_typeof(legacy) = 'object' AND octet_length(legacy::text) <= 16384)),
+    ADD COLUMN legacy JSONB CHECK (legacy IS NULL OR (jsonb_typeof(legacy) = 'object' AND octet_length(legacy::text) <= 4096)),
     ADD CONSTRAINT skills_managed_complete CHECK ((managed_by IS NULL) = (managed_owner IS NULL));
 ALTER TABLE skills DROP COLUMN shown_visibility;
 ALTER TABLE skills ADD COLUMN shown_visibility TEXT GENERATED ALWAYS AS
@@ -21,7 +21,9 @@ ALTER TABLE mcp_servers
     ADD COLUMN managed_revision BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN managed_phase SMALLINT NOT NULL DEFAULT 0,
     ADD COLUMN projection_hidden BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN legacy JSONB CHECK (legacy IS NULL OR (jsonb_typeof(legacy) = 'object' AND octet_length(legacy::text) <= 16384)),
+    ADD COLUMN legacy JSONB CHECK (legacy IS NULL OR (jsonb_typeof(legacy) = 'object' AND octet_length(legacy::text) <= 4096)),
+    ADD COLUMN metadata JSONB CHECK (metadata IS NULL OR (jsonb_typeof(metadata) = 'object' AND octet_length(metadata::text) <= 65536)),
+    ADD COLUMN metadata_revision BIGINT NOT NULL DEFAULT 0,
     ADD CONSTRAINT mcp_servers_managed_complete CHECK ((managed_by IS NULL) = (managed_owner IS NULL));
 ALTER TABLE mcp_servers DROP COLUMN shown_visibility;
 ALTER TABLE mcp_servers ADD COLUMN shown_visibility TEXT GENERATED ALWAYS AS
