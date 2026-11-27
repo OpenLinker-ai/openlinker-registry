@@ -373,6 +373,11 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if legacy, _ := meta["ai.openlinker/legacy"].(map[string]any); legacy["agent_id"] != "1" {
 			t.Fatalf("legacy: %s", r.Body)
 		}
+		nullServer, _ := json.Marshal(map[string]any{"op": "cececece-cece-4ece-8ece-cececececece", "revision": 9, "phase": 1, "owner": map[string]any{"sub": coreUser},
+			"state": "visible", "listed": true, "version": "0.1.9", "server": nil})
+		if r := e.Expect(alice.send("PUT", "/v1/projections/mcp/m-weather", nullServer, "application/json"), 422, "null server"); errCode(r) != "server_invalid" {
+			t.Fatalf("null server: %s", r.Body)
+		}
 		e.Expect(e.decide("mcp/servers", ns+"/m-weather", map[string]any{"decision": "reject", "reason": "check"}), 200, "reject")
 		before := e.Expect(e.Do("GET", "/v1/mcp/servers/"+ns+"/m-weather", AdminToken, "", nil), 200, "rejected detail").JSON["review"].(map[string]any)["revision"]
 		next, _ := json.Marshal(map[string]any{"op": "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd", "revision": 10, "phase": 1, "owner": map[string]any{"sub": coreUser},

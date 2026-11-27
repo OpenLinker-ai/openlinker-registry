@@ -232,8 +232,8 @@ func (s *Service) ApplyMCPState(ctx context.Context, p Projector, name string, s
 	full := ns.Name + "/" + name
 	var version *model.MCPVersion
 	if st.State == "visible" {
-		doc := map[string]json.RawMessage{}
-		if err := json.Unmarshal(st.Server, &doc); err != nil {
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(st.Server, &doc); err != nil || doc == nil {
 			return model.ProjectionResult{}, fail(http.StatusUnprocessableEntity, "server_invalid", "server must be a JSON object")
 		}
 		doc["name"], _ = json.Marshal(full)
