@@ -349,6 +349,9 @@ func runProjection(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if r.JSON["display_name"] != "PDF tools" {
 			t.Fatalf("display name: %s", r.Body)
 		}
+		if !listed(t, e, "", "/v1/skills?q="+url.QueryEscape("pdf tools"), "skills", "p-vis") {
+			t.Fatal("a projected entry is not found by its display name")
+		}
 		if !strings.Contains(string(r.Body), "ai.openlinker/legacy") {
 			t.Fatalf("legacy missing from the detail: %s", r.Body)
 		}

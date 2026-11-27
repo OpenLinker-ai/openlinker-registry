@@ -862,7 +862,7 @@ func (s *Store) Search(ctx context.Context, q model.SearchQuery) ([]model.SkillS
 	}
 	if q.Q != "" {
 		p := arg("%" + likeEscape(strings.ToLower(q.Q)) + "%")
-		where = append(where, "(lower(s.name) LIKE "+p+" OR lower(s.description) LIKE "+p+" OR n.name LIKE "+p+")")
+		where = append(where, "(lower(s.name) LIKE "+p+" OR lower(s.description) LIKE "+p+" OR n.name LIKE "+p+" OR lower(COALESCE(s.display_name, '')) LIKE "+p+")")
 	}
 	if q.Namespace != "" {
 		where = append(where, "n.name = "+arg(q.Namespace))

@@ -556,7 +556,8 @@ func (m *Memory) Search(_ context.Context, q model.SearchQuery) ([]model.SkillSu
 			continue
 		}
 		if needle != "" && !strings.Contains(strings.ToLower(s.Name), needle) &&
-			!strings.Contains(strings.ToLower(s.Description), needle) && !strings.Contains(s.Namespace, needle) {
+			!strings.Contains(strings.ToLower(s.Description), needle) && !strings.Contains(s.Namespace, needle) &&
+			!strings.Contains(strings.ToLower(s.Managed.DisplayName), needle) {
 			continue
 		}
 		lv, hasLatest := m.latest(s.ID)
