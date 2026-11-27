@@ -117,6 +117,11 @@ type Store interface {
 	MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, expectedRevision int64, audit model.AuditEvent) (model.Skill, error)
 	SkillRedirect(ctx context.Context, namespace, name string) (model.Skill, error)
 
+	SetGatewayProjection(ctx context.Context, consumer string, projection bool, audit model.AuditEvent) error
+	ProjectionNamespace(ctx context.Context, owner string, candidates []string, create bool, audit model.AuditEvent) (model.Namespace, error)
+	ApplySkillProjection(ctx context.Context, p model.Projection, audit model.AuditEvent) (model.ProjectionResult, error)
+	ApplyMCPProjection(ctx context.Context, p model.Projection, audit model.AuditEvent) (model.ProjectionResult, error)
+
 	// ListMirroredSkills pages through every skill in the namespaces of an
 	// upstream, in (namespace, name) byte order, whatever its listing,
 	// visibility or status: a mirror reconciles all of them, not only the

@@ -4,6 +4,21 @@ The registry has its own version numbers; see [RELEASE.md](./RELEASE.md).
 
 ## Unreleased
 
+- Projection (OpenLinker Core migration, R6): gateways marked `projection`
+  (`PATCH /v1/admin/gateways/{consumer}`) may, with a user assertion carrying
+  the new `project` action, ingest Core bundles as hidden immutable versions
+  (`PUT /v1/projections/skills/{name}/versions/{v}`), apply a revisioned
+  complete state to an entry (`PUT /v1/projections/skills/{name}`,
+  `PUT /v1/projections/mcp/{name}`), validate bundles and preflight
+  namespaces. Projected entries live in the owner's `ai.openlinker.*`
+  namespace (a generated `ai.openlinker.u<id>` when the owner has none,
+  reserved from self-service), are managed by that gateway and owner only,
+  skip the initial review but keep later moderation holds, and can hide whole
+  entries or single versions from everyone but administrators. States with
+  an older `(revision, phase)` change nothing; a hidden state for a missing
+  entry leaves a tombstone. `LicenseRef-openlinker-platform-terms` is accepted
+  for projected versions only. Migration `0007`.
+
 - Gateways: an API token registered as a gateway can read on behalf of its
   users with a signed, single-use, request-bound Ed25519 user assertion
   (`OpenLinker-User-Assertion`). Admin endpoints `/v1/admin/gateways`; role

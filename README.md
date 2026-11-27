@@ -350,6 +350,38 @@ Through a gateway user assertion with `write` (and a gateway token with
   entries. A write authorized against the old namespace that arrives after a
   claim fails with `409 entry_moved`.
 
+## Projection from OpenLinker Core
+
+A gateway the administrator marks with `{"projection": true}`
+(`PATCH /v1/admin/gateways/{consumer}`) can mirror what an OpenLinker Core
+publishes, one way. Every request carries a user assertion whose `act`
+includes `project` (the owner is the assertion's `sub`) and a gateway token
+with `skills:write`; only public instances accept projections.
+
+| Method and path | Body | Effect |
+|---|---|---|
+| `PUT /v1/projections/skills/{name}/versions/{v}?license=` | Core bundle | Immutable version, created hidden; same bytes again is 200, other bytes 409 |
+| `PUT /v1/projections/skills/{name}` | `{op, revision, phase, owner:{sub}, state, listed, versions, current_version, display, legacy}` | The entry's complete state |
+| `PUT /v1/projections/mcp/{name}` | `{op, revision, phase, owner:{sub}, state, listed, version, server, metadata, metadata_revision, legacy}` | The MCP server's complete state; a new `version` adds an immutable version |
+| `POST /v1/projections/validate` | Core bundle | `{ok, code, message}` without writing |
+| `POST /v1/projections/namespaces/preflight` | `{subjects}` | The namespace each owner would use, or a conflict |
+
+- Entries go to the owner's `ai.openlinker.*` namespace, or a generated
+  `ai.openlinker.u<first 12 (or 16) hex digits of the owner id>` bound to the
+  owner; those names are reserved from self-service.
+- Projected entries are managed: only the same gateway and owner may project
+  them; ordinary writes are `409 managed_by_core`. Administrators can still
+  review, reject and yank.
+- A state applies only when its `(revision, phase)` is newer than the last
+  one; `op` replays return the first answer. A hidden state for an entry that
+  does not exist yet records a tombstone, so older requests cannot reveal it.
+- `state: hidden`, and versions left out of `versions`, are hidden from
+  everyone but administrators on every read path (stronger than any role or
+  share), reversibly. Projection never changes the review state: new entries
+  start approved, later holds stay.
+- `license=LicenseRef-openlinker-platform-terms` stores an approved custom
+  license, for projected versions only.
+
 ## Upstreams: forwarding and mirroring
 
 ```json

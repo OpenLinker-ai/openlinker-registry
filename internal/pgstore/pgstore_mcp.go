@@ -14,7 +14,8 @@ import (
 )
 
 const mcpServerCols = `m.id, n.name, m.name, m.mode, m.visibility, m.listed, COALESCE(u.name, ''), m.review_state,
-	m.review_reason, m.review_revision, m.created_by, m.created_at, m.updated_at`
+	m.review_reason, m.review_revision, COALESCE(m.managed_by, ''), COALESCE(m.managed_owner, ''), m.managed_revision, m.managed_phase,
+	m.projection_hidden, m.legacy, m.created_by, m.created_at, m.updated_at`
 
 // mcpServerFrom joins what mcpServerCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -26,7 +27,8 @@ const mcpVersionCols = `v.id, v.server_id, v.version, v.server_json, v.digest, v
 
 func mcpServerDest(s *model.MCPServer) []any {
 	return []any{&s.ID, &s.Namespace, &s.Name, &s.Mode, &s.Visibility, &s.Listed, &s.Upstream, &s.ReviewState,
-		&s.ReviewReason, &s.ReviewRevision, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt}
+		&s.ReviewReason, &s.ReviewRevision, &s.Managed.By, &s.Managed.Owner, &s.Managed.Revision, &s.Managed.Phase,
+		&s.Managed.Hidden, &s.Managed.Legacy, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt}
 }
 
 func mcpVersionDest(v *model.MCPVersion) []any {
@@ -110,6 +112,16 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 		srv, srvNS, created, err = lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
 			Listed: in.Listed, CreatedBy: in.Version.CreatedBy}, nsID)
 		if err != nil {
+			return err
+		}
+		if created && in.Projection != nil {
+			if _, err := tx.Exec(ctx, `UPDATE mcp_servers SET managed_by = $2, managed_owner = $3, projection_hidden = true WHERE id = $1`,
+				srv.ID, in.Projection.Consumer, in.Projection.Owner); err != nil {
+				return err
+			}
+			srv.Managed = model.Managed{By: in.Projection.Consumer, Owner: in.Projection.Owner, Hidden: true}
+		}
+		if err := managedWrite(srv.Managed, in.Projection); err != nil {
 			return err
 		}
 		switch {

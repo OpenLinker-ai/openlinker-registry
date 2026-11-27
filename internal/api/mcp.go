@@ -451,6 +451,9 @@ func (s *Server) loadMCPForWrite(r *http.Request, min model.Role) (model.MCPServ
 	if errors.Is(err, model.ErrNotFound) {
 		return srv, errNotFound
 	}
+	if err == nil && srv.Managed.IsManaged() && !principal(r).Admin {
+		return srv, model.ErrManagedByCore()
+	}
 	return srv, err
 }
 

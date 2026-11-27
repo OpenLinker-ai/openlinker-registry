@@ -214,6 +214,7 @@ type PublishOptions struct {
 	Listed      *bool  // optional; only applies when the skill is created
 	License     string // optional override of frontmatter license
 	LicenseText string // required for custom unless a LICENSE file is included
+	Projection  *model.ProjectionTarget
 }
 
 func (s *Service) validateTarget(ctx context.Context, o *PublishOptions, mode string) (existing *model.Skill, err error) {
@@ -304,13 +305,19 @@ func (s *Service) publishHosted(ctx context.Context, o PublishOptions, files []s
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
-	lic, licText, err := hostedLicense(o, fm, files)
-	if err != nil {
+	var lic skill.License
+	var licText string
+	if o.Projection != nil && o.License == PlatformTermsLicense {
+		lic, licText = skill.License{Kind: skill.LicenseCustom}, platformTermsText
+	} else if lic, licText, err = hostedLicense(o, fm, files); err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
 	b, err := s.build(files, artifactType, artifact, lic, licText)
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
+	}
+	if o.Projection != nil && o.License == PlatformTermsLicense {
+		b.version.LicenseApproved = true
 	}
 	// The blob is written before the version row is committed, under a
 	// shared lease that GCArtifacts must wait for. If the publish fails, the
@@ -331,7 +338,7 @@ func (s *Service) publishHosted(ctx context.Context, o PublishOptions, files []s
 		listed = *o.Listed
 	}
 	return s.Store.PublishVersion(ctx, model.PublishInput{Namespace: o.Namespace, Name: o.Name, Mode: skill.ModeHosted,
-		Visibility: o.Visibility, Listed: listed, Version: v, Review: s.reviewRule(ctx, false)},
+		Visibility: o.Visibility, Listed: listed, Version: v, Review: s.projectionReview(ctx, o.Projection), Projection: o.Projection},
 		auditEvent(o.Actor, "skill.publish", o.Namespace, o.Name+"@"+o.Version,
 			map[string]any{"digest": v.ArtifactDigest, "artifact_type": v.ArtifactType, "source": src.Kind}))
 }

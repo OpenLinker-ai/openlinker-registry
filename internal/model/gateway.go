@@ -11,6 +11,7 @@ type Gateway struct {
 	Consumer   string
 	TokenID    string
 	Identities []string
+	Projection bool
 	CreatedAt  time.Time
 }
 

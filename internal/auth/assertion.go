@@ -26,6 +26,7 @@ const (
 	ActRead           = "read"
 	ActImport         = "import"
 	ActWrite          = "write"
+	ActProject        = "project"
 	MaxAssertionBytes = 8192
 	maxAssertionLife  = 60 * time.Second
 	assertionSkew     = 30 * time.Second
@@ -187,7 +188,7 @@ func (a *Authenticator) VerifyAssertion(ctx context.Context, p Principal, raw st
 		return Principal{}, ErrInvalidAssertion
 	}
 	for _, act := range c.Act {
-		if act != ActRead && act != ActImport && act != ActWrite {
+		if act != ActRead && act != ActImport && act != ActWrite && act != ActProject {
 			return Principal{}, ErrInvalidAssertion
 		}
 	}

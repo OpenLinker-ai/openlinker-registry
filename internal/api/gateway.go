@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
@@ -86,6 +87,9 @@ func (s *Server) withAssertion(w http.ResponseWriter, r *http.Request, p auth.Pr
 	act := auth.ActWrite
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		act = auth.ActRead
+	}
+	if strings.HasPrefix(strings.TrimPrefix(r.URL.Path, s.BasePath), "/v1/projections/") {
+		act = auth.ActProject
 	}
 	verified, err := s.Auth.VerifyAssertion(r.Context(), p, raw, auth.AssertionRequest{Method: r.Method,
 		Target: auth.CanonicalTarget(r.URL.EscapedPath(), query), Body: body, Audience: s.assertionAudience(), Act: act})
@@ -172,7 +176,7 @@ func (s *Server) listGateways(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		out = append(out, map[string]any{"consumer": g.Consumer, "token_id": g.TokenID, "identities": g.Identities,
-			"created_at": g.CreatedAt, "keys": keys})
+			"projection": g.Projection, "created_at": g.CreatedAt, "keys": keys})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"gateways": out})
 }

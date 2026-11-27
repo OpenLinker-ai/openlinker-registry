@@ -47,6 +47,18 @@ func (e *Env) decide(kind, entry string, body map[string]any) Resp {
 	r := e.Expect(e.Do("GET", read, AdminToken, "", nil), 200, "admin reads "+entry)
 	if review, ok := r.JSON["review"].(map[string]any); ok {
 		body["revision"] = review["revision"]
+	} else {
+		k := "skill"
+		if kind == "mcp/servers" {
+			k = "mcp"
+		}
+		q := e.Expect(e.Do("GET", "/v1/admin/review?state=approved&limit=200&kind="+k, AdminToken, "", nil), 200, "approved queue")
+		for _, it := range q.JSON["items"].([]any) {
+			m := it.(map[string]any)
+			if m["namespace"].(string)+"/"+m["name"].(string) == entry || (kind == "mcp/servers" && m["name"] == entry) {
+				body["revision"] = m["review_revision"]
+			}
+		}
 	}
 	return e.Do("POST", "/v1/admin/review/"+kind+"/"+entry, AdminToken, "", body)
 }

@@ -47,12 +47,18 @@ type MCPServer struct {
 	ReviewState    string
 	ReviewReason   string
 	ReviewRevision int64
+	Managed        Managed
 	CreatedBy      string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
 
-func (m MCPServer) ShownVisibility() string { return ShownVisibility(m.ReviewState, m.Visibility) }
+func (m MCPServer) ShownVisibility() string {
+	if m.Managed.Hidden {
+		return VisibilityHidden
+	}
+	return ShownVisibility(m.ReviewState, m.Visibility)
+}
 
 // MCPVersion is one published version. ServerJSON, Digest, Version,
 // PublishedAt and CreatedBy never change; status fields and IsLatest may.
@@ -87,6 +93,7 @@ type MCPPublishInput struct {
 	Visibility string // used only when creating the server
 	Listed     bool   // used only when creating the server
 	Review     ReviewRule
+	Projection *ProjectionTarget
 	Version    MCPVersion
 }
 

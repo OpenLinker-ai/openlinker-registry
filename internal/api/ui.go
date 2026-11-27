@@ -308,6 +308,7 @@ func (s *Server) uiSkill(w http.ResponseWriter, r *http.Request) {
 		s.uiError(w, r, err)
 		return
 	}
+	versions = visibleVersions(r, versions)
 	d := uiSkillDetail{Skill: sk, Versions: versions}
 	want := r.PathValue("version")
 	found := false

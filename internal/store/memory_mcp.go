@@ -130,6 +130,12 @@ func (m *Memory) PublishMCPVersion(_ context.Context, in model.MCPPublishInput, 
 	} else {
 		s = model.MCPServer{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
 			Listed: in.Listed, CreatedBy: in.Version.CreatedBy, CreatedAt: now}
+		if in.Projection != nil {
+			s.Managed = model.Managed{By: in.Projection.Consumer, Owner: in.Projection.Owner, Hidden: true}
+		}
+	}
+	if err := managedWrite(s.Managed, in.Projection); err != nil {
+		return fail(err)
 	}
 	prev := s.ReviewState
 	if ok {

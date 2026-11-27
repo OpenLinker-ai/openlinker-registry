@@ -52,7 +52,7 @@ func (s *Service) ClaimNamespace(ctx context.Context, c Claimant, name string) (
 		if s.Cfg.Mode != "public" {
 			return model.Namespace{}, false, notClaimable("ai.openlinker namespaces exist only on the public instance")
 		}
-		if !handleRe.MatchString(handle) || strings.Contains(handle, "--") || slices.Contains(reservedHandles, handle) {
+		if !handleRe.MatchString(handle) || strings.Contains(handle, "--") || slices.Contains(reservedHandles, handle) || generatedHandle(handle) {
 			return model.Namespace{}, false, notClaimable("the handle must be 3-39 lowercase letters, digits or single hyphens, not reserved")
 		}
 		if !c.OpenLinker {

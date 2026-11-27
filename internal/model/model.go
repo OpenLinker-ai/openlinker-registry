@@ -2,6 +2,7 @@
 package model
 
 import (
+	"encoding/json"
 	"errors"
 	"slices"
 	"time"
@@ -105,6 +106,7 @@ type Namespace struct {
 	// namespaces). Kind is NSKindUpstream exactly when it is set.
 	UpstreamID        int64
 	OpenLinkerSubject string
+	GeneratedFor      string
 	ReviewTrusted     bool
 	CreatedAt         time.Time
 }
@@ -152,11 +154,17 @@ type Skill struct {
 	ReviewReason   string
 	ReviewRevision int64
 	Claimed        bool
+	Managed        Managed
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
 
-func (s Skill) ShownVisibility() string { return ShownVisibility(s.ReviewState, s.Visibility) }
+func (s Skill) ShownVisibility() string {
+	if s.Managed.Hidden {
+		return VisibilityHidden
+	}
+	return ShownVisibility(s.ReviewState, s.Visibility)
+}
 
 // CheckSource says where the content of an indexed version was read from
 // when it was verified. A check result is about that source only: the
@@ -181,7 +189,7 @@ func LatestVersion(current string, versions []Version) (Version, bool) {
 	var newest *Version
 	for i := range versions {
 		v := &versions[i]
-		if v.YankedAt != nil {
+		if v.YankedAt != nil || v.Hidden {
 			continue
 		}
 		if current != "" && v.Version == current {
@@ -267,6 +275,7 @@ type Version struct {
 	YankReason   string
 	CreatedBy    string
 	CreatedAt    time.Time
+	Hidden       bool
 }
 
 // SkillSummary is a list/search row.
@@ -359,6 +368,7 @@ type PublishInput struct {
 	// upstream's order; a mismatch is ConflictError version_order.
 	ExpectNewest *string
 	Review       ReviewRule
+	Projection   *ProjectionTarget
 	// A published version becomes the skill's latest: publishing clears
 	// Skill.CurrentVersion.
 	Version Version
@@ -378,6 +388,8 @@ const (
 
 const VisibilityReview = "review"
 
+const VisibilityHidden = "hidden"
+
 func ShownVisibility(review, visibility string) string {
 	if review == "" || review == ReviewApproved {
 		return visibility
@@ -386,7 +398,7 @@ func ShownVisibility(review, visibility string) string {
 }
 
 func PresentedVisibility(shown string) string {
-	if shown == VisibilityReview {
+	if shown == VisibilityReview || shown == VisibilityHidden {
 		return VisibilityPrivate
 	}
 	return shown
@@ -458,4 +470,56 @@ type ReportResult struct {
 	Report   Report
 	Created  bool
 	Reopened bool
+}
+
+type Managed struct {
+	By       string
+	Owner    string
+	Revision int64
+	Phase    int
+	Hidden   bool
+	Legacy   json.RawMessage
+}
+
+func (m Managed) IsManaged() bool { return m.By != "" }
+
+type ProjectionTarget struct {
+	Consumer string
+	Owner    string
+}
+
+type Projection struct {
+	Target      ProjectionTarget
+	Namespace   string
+	Name        string
+	Op          string
+	Revision    int64
+	Phase       int
+	Hidden      bool
+	Listed      bool
+	Versions    []string
+	Current     string
+	Description string
+	Legacy      json.RawMessage
+	MCPVersion  MCPVersion
+}
+
+type ProjectionResult struct {
+	Applied bool `json:"applied"`
+}
+
+func ErrManagedByCore() error {
+	return &ConflictError{Code: "managed_by_core", Msg: "this entry is managed by OpenLinker Core; change it there"}
+}
+
+func ErrProjectionNameConflict() error {
+	return &ConflictError{Code: "name_conflict", Msg: "an entry that is not managed by this gateway already uses this name"}
+}
+
+func ErrProjectionVersionMissing() error {
+	return &ConflictError{Code: "version_missing", Msg: "a listed version has not been ingested"}
+}
+
+func ErrProjectionNamespace() error {
+	return &ConflictError{Code: "namespace_conflict", Msg: "no namespace can be provisioned for this owner"}
 }

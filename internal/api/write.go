@@ -53,6 +53,9 @@ func (s *Server) loadForWrite(r *http.Request, min model.Role) (model.Skill, *ht
 	if err != nil {
 		return sk, r, err
 	}
+	if sk.Managed.IsManaged() && !principal(r).Admin {
+		return sk, r, model.ErrManagedByCore()
+	}
 	return sk, r.WithContext(model.WithSkillGuard(r.Context(), sk.ID, sk.Namespace)), nil
 }
 
