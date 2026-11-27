@@ -44,6 +44,24 @@ func (s *Server) mcpRoutes(m *http.ServeMux) {
 
 // --- presentation ---
 
+func managedMeta(m model.Managed) map[string]any {
+	if !m.IsManaged() {
+		return nil
+	}
+	meta := map[string]any{}
+	if len(m.Legacy) > 0 {
+		meta["ai.openlinker/legacy"] = json.RawMessage(m.Legacy)
+	}
+	if len(m.Metadata) > 0 {
+		meta["ai.openlinker/metadata"] = json.RawMessage(m.Metadata)
+		meta["ai.openlinker/metadata_revision"] = m.MetadataRevision
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
+}
+
 func mcpServerJSON(srv model.MCPServer) map[string]any {
 	out := map[string]any{"name": srv.Name, "namespace": srv.Namespace, "mode": srv.Mode, "visibility": model.PresentedVisibility(srv.ShownVisibility()),
 		"listed": srv.Listed, "created_at": srv.CreatedAt, "updated_at": srv.UpdatedAt}
@@ -363,6 +381,9 @@ func (s *Server) getMCPServer(w http.ResponseWriter, r *http.Request) {
 			"published_at": v.PublishedAt, "updated_at": v.UpdatedAt, "digest": v.Digest})
 	}
 	out := mcpServerJSON(srv)
+	if meta := managedMeta(srv.Managed); meta != nil {
+		out["_meta"] = meta
+	}
 	out["latest_version"] = nullable(latest.Version)
 	out["versions"] = list
 	s.setCache(w, r, false)
@@ -443,13 +464,16 @@ func (s *Server) publishMCP(w http.ResponseWriter, r *http.Request) {
 
 // loadMCPForWrite authorizes then loads the server, so callers without a
 // role learn nothing about private entries.
-func (s *Server) loadMCPForWrite(r *http.Request, min model.Role) (model.MCPServer, error) {
+func (s *Server) loadMCPForWrite(r *http.Request, min model.Role, moderation bool) (model.MCPServer, error) {
 	if err := requireRole(r, strings.ToLower(r.PathValue("ns")), min); err != nil {
 		return model.MCPServer{}, err
 	}
 	srv, err := s.Svc.Store.GetMCPServer(r.Context(), serverName(r))
 	if errors.Is(err, model.ErrNotFound) {
 		return srv, errNotFound
+	}
+	if err == nil && srv.Managed.IsManaged() && !(moderation && principal(r).Admin) {
+		return srv, model.ErrManagedByCore()
 	}
 	return srv, err
 }
@@ -460,7 +484,7 @@ type mcpStatusRequest struct {
 }
 
 func (s *Server) setMCPStatus(w http.ResponseWriter, r *http.Request) {
-	srv, err := s.loadMCPForWrite(r, model.RolePublisher)
+	srv, err := s.loadMCPForWrite(r, model.RolePublisher, true)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -479,7 +503,7 @@ func (s *Server) setMCPStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) patchMCP(w http.ResponseWriter, r *http.Request) {
-	srv, err := s.loadMCPForWrite(r, model.RoleOwner)
+	srv, err := s.loadMCPForWrite(r, model.RoleOwner, false)
 	if err != nil {
 		s.fail(w, r, err)
 		return

@@ -12,21 +12,22 @@ import (
 
 // Memory is an in-memory Store with the same semantics as the Postgres store.
 type Memory struct {
-	mu        sync.Mutex
-	nextID    int64
-	ns        map[string]model.Namespace
-	roles     map[string]map[string]model.Role // subject -> namespace -> role
-	tokens    map[string]model.Token
-	tokenIDs  []string // creation order
-	skills    map[int64]model.Skill
-	versions  map[int64]model.Version
-	audit     []model.AuditEvent
-	locks     keyLocks
-	upstreams map[int64]model.Upstream
-	mcp       map[int64]model.MCPServer
-	mcpVers   map[int64]model.MCPVersion
-	gateways  *gatewayState
-	review    *reviewState
+	mu         sync.Mutex
+	nextID     int64
+	ns         map[string]model.Namespace
+	roles      map[string]map[string]model.Role // subject -> namespace -> role
+	tokens     map[string]model.Token
+	tokenIDs   []string // creation order
+	skills     map[int64]model.Skill
+	versions   map[int64]model.Version
+	audit      []model.AuditEvent
+	locks      keyLocks
+	upstreams  map[int64]model.Upstream
+	mcp        map[int64]model.MCPServer
+	mcpVers    map[int64]model.MCPVersion
+	gateways   *gatewayState
+	review     *reviewState
+	projection *projectionState
 }
 
 // NewMemory returns an empty in-memory store.
@@ -249,6 +250,9 @@ func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audi
 	now := time.Now().UTC()
 	s, ok := m.findSkill(in.Namespace, in.Name)
 	if ok {
+		if err := managedWrite(s.Managed, in.Projection); err != nil {
+			return model.Skill{}, model.Version{}, err
+		}
 		if s.Mode != in.Mode {
 			return model.Skill{}, model.Version{}, conflict("mode_mismatch", "skill exists with a different mode")
 		}
@@ -282,6 +286,9 @@ func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audi
 		}
 		s = model.Skill{ID: m.id(), Namespace: in.Namespace, Name: in.Name, Visibility: m.mirrorVisibility(in.UpstreamID, in.Visibility), Listed: in.Listed,
 			Status: model.StatusActive, Mode: in.Mode, SourceKey: in.SourceKey, CreatedAt: now}
+		if in.Projection != nil {
+			s.Managed = model.Managed{By: in.Projection.Consumer, Owner: in.Projection.Owner, Hidden: true}
+		}
 	}
 	if in.ExpectNewest != nil {
 		newest := ""
@@ -313,8 +320,11 @@ func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audi
 	v := in.Version
 	v.ID, v.SkillID, v.CreatedAt, v.Mode = m.id(), s.ID, now, in.Mode
 	v.Files = slices.Clone(v.Files)
+	v.Hidden = in.Projection != nil
 	m.versions[v.ID] = v
-	s.Description, s.CurrentVersion, s.UpdatedAt = v.FrontmatterDescription, "", now
+	if in.Projection == nil {
+		s.Description, s.CurrentVersion, s.UpdatedAt = v.FrontmatterDescription, "", now
+	}
 	m.skills[s.ID] = s
 	m.appendAudit(audit)
 	return m.withUpstream(s), v, nil
@@ -704,6 +714,10 @@ func (m *Memory) LockMirror(ctx context.Context, key string) (func(), error) {
 }
 
 // SetVersionMirrorServed implements Store.
+func (m *Memory) SetVersionMirrorHidden(ctx context.Context, id int64, hidden bool, audit model.AuditEvent) error {
+	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.Hidden = hidden })
+}
+
 func (m *Memory) SetVersionMirrorServed(ctx context.Context, id int64, served bool, audit model.AuditEvent) error {
 	return m.mutateVersion(ctx, id, &audit, func(v *model.Version) { v.MirrorServed = &served })
 }

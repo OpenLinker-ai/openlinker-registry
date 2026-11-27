@@ -73,6 +73,7 @@ type Store interface {
 	// SetVersionMirrorServed records whether the upstream of a mirrored
 	// version serves its content (see model.Version.MirrorServed).
 	SetVersionMirrorServed(ctx context.Context, versionID int64, served bool, audit model.AuditEvent) error
+	SetVersionMirrorHidden(ctx context.Context, versionID int64, hidden bool, audit model.AuditEvent) error
 
 	// SetVersionLocatorURL records where the content of a URL-indexed
 	// version is served now (ErrNotFound for any other version), together
@@ -116,6 +117,11 @@ type Store interface {
 	ResolveReport(ctx context.Context, id int64, state, by string, at time.Time, audit model.AuditEvent) (model.Report, error)
 	MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, expectedRevision int64, audit model.AuditEvent) (model.Skill, error)
 	SkillRedirect(ctx context.Context, namespace, name string) (model.Skill, error)
+
+	SetGatewayProjection(ctx context.Context, consumer string, projection bool, audit model.AuditEvent) error
+	ProjectionNamespace(ctx context.Context, owner string, candidates []string, create bool, audit model.AuditEvent) (model.Namespace, error)
+	ApplySkillProjection(ctx context.Context, p model.Projection, audit model.AuditEvent) (model.ProjectionResult, error)
+	ApplyMCPProjection(ctx context.Context, p model.Projection, audit model.AuditEvent) (model.ProjectionResult, error)
 
 	// ListMirroredSkills pages through every skill in the namespaces of an
 	// upstream, in (namespace, name) byte order, whatever its listing,

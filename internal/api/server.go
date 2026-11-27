@@ -167,6 +167,7 @@ func (s *Server) routes(m *http.ServeMux) {
 	s.adminRoutes(m)
 	s.gatewayRoutes(m)
 	s.reviewRoutes(m)
+	s.projectionRoutes(m)
 	if s.UI {
 		s.uiRoutes(m)
 	}

@@ -38,6 +38,11 @@ func (s *Store) ClaimNamespace(ctx context.Context, ns model.Namespace, owner st
 	var out model.Namespace
 	created := false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if ns.OpenLinkerSubject != "" {
+			if err := lockOwner(ctx, tx, ns.OpenLinkerSubject); err != nil {
+				return err
+			}
+		}
 		existing, err := scanNamespace(tx.QueryRow(ctx, `SELECT `+nsCols+` FROM namespaces WHERE name = $1 FOR UPDATE`, ns.Name))
 		if err == nil {
 			if !sameOwner(existing, ns) {
@@ -56,7 +61,7 @@ func (s *Store) ClaimNamespace(ctx context.Context, ns model.Namespace, owner st
 		err = tx.QueryRow(ctx, `INSERT INTO namespaces (name, kind, github_id, display_name, openlinker_subject)
 			VALUES ($1, $2, $3, $4, $5) RETURNING `+nsCols, ns.Name, ns.Kind, ns.GitHubID, ns.DisplayName, subject).
 			Scan(&out.ID, &out.Name, &out.Kind, &out.GitHubID, &out.DisplayName, &out.UpstreamID, &out.OpenLinkerSubject,
-				&out.ReviewTrusted, &out.CreatedAt)
+				&out.GeneratedFor, &out.ReviewTrusted, &out.CreatedAt)
 		if c, ok := uniqueViolation(err); ok {
 			switch {
 			case strings.Contains(c, "openlinker_subject"):

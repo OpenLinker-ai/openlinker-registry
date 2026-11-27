@@ -211,11 +211,11 @@ func notFound(err error) error {
 	return err
 }
 
-const nsCols = `id, name, kind, github_id, display_name, COALESCE(upstream_id, 0), COALESCE(openlinker_subject, ''), review_trusted, created_at`
+const nsCols = `id, name, kind, github_id, display_name, COALESCE(upstream_id, 0), COALESCE(openlinker_subject, ''), COALESCE(generated_for, ''), review_trusted, created_at`
 
 func scanNamespace(row pgx.Row) (model.Namespace, error) {
 	var ns model.Namespace
-	err := row.Scan(&ns.ID, &ns.Name, &ns.Kind, &ns.GitHubID, &ns.DisplayName, &ns.UpstreamID, &ns.OpenLinkerSubject, &ns.ReviewTrusted, &ns.CreatedAt)
+	err := row.Scan(&ns.ID, &ns.Name, &ns.Kind, &ns.GitHubID, &ns.DisplayName, &ns.UpstreamID, &ns.OpenLinkerSubject, &ns.GeneratedFor, &ns.ReviewTrusted, &ns.CreatedAt)
 	return ns, err
 }
 
@@ -389,7 +389,8 @@ func rowsOrNotFound(tag pgconn.CommandTag, err error) error {
 
 const skillCols = `s.id, n.name, s.name, s.description, s.visibility, s.listed, s.status, s.status_reason,
 	s.mode, COALESCE(s.source_key, ''), COALESCE(s.global_alias, ''), COALESCE(u.name, ''), s.current_version,
-	s.review_state, s.review_reason, s.review_revision, s.claimed, s.created_at, s.updated_at`
+	s.review_state, s.review_reason, s.review_revision, s.claimed, COALESCE(s.managed_by, ''), COALESCE(s.managed_owner, ''),
+	s.managed_revision, s.managed_phase, s.projection_hidden, s.legacy, COALESCE(s.display_name, ''), s.created_at, s.updated_at`
 
 // skillFrom joins what skillCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -399,7 +400,8 @@ func scanSkill(row pgx.Row, extra ...any) (model.Skill, error) {
 	var k model.Skill
 	dest := append([]any{&k.ID, &k.Namespace, &k.Name, &k.Description, &k.Visibility, &k.Listed, &k.Status,
 		&k.StatusReason, &k.Mode, &k.SourceKey, &k.GlobalAlias, &k.Upstream, &k.CurrentVersion,
-		&k.ReviewState, &k.ReviewReason, &k.ReviewRevision, &k.Claimed, &k.CreatedAt, &k.UpdatedAt}, extra...)
+		&k.ReviewState, &k.ReviewReason, &k.ReviewRevision, &k.Claimed, &k.Managed.By, &k.Managed.Owner,
+		&k.Managed.Revision, &k.Managed.Phase, &k.Managed.Hidden, &k.Managed.Legacy, &k.Managed.DisplayName, &k.CreatedAt, &k.UpdatedAt}, extra...)
 	err := row.Scan(dest...)
 	return k, err
 }
@@ -451,9 +453,13 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 			sourceKey = &in.SourceKey
 		}
 		// Create the skill if missing; a concurrent creator wins and we re-read.
-		tag, err := tx.Exec(ctx, `INSERT INTO skills (namespace_id, name, visibility, listed, mode, source_key)
-			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (namespace_id, name) DO NOTHING`,
-			nsID, in.Name, visibility, in.Listed, in.Mode, sourceKey)
+		var managedBy, managedOwner *string
+		if in.Projection != nil {
+			managedBy, managedOwner = &in.Projection.Consumer, &in.Projection.Owner
+		}
+		tag, err := tx.Exec(ctx, `INSERT INTO skills (namespace_id, name, visibility, listed, mode, source_key, managed_by, managed_owner, projection_hidden)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (namespace_id, name) DO NOTHING`,
+			nsID, in.Name, visibility, in.Listed, in.Mode, sourceKey, managedBy, managedOwner, in.Projection != nil)
 		if c, ok := uniqueViolation(err); ok && strings.Contains(c, "source_key") {
 			// Do not reveal which (possibly private) entry holds the source.
 			return conflict("source_already_indexed", "this source is already indexed on this registry")
@@ -464,6 +470,9 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		k, err := scanSkill(tx.QueryRow(ctx, `SELECT `+skillCols+skillFrom+`WHERE s.namespace_id = $1 AND s.name = $2 FOR UPDATE OF s`,
 			nsID, in.Name))
 		if err != nil {
+			return err
+		}
+		if err := managedWrite(k.Managed, in.Projection); err != nil {
 			return err
 		}
 		if k.Mode != in.Mode {
@@ -512,14 +521,15 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 		if v.ArchiveDigest != "" {
 			archive = &v.ArchiveDigest
 		}
+		v.Hidden = in.Projection != nil
 		err = tx.QueryRow(ctx, `INSERT INTO skill_versions (skill_id, version, mode, frontmatter_name, frontmatter_description,
 			license_kind, license_id, license_text, license_approved, core_compatible, files, artifact_digest, artifact_type,
-			artifact_size, archive_digest, source, locator, indexed_by, check_result, checked_at, created_by, mirror_served)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NULLIF($19,''),$20,$21,$22)
+			artifact_size, archive_digest, source, locator, indexed_by, check_result, checked_at, created_by, mirror_served, projection_hidden)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NULLIF($19,''),$20,$21,$22,$23)
 			RETURNING id, created_at`,
 			k.ID, v.Version, in.Mode, v.FrontmatterName, v.FrontmatterDescription, v.LicenseKind, v.LicenseID, v.LicenseText,
 			v.LicenseApproved, v.CoreCompatible, files, v.ArtifactDigest, v.ArtifactType, v.ArtifactSize, archive, src, loc,
-			v.IndexedBy, v.CheckResult, v.CheckedAt, v.CreatedBy, v.MirrorServed).Scan(&v.ID, &v.CreatedAt)
+			v.IndexedBy, v.CheckResult, v.CheckedAt, v.CreatedBy, v.MirrorServed, v.Hidden).Scan(&v.ID, &v.CreatedAt)
 		if _, ok := uniqueViolation(err); ok {
 			return conflict("version_exists", "version already exists and is immutable")
 		}
@@ -527,6 +537,10 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 			return err
 		}
 		v.SkillID, v.Mode = k.ID, in.Mode
+		if in.Projection != nil {
+			outSkill, outVer = k, v
+			return nil
+		}
 		if err := tx.QueryRow(ctx, `UPDATE skills SET description = $2, current_version = '', updated_at = now()
 			WHERE id = $1 RETURNING updated_at`, k.ID, v.FrontmatterDescription).Scan(&k.UpdatedAt); err != nil {
 			return err
@@ -549,14 +563,14 @@ func jsonOrNil[T any](v *T) []byte {
 const versionCols = `id, skill_id, version, mode, frontmatter_name, frontmatter_description, license_kind, license_id,
 	license_text, license_approved, core_compatible, files, artifact_digest, artifact_type, artifact_size,
 	COALESCE(archive_digest, ''), source, locator, indexed_by, COALESCE(check_result, ''), checked_at, yanked_at,
-	yank_reason, created_by, created_at, mirror_served, locator_url`
+	yank_reason, created_by, created_at, mirror_served, locator_url, projection_hidden`
 
 // versionSummaryCols is versionCols without the file manifest and the
 // license text, which are what makes a version row large.
 const versionSummaryCols = `id, skill_id, version, mode, frontmatter_name, frontmatter_description, license_kind, license_id,
 	'' AS license_text, license_approved, core_compatible, '[]'::jsonb AS files, artifact_digest, artifact_type, artifact_size,
 	COALESCE(archive_digest, ''), source, locator, indexed_by, COALESCE(check_result, ''), checked_at, yanked_at,
-	yank_reason, created_by, created_at, mirror_served, locator_url`
+	yank_reason, created_by, created_at, mirror_served, locator_url, projection_hidden`
 
 func scanVersion(row pgx.Row) (model.Version, error) {
 	var v model.Version
@@ -565,7 +579,7 @@ func scanVersion(row pgx.Row) (model.Version, error) {
 	err := row.Scan(&v.ID, &v.SkillID, &v.Version, &v.Mode, &v.FrontmatterName, &v.FrontmatterDescription, &v.LicenseKind,
 		&v.LicenseID, &v.LicenseText, &v.LicenseApproved, &v.CoreCompatible, &files, &v.ArtifactDigest, &v.ArtifactType,
 		&v.ArtifactSize, &v.ArchiveDigest, &src, &loc, &v.IndexedBy, &v.CheckResult, &v.CheckedAt, &v.YankedAt,
-		&v.YankReason, &v.CreatedBy, &v.CreatedAt, &v.MirrorServed, &locatorURL)
+		&v.YankReason, &v.CreatedBy, &v.CreatedAt, &v.MirrorServed, &locatorURL, &v.Hidden)
 	if err != nil {
 		return v, err
 	}
@@ -814,7 +828,7 @@ func (s *Store) SetVersionCheck(ctx context.Context, id int64, src model.CheckSo
 const latestOrder = `ORDER BY (v.version = s.current_version) DESC, v.id DESC LIMIT 1`
 
 // latestJoin selects the latest version of each skill.
-const latestJoin = `LEFT JOIN LATERAL (SELECT * FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL ` +
+const latestJoin = `LEFT JOIN LATERAL (SELECT * FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL AND NOT v.projection_hidden ` +
 	latestOrder + `) lv ON true`
 
 // visibleSQL is model.Viewer.CanSee as a SQL condition over the visibility
@@ -892,7 +906,7 @@ func likeEscape(s string) string {
 // IndexCandidates implements store.Store.
 func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly bool) ([]model.IndexCandidate, error) {
 	rows, err := s.pool.Query(ctx, `SELECT s.id, v.version FROM skills s JOIN namespaces n ON n.id = s.namespace_id
-		JOIN LATERAL (SELECT version FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL `+latestOrder+`) v ON true
+		JOIN LATERAL (SELECT version FROM skill_versions v WHERE v.skill_id = s.id AND v.yanked_at IS NULL AND NOT v.projection_hidden `+latestOrder+`) v ON true
 		WHERE s.shown_visibility = 'public' AND s.listed AND s.status = 'active'
 		AND ($1 = '' OR n.name = $1) AND (NOT $2 OR s.global_alias IS NOT NULL)
 		ORDER BY n.name, s.name`, namespace, aliasOnly)
@@ -928,7 +942,7 @@ func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly
 		if err != nil {
 			return nil, err
 		}
-		if sk.ShownVisibility() != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive {
+		if sk.ShownVisibility() != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive || v.Hidden {
 			continue
 		}
 		out = append(out, model.IndexCandidate{Skill: sk, Version: v})
@@ -1038,6 +1052,10 @@ func (s *Store) LockMirror(ctx context.Context, key string) (func(), error) {
 }
 
 // SetVersionMirrorServed implements store.Store.
+func (s *Store) SetVersionMirrorHidden(ctx context.Context, id int64, hidden bool, audit model.AuditEvent) error {
+	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET projection_hidden = $2 WHERE id = $1`, id, hidden)
+}
+
 func (s *Store) SetVersionMirrorServed(ctx context.Context, id int64, served bool, audit model.AuditEvent) error {
 	return s.execVersionAudit(ctx, audit, `UPDATE skill_versions SET mirror_served = $2 WHERE id = $1`, id, served)
 }

@@ -151,3 +151,16 @@ func (m *Memory) NamespaceForGitHubID(_ context.Context, githubID int64) (model.
 	}
 	return model.Namespace{}, model.ErrNotFound
 }
+
+func (m *Memory) SetGatewayProjection(_ context.Context, consumer string, projection bool, audit model.AuditEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.gw().byConsumer[consumer]
+	if !ok {
+		return model.ErrNotFound
+	}
+	g.Projection = projection
+	m.gw().byConsumer[consumer] = g
+	m.appendAudit(audit)
+	return nil
+}

@@ -14,7 +14,8 @@ import (
 )
 
 const mcpServerCols = `m.id, n.name, m.name, m.mode, m.visibility, m.listed, COALESCE(u.name, ''), m.review_state,
-	m.review_reason, m.review_revision, m.created_by, m.created_at, m.updated_at`
+	m.review_reason, m.review_revision, COALESCE(m.managed_by, ''), COALESCE(m.managed_owner, ''), m.managed_revision, m.managed_phase,
+	m.projection_hidden, m.legacy, m.metadata, m.metadata_revision, m.created_by, m.created_at, m.updated_at`
 
 // mcpServerFrom joins what mcpServerCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -26,7 +27,8 @@ const mcpVersionCols = `v.id, v.server_id, v.version, v.server_json, v.digest, v
 
 func mcpServerDest(s *model.MCPServer) []any {
 	return []any{&s.ID, &s.Namespace, &s.Name, &s.Mode, &s.Visibility, &s.Listed, &s.Upstream, &s.ReviewState,
-		&s.ReviewReason, &s.ReviewRevision, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt}
+		&s.ReviewReason, &s.ReviewRevision, &s.Managed.By, &s.Managed.Owner, &s.Managed.Revision, &s.Managed.Phase,
+		&s.Managed.Hidden, &s.Managed.Legacy, &s.Managed.Metadata, &s.Managed.MetadataRevision, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt}
 }
 
 func mcpVersionDest(v *model.MCPVersion) []any {
@@ -112,6 +114,16 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 		if err != nil {
 			return err
 		}
+		if created && in.Projection != nil {
+			if _, err := tx.Exec(ctx, `UPDATE mcp_servers SET managed_by = $2, managed_owner = $3, projection_hidden = true WHERE id = $1`,
+				srv.ID, in.Projection.Consumer, in.Projection.Owner); err != nil {
+				return err
+			}
+			srv.Managed = model.Managed{By: in.Projection.Consumer, Owner: in.Projection.Owner, Hidden: true}
+		}
+		if err := managedWrite(srv.Managed, in.Projection); err != nil {
+			return err
+		}
 		switch {
 		case srv.Name != in.Name:
 			return errServerName()
@@ -125,43 +137,7 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 			return err
 		}
 		srv.ReviewState, srv.ReviewReason, srv.ReviewRevision = review.state, review.reason, review.revision
-		// Under the server lock: the new version takes the flag unless the
-		// current latest is a higher semantic version.
-		var curVersion string
-		err = tx.QueryRow(ctx, `SELECT version FROM mcp_server_versions WHERE server_id = $1 AND is_latest`, srv.ID).Scan(&curVersion)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		latest := err != nil || model.CompareVersions(in.Version.Version, curVersion) >= 0
-		if latest {
-			if err := clearMCPLatest(ctx, tx, srv.ID, 0, nil); err != nil {
-				return err
-			}
-		}
-		// The publication time is taken here, under the server lock, and is
-		// later than that of every version the server has: now() is the
-		// start of the transaction, which may be earlier than the commit of
-		// a publish this one waited for. Whenever "latest" is decided again
-		// (a version is deleted or restored), versions that do not compare
-		// as semantic versions are ordered by this time, and that order has
-		// to be the order in which they were published.
-		publishedAt := in.Version.PublishedAt
-		if publishedAt.IsZero() {
-			if err := tx.QueryRow(ctx, `SELECT GREATEST(clock_timestamp(), (SELECT max(published_at) + interval '1 microsecond'
-				FROM mcp_server_versions WHERE server_id = $1))`, srv.ID).Scan(&publishedAt); err != nil {
-				return err
-			}
-		}
-		title, description := store.MCPSearchText(in.Version.ServerJSON)
-		ver, err = scanMCPVersion(tx.QueryRow(ctx, `INSERT INTO mcp_server_versions AS v (server_id, version, server_json, digest,
-			status_changed_at, published_at, updated_at, is_latest, created_by, title, description)
-			VALUES ($1, $2, $3, $4, $5, $5, $5, $6, $7, $8, $9)
-			RETURNING `+mcpVersionCols,
-			srv.ID, in.Version.Version, string(in.Version.ServerJSON), in.Version.Digest, publishedAt,
-			latest, in.Version.CreatedBy, title, description))
-		if c, ok := uniqueViolation(err); ok && c != "mcp_server_versions_latest_key" {
-			return conflict("version_exists", "version already exists and is immutable")
-		}
+		ver, err = insertMCPVersion(ctx, tx, srv.ID, in.Version)
 		if err != nil {
 			return err
 		}
@@ -406,6 +382,16 @@ func (s *Store) SetMCPStatus(ctx context.Context, serverID int64, version, statu
 			return err
 		}
 		latest, ok := store.LatestMCPVersion(live)
+		var kept int64
+		err = tx.QueryRow(ctx, `SELECT v.id FROM mcp_server_versions v JOIN mcp_servers m ON m.id = v.server_id
+			WHERE v.server_id = $1 AND v.is_latest AND v.status <> 'deleted' AND m.managed_by IS NOT NULL`, serverID).Scan(&kept)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err == nil {
+			latest, ok = kept, true
+		}
+		err = nil
 		if err := clearMCPLatest(ctx, tx, serverID, latest, &at); err != nil {
 			return err
 		}
@@ -521,4 +507,45 @@ func (s *Store) ListMirroredMCP(ctx context.Context, upstreamID int64, afterName
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.MCPServer, error) { return scanMCPServer(row) })
+}
+
+func insertMCPVersion(ctx context.Context, tx pgx.Tx, serverID int64, in model.MCPVersion) (model.MCPVersion, error) {
+	// Under the server lock: the new version takes the flag unless the
+	// current latest is a higher semantic version.
+	var curVersion string
+	err := tx.QueryRow(ctx, `SELECT version FROM mcp_server_versions WHERE server_id = $1 AND is_latest`, serverID).Scan(&curVersion)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return model.MCPVersion{}, err
+	}
+	latest := err != nil || model.CompareVersions(in.Version, curVersion) >= 0
+	if latest {
+		if err := clearMCPLatest(ctx, tx, serverID, 0, nil); err != nil {
+			return model.MCPVersion{}, err
+		}
+	}
+	// The publication time is taken here, under the server lock, and is
+	// later than that of every version the server has: now() is the
+	// start of the transaction, which may be earlier than the commit of
+	// a publish this one waited for. Whenever "latest" is decided again
+	// (a version is deleted or restored), versions that do not compare
+	// as semantic versions are ordered by this time, and that order has
+	// to be the order in which they were published.
+	publishedAt := in.PublishedAt
+	if publishedAt.IsZero() {
+		if err := tx.QueryRow(ctx, `SELECT GREATEST(clock_timestamp(), (SELECT max(published_at) + interval '1 microsecond'
+			FROM mcp_server_versions WHERE server_id = $1))`, serverID).Scan(&publishedAt); err != nil {
+			return model.MCPVersion{}, err
+		}
+	}
+	title, description := store.MCPSearchText(in.ServerJSON)
+	ver, err := scanMCPVersion(tx.QueryRow(ctx, `INSERT INTO mcp_server_versions AS v (server_id, version, server_json, digest,
+		status_changed_at, published_at, updated_at, is_latest, created_by, title, description)
+		VALUES ($1, $2, $3, $4, $5, $5, $5, $6, $7, $8, $9)
+		RETURNING `+mcpVersionCols,
+		serverID, in.Version, string(in.ServerJSON), in.Digest, publishedAt,
+		latest, in.CreatedBy, title, description))
+	if c, ok := uniqueViolation(err); ok && c != "mcp_server_versions_latest_key" {
+		return model.MCPVersion{}, conflict("version_exists", "version already exists and is immutable")
+	}
+	return ver, err
 }

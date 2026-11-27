@@ -25,13 +25,13 @@ func (s *Store) CreateGateway(ctx context.Context, g model.Gateway, audit model.
 }
 
 func (s *Store) ListGateways(ctx context.Context) ([]model.Gateway, []model.GatewayKey, error) {
-	rows, err := s.pool.Query(ctx, `SELECT consumer, token_id, identities, created_at FROM gateways ORDER BY consumer`)
+	rows, err := s.pool.Query(ctx, `SELECT consumer, token_id, identities, projection, created_at FROM gateways ORDER BY consumer`)
 	if err != nil {
 		return nil, nil, err
 	}
 	gs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (model.Gateway, error) {
 		var g model.Gateway
-		err := row.Scan(&g.Consumer, &g.TokenID, &g.Identities, &g.CreatedAt)
+		err := row.Scan(&g.Consumer, &g.TokenID, &g.Identities, &g.Projection, &g.CreatedAt)
 		return g, err
 	})
 	if err != nil {
@@ -51,8 +51,8 @@ func (s *Store) ListGateways(ctx context.Context) ([]model.Gateway, []model.Gate
 
 func (s *Store) GatewayForToken(ctx context.Context, tokenID string) (model.Gateway, error) {
 	var g model.Gateway
-	err := s.pool.QueryRow(ctx, `SELECT consumer, token_id, identities, created_at FROM gateways WHERE token_id = $1`, tokenID).
-		Scan(&g.Consumer, &g.TokenID, &g.Identities, &g.CreatedAt)
+	err := s.pool.QueryRow(ctx, `SELECT consumer, token_id, identities, projection, created_at FROM gateways WHERE token_id = $1`, tokenID).
+		Scan(&g.Consumer, &g.TokenID, &g.Identities, &g.Projection, &g.CreatedAt)
 	return g, notFound(err)
 }
 
@@ -96,4 +96,14 @@ func (s *Store) ClaimAssertion(ctx context.Context, consumer, jti string, expire
 func (s *Store) NamespaceForGitHubID(ctx context.Context, githubID int64) (model.Namespace, error) {
 	ns, err := scanNamespace(s.pool.QueryRow(ctx, `SELECT `+nsCols+` FROM namespaces WHERE github_id = $1 AND upstream_id IS NULL`, githubID))
 	return ns, notFound(err)
+}
+
+func (s *Store) SetGatewayProjection(ctx context.Context, consumer string, projection bool, audit model.AuditEvent) error {
+	return s.inTx(ctx, audit, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE gateways SET projection = $2 WHERE consumer = $1`, consumer, projection)
+		if err == nil && tag.RowsAffected() == 0 {
+			return model.ErrNotFound
+		}
+		return err
+	})
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -135,6 +136,9 @@ func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version
 	if err != nil {
 		return sk, v, err
 	}
+	if v.Hidden && !principal(r).Admin {
+		return model.Skill{}, model.Version{}, errNotFound
+	}
 	if sk, err = s.confirmSkill(r, sk); err != nil {
 		return model.Skill{}, model.Version{}, err
 	}
@@ -159,8 +163,30 @@ func skillJSON(sk model.Skill, latest string) map[string]any {
 	if sk.Claimed {
 		out["claimed"] = true
 	}
+	if sk.Managed.IsManaged() {
+		out["managed"] = true
+		if sk.Managed.DisplayName != "" {
+			out["display_name"] = sk.Managed.DisplayName
+		}
+		if len(sk.Managed.Legacy) > 0 {
+			out["_meta"] = map[string]any{"ai.openlinker/legacy": json.RawMessage(sk.Managed.Legacy)}
+		}
+	}
 	if sk.Upstream != "" {
 		out["upstream"] = sk.Upstream
+	}
+	return out
+}
+
+func visibleVersions(r *http.Request, versions []model.Version) []model.Version {
+	if principal(r).Admin {
+		return versions
+	}
+	out := versions[:0:0]
+	for _, v := range versions {
+		if !v.Hidden {
+			out = append(out, v)
+		}
 	}
 	return out
 }
@@ -288,7 +314,9 @@ func (s *Server) listSkills(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
-		items = append(items, skillJSON(row.Skill, row.LatestVersion))
+		item := skillJSON(row.Skill, row.LatestVersion)
+		delete(item, "_meta")
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"skills": items, "next_cursor": next})
 }
@@ -303,6 +331,7 @@ func (s *Server) getSkill(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		sk, err = s.confirmSkill(r, sk)
 	}
+	versions = visibleVersions(r, versions)
 	if err != nil {
 		s.fail(w, r, err)
 		return

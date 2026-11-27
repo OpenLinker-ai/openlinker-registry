@@ -350,6 +350,58 @@ Through a gateway user assertion with `write` (and a gateway token with
   entries. A write authorized against the old namespace that arrives after a
   claim fails with `409 entry_moved`.
 
+## Projection from OpenLinker Core
+
+A gateway the administrator marks with `{"projection": true}`
+(`PATCH /v1/admin/gateways/{consumer}`) can mirror what an OpenLinker Core
+publishes, one way. Every request carries a user assertion whose `act`
+includes `project` (the owner is the assertion's `sub`) and a gateway token
+with `skills:write`; only public instances accept projections.
+
+| Method and path | Body | Effect |
+|---|---|---|
+| `PUT /v1/projections/skills/{name}/versions/{v}?license=` | Core bundle | Immutable version, created hidden; same bytes again is 200, other bytes 409 |
+| `PUT /v1/projections/skills/{name}` | `{op, revision, phase, owner:{sub}, state, listed, versions, current_version, display, legacy}` | The entry's complete state |
+| `PUT /v1/projections/mcp/{name}` | `{op, revision, phase, owner:{sub}, state, listed, version, server, metadata, metadata_revision, legacy}` | The MCP server's complete state; a new `version` adds an immutable version |
+| `GET /v1/projections/skills/{name}`, `GET /v1/projections/mcp/{name}` | — | The managed entry's projection state (revision, phase, hidden, listed, visible and ingested versions with digests, review state), for its own gateway and owner only; used for reconciliation |
+| `POST /v1/projections/validate` | Core bundle | `{ok, code, message}` without writing |
+| `POST /v1/projections/namespaces/preflight` | `{subjects}` | The namespace each owner would use, or a conflict |
+
+- Entries go to the owner's generated `ai.openlinker.u<first 12 (or 16) hex
+  digits of the owner id>` namespace, or, when the owner had an
+  `ai.openlinker.*` handle before the first projection, to that handle. Once
+  generated, the namespace never changes, also after a later handle claim.
+  Generated names are reserved from self-service.
+- Projected entries are managed: only the same gateway and owner may project
+  them; ordinary writes, settings changes, claims and indexing are
+  `409 managed_by_core`, also for administrators, who can still review,
+  reject, deprecate and yank.
+- A state applies only when its `(revision, phase)` is newer than the last
+  one; `op` replays return the first answer, also when they arrive at once.
+  A state for an entry that does not exist yet records a hidden tombstone
+  with its revision (a visible one then answers `409 version_missing`), so
+  older requests cannot reveal it. An MCP state checks its revision before it
+  writes its version, in the same transaction.
+- `state: hidden`, and versions left out of `versions`, are hidden from
+  everyone but administrators on every read path (stronger than any role or
+  share), reversibly. Projection never changes the review state: new entries
+  start approved, later holds stay.
+- `license=LicenseRef-openlinker-platform-terms` stores an approved custom
+  license, for projected versions only.
+- `legacy` (at most 4 KiB) and an MCP server's `metadata` (at most 64 KiB)
+  with `metadata_revision` appear only in details, under `_meta` keys
+  `ai.openlinker/legacy`, `ai.openlinker/metadata` and
+  `ai.openlinker/metadata_revision`. Display descriptions follow the SKILL.md
+  limit of 2000 characters; `validate` applies the same admission as
+  ingestion.
+- Mirrors hide versions that disappear from their upstream and show them
+  again when they return, also past the version cap. An older version that
+  was hidden upstream when the mirror first synced is backfilled once it
+  returns; the latest version still follows the upstream.
+- `display.name` is shown as `display_name` on projected entries; the path
+  keeps the generated name. Namespace allocation and handle claims for one
+  owner are serialized.
+
 ## Upstreams: forwarding and mirroring
 
 ```json

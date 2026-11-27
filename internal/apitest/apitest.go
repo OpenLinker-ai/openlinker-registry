@@ -232,6 +232,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("gateway assertions", func(t *testing.T) { runGateway(t, newStore) })
 	t.Run("review queue", func(t *testing.T) { runReview(t, newStore) })
 	t.Run("claims", func(t *testing.T) { runClaims(t, newStore) })
+	t.Run("projection", func(t *testing.T) { runProjection(t, newStore) })
+	t.Run("projection reads", func(t *testing.T) { runProjectionReads(t, newStore) })
 }
 
 func runPublic(t *testing.T, e *Env) {

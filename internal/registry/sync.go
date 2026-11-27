@@ -910,6 +910,22 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			break
 		}
 	}
+	{
+		listed := map[string]bool{}
+		for _, ref := range d.Versions {
+			listed[ref.Version] = true
+		}
+		for _, v := range have {
+			if v.Hidden == !listed[v.Version] {
+				continue
+			}
+			if err := s.Store.SetVersionMirrorHidden(ctx, v.ID, !listed[v.Version], auditEvent(actor, "version.mirror_hidden", d.Namespace,
+				d.Name+"@"+v.Version, map[string]any{"hidden": !listed[v.Version]})); err != nil {
+				return err
+			}
+			changed = true
+		}
+	}
 	// What can change about a version after it was published: it is yanked,
 	// a license is approved, and with that the upstream starts serving it.
 	for _, ref := range d.Versions[fresh:] {
@@ -1000,6 +1016,13 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 		if err != nil {
 			break
 		}
+	}
+	if exists && tooMany == nil {
+		updated, backfilled, err := s.backfillSkillVersions(ctx, c, u, local, d, visibility, stats)
+		if err != nil {
+			return err
+		}
+		local, changed = updated, changed || backfilled
 	}
 	if created {
 		// A skill created just now took its visibility and listing from the
@@ -1537,4 +1560,42 @@ func sameManifest(a, b []skill.ManifestEntry) bool {
 		}
 	}
 	return true
+}
+
+func (s *Service) backfillSkillVersions(ctx context.Context, c *upstream.Client, u model.Upstream, local model.Skill, d upstream.SkillDetail,
+	visibility string, stats syncStats) (model.Skill, bool, error) {
+	versions, err := s.Store.ListVersionSummaries(ctx, local.ID)
+	if err != nil || len(versions) == 0 {
+		return local, false, err
+	}
+	have := map[string]bool{}
+	for _, v := range versions {
+		have[v.Version] = true
+	}
+	newest, changed := versions[0].Version, false
+	for i := len(d.Versions) - 1; i >= 0; i-- {
+		ref := d.Versions[i]
+		if have[ref.Version] || ref.Yanked || !skill.ValidVersion(ref.Version) {
+			continue
+		}
+		sv, err := c.GetSkillVersion(ctx, d.Namespace, d.Name, ref.Version)
+		var ue *upstream.Error
+		if errors.Is(err, upstream.ErrNotFound) || errors.As(err, &ue) {
+			stats.add("skills_incomplete")
+			continue
+		}
+		if err != nil {
+			return local, changed, err
+		}
+		sk, err := s.mirrorSkillVersion(ctx, u, sv, visibility, d.Listed, newest)
+		if err != nil {
+			if isStoreFailure(err) {
+				return local, changed, err
+			}
+			stats.add("skills_incomplete")
+			continue
+		}
+		local, newest, changed = sk, sv.Version, true
+	}
+	return local, changed, nil
 }
