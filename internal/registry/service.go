@@ -26,9 +26,10 @@ import (
 
 // Error is a use-case failure mapped to an HTTP status by the API layer.
 type Error struct {
-	Status int
-	Code   string
-	Msg    string
+	Location string
+	Status   int
+	Code     string
+	Msg      string
 	// SourceURL is set when content is withheld but a source link exists.
 	SourceURL string
 	// RetryAfter is the number of seconds a rate-limited caller should wait.
@@ -98,6 +99,9 @@ type Config struct {
 	// UpstreamToken returns the bearer token for an upstream by name ("" for
 	// none). Tokens come from the environment and are never stored.
 	UpstreamToken func(name string) string
+
+	Review          bool
+	ReportThreshold int
 }
 
 // Service implements the use cases.
@@ -327,7 +331,7 @@ func (s *Service) publishHosted(ctx context.Context, o PublishOptions, files []s
 		listed = *o.Listed
 	}
 	return s.Store.PublishVersion(ctx, model.PublishInput{Namespace: o.Namespace, Name: o.Name, Mode: skill.ModeHosted,
-		Visibility: o.Visibility, Listed: listed, Version: v},
+		Visibility: o.Visibility, Listed: listed, Version: v, Review: s.reviewRule(ctx, false)},
 		auditEvent(o.Actor, "skill.publish", o.Namespace, o.Name+"@"+o.Version,
 			map[string]any{"digest": v.ArtifactDigest, "artifact_type": v.ArtifactType, "source": src.Kind}))
 }
@@ -593,14 +597,14 @@ func (s *Service) IndexGitHub(ctx context.Context, actor, namespace string, req 
 	v := b.version
 	v.Version = o.Version
 	v.Locator = &model.Locator{Kind: "github", Owner: r.Owner, Repo: r.Repo, Commit: snap.Commit, Path: r.Dir,
-		TreeSHA: snap.TreeSHA, SingleFile: r.SingleFile}
+		TreeSHA: snap.TreeSHA, SingleFile: r.SingleFile, RepoID: s.githubRepoID(ctx, r.Owner, r.Repo)}
 	v.IndexedBy, v.CreatedBy, v.CheckResult, v.CheckedAt = actor, actor, model.CheckOK, &now
 	listed := true
 	if o.Listed != nil {
 		listed = *o.Listed
 	}
 	return s.Store.PublishVersion(ctx, model.PublishInput{Namespace: namespace, Name: o.Name, Mode: skill.ModeIndexed,
-		SourceKey: r.SourceKey(), Visibility: o.Visibility, Listed: listed, Version: v},
+		SourceKey: r.SourceKey(), Visibility: o.Visibility, Listed: listed, Version: v, Review: s.reviewRule(ctx, true)},
 		auditEvent(actor, "skill.index", namespace, o.Name+"@"+o.Version,
 			map[string]any{"digest": v.ArtifactDigest, "commit": snap.Commit, "tree_sha": snap.TreeSHA, "source_key": r.SourceKey()}))
 }

@@ -90,7 +90,10 @@ type Options struct {
 	RealPublicURL bool
 	// VerifyInterval overrides how long verified indexed content is served
 	// from the cache (default one hour; negative means verify every read).
-	VerifyInterval time.Duration
+	VerifyInterval  time.Duration
+	Review          bool
+	ReportThreshold int
+	WritePerMinute  int
 }
 
 // NewEnv starts a registry over st.
@@ -129,11 +132,12 @@ func NewEnv(t *testing.T, st store.Store, o Options) *Env {
 	}
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := registry.New(st, blobs, gh, registry.Config{Mode: o.Mode, AllowPublic: true, PublicURL: PublicURL, VerifyInterval: verify,
-		UpstreamPolicy: policy, UpstreamToken: func(name string) string { return o.UpstreamTokens[name] }})
+		UpstreamPolicy: policy, UpstreamToken: func(name string) string { return o.UpstreamTokens[name] },
+		Review: o.Review, ReportThreshold: o.ReportThreshold})
 	svc.Log = quiet
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, AdminToken), BasePath: "/registry",
 		AllowAnonRead: o.AllowAnonRead, MaxUploadBytes: 4 << 20, Log: quiet, UI: o.UI,
-		ForwardLimit: ratelimit.New(o.ForwardPerMinute), ReadLimit: ratelimit.New(o.ReadPerMinute),
+		ForwardLimit: ratelimit.New(o.ForwardPerMinute), ReadLimit: ratelimit.New(o.ReadPerMinute), WriteLimit: ratelimit.New(o.WritePerMinute),
 		AuthFailLimit: ratelimit.New(o.AuthFailuresPerMinute)}
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(hs.Close)
@@ -226,6 +230,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("built-in pages", func(t *testing.T) { runUI(t, newStore) })
 	t.Run("hardening", func(t *testing.T) { runHardening(t, newStore) })
 	t.Run("gateway assertions", func(t *testing.T) { runGateway(t, newStore) })
+	t.Run("review queue", func(t *testing.T) { runReview(t, newStore) })
+	t.Run("claims", func(t *testing.T) { runClaims(t, newStore) })
 }
 
 func runPublic(t *testing.T, e *Env) {

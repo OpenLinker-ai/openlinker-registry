@@ -318,6 +318,11 @@ func (m *Memory) upstreamCurrent(upstreamID, configVersion int64) error {
 
 // guard enforces model.WithUpstreamGuard; the caller holds the lock.
 func (m *Memory) guard(ctx context.Context) error {
+	if skillID, ns, ok := model.SkillGuardFrom(ctx); ok {
+		if s, found := m.skills[skillID]; !found || s.Namespace != ns {
+			return model.ErrEntryMoved()
+		}
+	}
 	id, version, ok := model.UpstreamGuardFrom(ctx)
 	if !ok {
 		return nil

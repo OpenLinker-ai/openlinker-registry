@@ -66,6 +66,7 @@ func (s *Service) PublishMCP(ctx context.Context, o MCPPublishOptions, body []by
 	}
 	return s.Store.PublishMCPVersion(ctx, model.MCPPublishInput{
 		Namespace: o.Namespace, Name: p.Name, Mode: mode, Visibility: visibility, Listed: listed,
+		Review:  s.reviewRule(ctx, o.Indexed),
 		Version: model.MCPVersion{Version: p.Version, ServerJSON: p.Canonical, Digest: p.Digest, CreatedBy: o.Actor},
 	}, auditEvent(o.Actor, action, o.Namespace, p.Name+"@"+p.Version, map[string]any{"digest": p.Digest}))
 }

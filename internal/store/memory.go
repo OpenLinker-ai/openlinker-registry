@@ -26,6 +26,7 @@ type Memory struct {
 	mcp       map[int64]model.MCPServer
 	mcpVers   map[int64]model.MCPVersion
 	gateways  *gatewayState
+	review    *reviewState
 }
 
 // NewMemory returns an empty in-memory store.
@@ -273,6 +274,9 @@ func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audi
 				}
 			}
 		}
+		if _, reserved := m.rv().redirects[in.Namespace+"/"+in.Name]; reserved {
+			return model.Skill{}, model.Version{}, conflict("name_reserved", "this name belonged to an entry that moved; it cannot be reused")
+		}
 		if in.Mode == "hosted" && in.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
 			return model.Skill{}, model.Version{}, &model.PolicyError{Code: model.CodeLicenseRequired, Msg: model.MsgLicenseRequired}
 		}
@@ -295,6 +299,14 @@ func (m *Memory) PublishVersion(ctx context.Context, in model.PublishInput, audi
 		m.createUpstreamNS(ns)
 		m.appendAudit(model.AuditEvent{Actor: audit.Actor, Action: "namespace.mirror", Namespace: in.Namespace,
 			Details: map[string]any{"upstream_id": in.UpstreamID}})
+	}
+	if ok {
+		s.ReviewState = in.Review.Next(s.ReviewState)
+	} else {
+		s.ReviewState = in.Review.Initial(ns.ReviewTrusted)
+	}
+	if s.ReviewState != model.ReviewApproved {
+		s.ReviewReason = ""
 	}
 	v := in.Version
 	v.ID, v.SkillID, v.CreatedAt, v.Mode = m.id(), s.ID, now, in.Mode
@@ -525,7 +537,7 @@ func (m *Memory) Search(_ context.Context, q model.SearchQuery) ([]model.SkillSu
 	needle := strings.ToLower(q.Q)
 	var out []model.SkillSummary
 	for _, s := range m.skills {
-		if !s.Listed || s.Status == model.StatusYanked || !q.Viewer.CanSee(s.Namespace, s.Visibility) {
+		if !s.Listed || s.Status == model.StatusYanked || !q.Viewer.CanSee(s.Namespace, s.ShownVisibility()) {
 			continue
 		}
 		if q.Namespace != "" && s.Namespace != q.Namespace || q.Mode != "" && s.Mode != q.Mode {
@@ -562,7 +574,7 @@ func (m *Memory) IndexCandidates(_ context.Context, namespace string, aliasOnly 
 	defer m.mu.Unlock()
 	var out []model.IndexCandidate
 	for _, s := range m.skills {
-		if s.Visibility != model.VisibilityPublic || !s.Listed || s.Status != model.StatusActive {
+		if s.ShownVisibility() != model.VisibilityPublic || !s.Listed || s.Status != model.StatusActive {
 			continue
 		}
 		if namespace != "" && s.Namespace != namespace || aliasOnly && s.GlobalAlias == "" {

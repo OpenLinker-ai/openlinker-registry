@@ -26,3 +26,23 @@ func UpstreamGuardFrom(ctx context.Context) (upstreamID, configVersion int64, ok
 	g, ok := ctx.Value(upstreamGuardKey{}).(upstreamGuard)
 	return g.id, g.version, ok
 }
+
+type entryGuardKey struct{}
+
+type entryGuard struct {
+	skillID   int64
+	namespace string
+}
+
+func WithSkillGuard(ctx context.Context, skillID int64, namespace string) context.Context {
+	return context.WithValue(ctx, entryGuardKey{}, entryGuard{skillID, namespace})
+}
+
+func SkillGuardFrom(ctx context.Context) (skillID int64, namespace string, ok bool) {
+	g, ok := ctx.Value(entryGuardKey{}).(entryGuard)
+	return g.skillID, g.namespace, ok
+}
+
+func ErrEntryMoved() error {
+	return &ConflictError{Code: "entry_moved", Msg: "the entry moved to another namespace; reload it"}
+}

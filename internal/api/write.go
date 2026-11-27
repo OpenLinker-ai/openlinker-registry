@@ -42,15 +42,18 @@ func requireRole(r *http.Request, namespace string, min model.Role) error {
 
 // loadForWrite authorizes then loads the skill. Authorization happens first
 // so callers without a role learn nothing about private skills.
-func (s *Server) loadForWrite(r *http.Request, min model.Role) (model.Skill, error) {
+func (s *Server) loadForWrite(r *http.Request, min model.Role) (model.Skill, *http.Request, error) {
 	if err := requireRole(r, r.PathValue("ns"), min); err != nil {
-		return model.Skill{}, err
+		return model.Skill{}, r, err
 	}
 	sk, err := s.Svc.Store.GetSkill(r.Context(), r.PathValue("ns"), r.PathValue("name"))
 	if errors.Is(err, model.ErrNotFound) {
-		return sk, errNotFound
+		return sk, r, errNotFound
 	}
-	return sk, err
+	if err != nil {
+		return sk, r, err
+	}
+	return sk, r.WithContext(model.WithSkillGuard(r.Context(), sk.ID, sk.Namespace)), nil
 }
 
 func uploadFormat(contentType string) string {
@@ -193,7 +196,7 @@ func readReason(w http.ResponseWriter, r *http.Request) (string, error) {
 
 func (s *Server) setStatus(status string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		sk, err := s.loadForWrite(r, model.RolePublisher)
+		sk, r, err := s.loadForWrite(r, model.RolePublisher)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -213,7 +216,7 @@ func (s *Server) setStatus(status string) http.HandlerFunc {
 }
 
 func (s *Server) yankVersion(w http.ResponseWriter, r *http.Request) {
-	sk, err := s.loadForWrite(r, model.RolePublisher)
+	sk, r, err := s.loadForWrite(r, model.RolePublisher)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -246,7 +249,7 @@ type patchRequest struct {
 }
 
 func (s *Server) patchSkill(w http.ResponseWriter, r *http.Request) {
-	sk, err := s.loadForWrite(r, model.RoleOwner)
+	sk, r, err := s.loadForWrite(r, model.RoleOwner)
 	if err != nil {
 		s.fail(w, r, err)
 		return

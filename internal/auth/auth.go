@@ -122,6 +122,21 @@ func (p Principal) Viewer() model.Viewer {
 		v.Namespaces = append(v.Namespaces, ns)
 	}
 	slices.Sort(v.Namespaces)
+	members := map[string]bool{}
+	if p.Gateway == nil {
+		for ns := range p.Roles {
+			members[ns] = true
+		}
+	}
+	if p.User != nil {
+		for ns := range p.User.Roles {
+			members[ns] = true
+		}
+	}
+	for ns := range members {
+		v.Members = append(v.Members, ns)
+	}
+	slices.Sort(v.Members)
 	return v
 }
 

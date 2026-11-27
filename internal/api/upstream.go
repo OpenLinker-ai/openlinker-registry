@@ -49,6 +49,9 @@ func (s *Server) limit(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if principal(r).Admin {
+			r = r.WithContext(registry.WithAdmin(r.Context()))
+		}
 		l := s.WriteLimit
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
 			l = s.ReadLimit

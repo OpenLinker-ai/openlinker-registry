@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -34,7 +35,16 @@ func (s *Server) loadVisible(r *http.Request) (model.Skill, error) {
 	if err != nil && !missing {
 		return model.Skill{}, err
 	}
-	visible := !missing && viewer.CanSee(sk.Namespace, sk.Visibility)
+	visible := !missing && viewer.CanSee(sk.Namespace, sk.ShownVisibility())
+	if missing {
+		moved, rerr := s.Svc.Store.SkillRedirect(r.Context(), ns, name)
+		if rerr == nil && viewer.CanSee(moved.Namespace, moved.ShownVisibility()) {
+			return model.Skill{}, s.movedTo(r, ns, name, moved)
+		}
+		if rerr != nil && !errors.Is(rerr, model.ErrNotFound) {
+			return model.Skill{}, rerr
+		}
+	}
 	if !visible && s.Svc.CanForwardSkill(r.Context(), viewer, ns) {
 		if err := s.chargeForward(r); err != nil {
 			return model.Skill{}, err
@@ -47,13 +57,23 @@ func (s *Server) loadVisible(r *http.Request) (model.Skill, error) {
 			if err != nil {
 				return model.Skill{}, err
 			}
-			visible = viewer.CanSee(sk.Namespace, sk.Visibility)
+			visible = viewer.CanSee(sk.Namespace, sk.ShownVisibility())
 		}
 	}
 	if !visible {
 		return model.Skill{}, errNotFound
 	}
 	return sk, nil
+}
+
+func (s *Server) movedTo(r *http.Request, ns, name string, moved model.Skill) error {
+	prefix := "/v1/skills/" + url.PathEscape(ns) + "/" + url.PathEscape(name)
+	rest := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
+	loc := s.BasePath + "/v1/skills/" + url.PathEscape(moved.Namespace) + "/" + url.PathEscape(moved.Name) + rest
+	if r.URL.RawQuery != "" {
+		loc += "?" + r.URL.RawQuery
+	}
+	return &registry.Error{Status: http.StatusPermanentRedirect, Code: "moved", Msg: "this entry moved to " + moved.Namespace + "/" + moved.Name, Location: loc}
 }
 
 // confirmSkill re-reads a skill after its versions were loaded. A skill's
@@ -69,7 +89,7 @@ func (s *Server) confirmSkill(r *http.Request, sk model.Skill) (model.Skill, err
 	if err != nil {
 		return model.Skill{}, err
 	}
-	if now.ID != sk.ID || !principal(r).Viewer().CanSee(now.Namespace, now.Visibility) {
+	if now.ID != sk.ID || !principal(r).Viewer().CanSee(now.Namespace, now.ShownVisibility()) {
 		return model.Skill{}, errNotFound
 	}
 	return now, nil
@@ -96,7 +116,7 @@ func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version
 			// The refresh applies what the upstream says now, which may be
 			// that the caller can no longer see the skill at all.
 			if sk, err = s.Svc.Store.GetSkill(r.Context(), sk.Namespace, sk.Name); errors.Is(err, model.ErrNotFound) ||
-				(err == nil && !principal(r).Viewer().CanSee(sk.Namespace, sk.Visibility)) {
+				(err == nil && !principal(r).Viewer().CanSee(sk.Namespace, sk.ShownVisibility())) {
 				return model.Skill{}, model.Version{}, errNotFound
 			}
 			if err != nil {
@@ -119,7 +139,7 @@ func (s *Server) loadVisibleVersion(r *http.Request) (model.Skill, model.Version
 
 func skillJSON(sk model.Skill, latest string) map[string]any {
 	out := map[string]any{
-		"namespace": sk.Namespace, "name": sk.Name, "description": sk.Description, "visibility": sk.Visibility,
+		"namespace": sk.Namespace, "name": sk.Name, "description": sk.Description, "visibility": model.PresentedVisibility(sk.ShownVisibility()),
 		"listed": sk.Listed, "status": sk.Status, "mode": sk.Mode, "latest_version": nullable(latest),
 		"created_at": sk.CreatedAt, "updated_at": sk.UpdatedAt,
 	}
@@ -129,10 +149,23 @@ func skillJSON(sk model.Skill, latest string) map[string]any {
 	if sk.GlobalAlias != "" {
 		out["global_alias"] = sk.GlobalAlias
 	}
+	if review := reviewJSON(sk.ReviewState, sk.ReviewReason, sk.Visibility); review != nil {
+		out["review"] = review
+	}
+	if sk.Claimed {
+		out["claimed"] = true
+	}
 	if sk.Upstream != "" {
 		out["upstream"] = sk.Upstream
 	}
 	return out
+}
+
+func reviewJSON(state, reason, visibility string) map[string]any {
+	if state == "" || state == model.ReviewApproved {
+		return nil
+	}
+	return map[string]any{"state": state, "reason": reason, "visibility": visibility}
 }
 
 func nullable(s string) any {
@@ -157,6 +190,9 @@ func (s *Server) versionJSON(sk model.Skill, v model.Version) map[string]any {
 	}
 	if acc.Artifact {
 		out["artifact"].(map[string]any)["url"] = s.Svc.VersionURL(sk.Namespace, sk.Name, v.Version, "artifact")
+	}
+	if review := reviewJSON(sk.ReviewState, sk.ReviewReason, sk.Visibility); review != nil {
+		out["review"] = review
 	}
 	if v.ArchiveDigest != "" {
 		a := map[string]any{"digest": v.ArchiveDigest}
@@ -324,7 +360,7 @@ func safeFilename(s string) string {
 
 func (s *Server) writeBlob(w http.ResponseWriter, r *http.Request, sk model.Skill, data []byte, contentType, disposition, digest string) {
 	h := w.Header()
-	s.setCache(w, r, sk.Visibility == model.VisibilityPublic)
+	s.setCache(w, r, sk.ShownVisibility() == model.VisibilityPublic)
 	h.Set("Content-Type", contentType)
 	h.Set("Content-Disposition", disposition)
 	h.Set("Content-Length", strconv.Itoa(len(data)))

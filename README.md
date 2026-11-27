@@ -128,6 +128,8 @@ Secrets are read from the environment only.
 | `REGISTRY_RATE_LIMIT_AUTH_FAILURES` | `-rate-limit-auth-failures` | 30 | Failed authentications per client address per minute. An address over the limit is refused without a token lookup until its failures age out, requests with a valid token included |
 | `REGISTRY_TRUSTED_PROXIES` | `-trusted-proxies` | empty | Reverse proxies whose `X-Forwarded-For` identifies the client |
 | `REGISTRY_ASSERTION_AUDIENCE` | `-assertion-audience` | the public URL | The `aud` that gateway user assertions must carry |
+| `REGISTRY_REVIEW` | `-review` | `true` if public, else `false` | Hold new namespaces' first entries and every indexed entry for review |
+| `REGISTRY_REPORT_THRESHOLD` | `-report-threshold` | 3 | Distinct open reports that send an approved entry back to review |
 
 ## Releases
 
@@ -286,6 +288,62 @@ What the caller may see and do:
   apply; the response is `private, no-store`.
 - **Signed queries** must not repeat a parameter; a malformed or repeated
   query is refused.
+
+## Review, reports and claims
+
+With `REGISTRY_REVIEW` on (the default in public mode):
+
+- A new entry waits for review (`pending`) when its namespace is not yet
+  trusted. Every **indexed** entry waits, and so does each new version of it,
+  because its content comes from someone else's source. New versions of an
+  approved registered or hosted entry stay approved. Administrators' own
+  writes and mirrors are not reviewed.
+- An entry that is `pending` or `rejected` is readable only by administrators
+  and by members of its namespace: holders of a role through their own token,
+  or asserted users with a role. A role granted to a **gateway token** (a share)
+  does not count, so neither the gateway nor any of its users sees it. This
+  holds on every read path, `purpose=import`, discovery indexes, `/v0` and
+  `/v0.1` included. Responses present such an entry's `visibility` as
+  `private` and add `review: {state, reason, visibility}` with the requested
+  visibility; a downstream mirror therefore never copies it, and withdraws an
+  approved entry that goes back to review.
+- `GET /v1/admin/review?state=pending&kind=` lists the queue;
+  `POST /v1/admin/review/skills/{ns}/{name}` or `…/mcp/servers/{ns}/{name}`
+  with `{"decision":"approve"|"reject","reason","trust_namespace"}` decides.
+  A trusted namespace publishes its next entries directly;
+  `PATCH /v1/admin/namespaces/{ns}` `{"review_trusted":false}` revokes that.
+  A rejected entry goes back to `pending` when a new version is published.
+- `POST /v1/reports` `{"kind":"skill"|"mcp","namespace","name","version","category","details"}`
+  (categories `malware`, `credential`, `license`, `spam`, `impersonation`,
+  `other`) needs a token or a gateway user assertion and an entry the caller
+  can see. One open report per reporter and entry. When the distinct open
+  reporters of an approved entry reach `REGISTRY_REPORT_THRESHOLD`, it goes
+  back to review; a report by an administrator does so at once. Reports are
+  kept per entry and survive a claim. `GET /v1/admin/reports?state=open`,
+  `POST /v1/admin/reports/{id}/resolve` `{"resolution":"dismissed"|"actioned"}`.
+
+Through a gateway user assertion with `write` (and a gateway token with
+`skills:write`):
+
+- `POST /v1/namespaces` `{"name"}` creates `ai.openlinker.<handle>` (public
+  instance, gateways allowed `openlinker`; 3–39 of `a-z 0-9 -`, reserved names
+  refused; one per user, never renamed) owned by the user, or
+  `io.github.<login>` (gateways allowed `github`; the registry looks the
+  asserted numeric id up on GitHub, and the login must match and be a personal
+  account). Repeating it for one's own namespace returns it (200).
+- `POST /v1/skills/{ns}/{name}/claim` `{"name"?}` moves an entry indexed from
+  GitHub into the `io.github.<login>` namespace of the repository's owner,
+  checked by the **numeric repository id** recorded when the entry was
+  indexed (entries indexed before that was recorded cannot be claimed), and by
+  the owner being the asserted personal account. Organization repositories
+  cannot be claimed this way. The entry keeps its versions, digests, review
+  state and reports and is marked `claimed`; the indexer loses write access.
+  The old coordinates answer `308` to the new ones for reads and are reserved
+  for good: no publish can take them again. When the name is taken in the
+  author's namespace the claim is `409 claim_name_taken` (pass another
+  `name`); entries are never merged, because versions never move between
+  entries. A write authorized against the old namespace that arrives after a
+  claim fails with `409 entry_moved`.
 
 ## Upstreams: forwarding and mirroring
 
@@ -470,10 +528,10 @@ cookie, so downloads offered by the pages are served under `/ui/` as well. The p
 
 ## Not included
 
-Writes by OpenLinker Core on behalf of its users (gateway assertions can
-carry `write`, but OpenLinker Core does not send them yet), GitHub OAuth login and namespace self-service, GitHub Actions OIDC,
-enterprise OIDC single sign-on, DNS/HTTP namespace verification, claims and
-shares, review queues and abuse reports, offline bundles, publisher
+GitHub OAuth login on the registry itself, organization namespaces through a
+gateway, GitHub Actions OIDC, enterprise OIDC single sign-on, DNS/HTTP
+namespace verification (and so claims of MCP remotes by domain), merging a
+claimed entry into an existing one, entry-level shares, offline bundles, publisher
 signatures, S3 storage (the interface exists; blobs are on local disk, so one
 process owns a storage directory), rate limits shared between replicas,
 indexing a single arbitrary URL by hand (discovery indexes are synced as

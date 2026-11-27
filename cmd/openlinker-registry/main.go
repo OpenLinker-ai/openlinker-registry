@@ -116,7 +116,8 @@ func run(args []string, log *slog.Logger, stdout io.Writer) error {
 	}
 	svc := registry.New(st, blobs, gh, registry.Config{Mode: cfg.Mode, AllowPublic: cfg.AllowPublic, Limits: cfg.Limits,
 		PublicURL: cfg.PublicURL, VerifyInterval: cfg.VerifyInterval, UpstreamToken: cfg.UpstreamToken,
-		UpstreamPolicy: safehttp.Policy{AllowHTTP: cfg.UpstreamAllowHTTP, AllowCIDRs: cfg.UpstreamAllowCIDRs, Timeout: cfg.UpstreamTimeout}})
+		UpstreamPolicy: safehttp.Policy{AllowHTTP: cfg.UpstreamAllowHTTP, AllowCIDRs: cfg.UpstreamAllowCIDRs, Timeout: cfg.UpstreamTimeout},
+		Review:         cfg.Review, ReportThreshold: cfg.ReportThreshold})
 	svc.Log = log
 	srv := &api.Server{Svc: svc, Auth: auth.NewAuthenticator(st, cfg.AdminToken), BasePath: cfg.BasePath,
 		AllowAnonRead: cfg.AllowAnonRead, MaxUploadBytes: cfg.MaxUploadBytes, Log: log,
@@ -174,7 +175,7 @@ func run(args []string, log *slog.Logger, stdout io.Writer) error {
 	}
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", cfg.Listen, "base_path", cfg.BasePath, "mode", cfg.Mode, "ui", cfg.UI,
+		log.Info("listening", "addr", cfg.Listen, "base_path", cfg.BasePath, "mode", cfg.Mode, "ui", cfg.UI, "review", cfg.Review,
 			"version", version, "commit", buildCommit())
 		errc <- hs.ListenAndServe()
 	}()

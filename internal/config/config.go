@@ -52,6 +52,9 @@ type Config struct {
 	// off for public ones, whose pages are served by the site in front).
 	UI bool
 
+	Review          bool
+	ReportThreshold int
+
 	// Upstream access (forwarding and mirroring).
 	UpstreamAllowHTTP  bool
 	UpstreamAllowCIDRs []netip.Prefix
@@ -118,6 +121,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	gcGrace := fs.String("artifact-gc-grace", env("ARTIFACT_GC_GRACE", "24h"), "minimum age of unreferenced artifacts before deletion")
 	cacheBytes := fs.String("cache-max-bytes", env("CACHE_MAX_BYTES", strconv.Itoa(1<<30)), "cache capacity in bytes")
 	ui := fs.String("ui", env("UI", ""), "serve the built-in web pages (default: true in private mode, false in public mode)")
+	review := fs.String("review", env("REVIEW", ""), "hold new namespaces' first entries and every indexed entry for admin review (default: true in public mode)")
+	reportThreshold := fs.String("report-threshold", env("REPORT_THRESHOLD", "3"), "distinct open reports that send an approved entry back to review (1-1000)")
 	upHTTP := fs.String("upstream-allow-http", env("UPSTREAM_ALLOW_HTTP", "false"), "allow http:// upstream URLs")
 	upCIDRs := fs.String("upstream-allow-cidrs", env("UPSTREAM_ALLOW_CIDRS", ""), "comma-separated private networks upstreams may live in")
 	upTimeout := fs.String("upstream-timeout", env("UPSTREAM_TIMEOUT", "30s"), "timeout for each upstream request")
@@ -178,6 +183,14 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	}
 	c.ArtifactGCGrace = parseDur("artifact-gc-grace", *gcGrace)
 	c.UI = parseBool("ui", *ui, c.Mode == "private")
+	c.Review = parseBool("review", *review, c.Mode == "public")
+	if n, perr := strconv.Atoi(*reportThreshold); perr != nil || n < 1 || n > 1000 {
+		if err == nil {
+			err = errors.New("report-threshold: must be an integer between 1 and 1000")
+		}
+	} else {
+		c.ReportThreshold = n
+	}
 	c.UpstreamAllowHTTP = parseBool("upstream-allow-http", *upHTTP, false)
 	c.BackgroundSync = parseBool("background-sync", *bgSync, true)
 	c.UpstreamTimeout = parseDur("upstream-timeout", *upTimeout)

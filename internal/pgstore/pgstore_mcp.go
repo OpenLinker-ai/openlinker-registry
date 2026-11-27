@@ -13,8 +13,8 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
 )
 
-const mcpServerCols = `m.id, n.name, m.name, m.mode, m.visibility, m.listed, COALESCE(u.name, ''), m.created_by,
-	m.created_at, m.updated_at`
+const mcpServerCols = `m.id, n.name, m.name, m.mode, m.visibility, m.listed, COALESCE(u.name, ''), m.review_state,
+	m.review_reason, m.created_by, m.created_at, m.updated_at`
 
 // mcpServerFrom joins what mcpServerCols reads: the namespace and, for an
 // upstream-managed namespace, its upstream.
@@ -25,8 +25,8 @@ const mcpVersionCols = `v.id, v.server_id, v.version, v.server_json, v.digest, v
 	v.status_changed_at, v.published_at, v.updated_at, v.is_latest, v.created_by`
 
 func mcpServerDest(s *model.MCPServer) []any {
-	return []any{&s.ID, &s.Namespace, &s.Name, &s.Mode, &s.Visibility, &s.Listed, &s.Upstream, &s.CreatedBy,
-		&s.CreatedAt, &s.UpdatedAt}
+	return []any{&s.ID, &s.Namespace, &s.Name, &s.Mode, &s.Visibility, &s.Listed, &s.Upstream, &s.ReviewState,
+		&s.ReviewReason, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt}
 }
 
 func mcpVersionDest(v *model.MCPVersion) []any {
@@ -105,8 +105,9 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 			return model.ErrNamespaceManaged()
 		}
 		var srvNS int64
+		var created bool
 		var err error
-		srv, srvNS, _, err = lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
+		srv, srvNS, created, err = lockMCPServer(ctx, tx, model.MCPServer{Name: in.Name, Mode: in.Mode, Visibility: in.Visibility,
 			Listed: in.Listed, CreatedBy: in.Version.CreatedBy}, nsID)
 		if err != nil {
 			return err
@@ -118,6 +119,9 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 			return conflict("mode_mismatch", "server exists with a different mode")
 		case srvNS != nsID:
 			return errServerName()
+		}
+		if srv.ReviewState, err = nextReview(ctx, tx, "mcp_servers", srv.ID, nsID, created, srv.ReviewState, in.Review); err != nil {
+			return err
 		}
 		// Under the server lock: the new version takes the flag unless the
 		// current latest is a higher semantic version.
@@ -438,7 +442,7 @@ func (s *Store) SearchMCP(ctx context.Context, q model.MCPQuery) ([]model.MCPEnt
 	where := []string{"m.listed"}
 	args := []any{}
 	arg := func(v any) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
-	if vis := visibleSQL("m.visibility", q.Viewer, arg); vis != "" {
+	if vis := visibleSQL("m.shown_visibility", q.Viewer, arg); vis != "" {
 		where = append(where, vis)
 	}
 	if q.Search != "" {

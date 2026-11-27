@@ -166,6 +166,7 @@ func (s *Server) routes(m *http.ServeMux) {
 	s.mcpRoutes(m)
 	s.adminRoutes(m)
 	s.gatewayRoutes(m)
+	s.reviewRoutes(m)
 	if s.UI {
 		s.uiRoutes(m)
 	}
@@ -350,6 +351,10 @@ func writeError(w http.ResponseWriter, e *registry.Error) {
 	}
 	if e.RetryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
+	}
+	if e.Location != "" {
+		w.Header().Set("Location", e.Location)
+		body["location"] = e.Location
 	}
 	writeJSON(w, e.Status, map[string]any{"error": body})
 }
