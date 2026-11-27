@@ -24,7 +24,8 @@ The registry has its own version numbers; see [RELEASE.md](./RELEASE.md).
   was reviewed, optionally trusting the namespace), `PATCH /v1/admin/namespaces/{ns}`.
 - Reports: `POST /v1/reports` for signed-in callers; distinct open reports
   reaching `REGISTRY_REPORT_THRESHOLD` (default 3) send an approved entry back
-  to review. `GET /v1/admin/reports`, `POST /v1/admin/reports/{id}/resolve`.
+  to review (only while review is on; otherwise reports are only recorded).
+  `GET /v1/admin/reports`, `POST /v1/admin/reports/{id}/resolve`.
 - Namespace self-service through a gateway: `POST /v1/namespaces` for
   `ai.openlinker.<handle>` (one per user, public instance) and
   `io.github.<login>` (login looked up by the asserted numeric GitHub id;

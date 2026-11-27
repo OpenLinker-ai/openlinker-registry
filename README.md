@@ -322,7 +322,8 @@ With `REGISTRY_REVIEW` on (the default in public mode):
   `other`) needs a token or a gateway user assertion and an entry the caller
   can see. One open report per reporter and entry. When the distinct open
   reporters of an approved entry reach `REGISTRY_REPORT_THRESHOLD`, it goes
-  back to review; a report by an administrator does so at once. Reports are
+  back to review; a report by an administrator does so at once. With review
+  off, reports are only recorded for administrators and never hide an entry. Reports are
   kept per entry and survive a claim. `GET /v1/admin/reports?state=open`,
   `POST /v1/admin/reports/{id}/resolve` `{"resolution":"dismissed"|"actioned"}`.
 

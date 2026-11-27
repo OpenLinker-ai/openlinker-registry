@@ -408,6 +408,12 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("review off: %s", r.Body)
 		}
 		oe.Expect(oe.Do("GET", "/v1/skills/ai.openlinker.alice/x", "", "", nil), 200, "visible")
+		report := []byte(`{"kind":"skill","namespace":"ai.openlinker.alice","name":"x","category":"spam","details":""}`)
+		for i, sub := range []string{otherUser, thirdUser, "0d5c3c1e-0000-4000-8000-000000000009"} {
+			oe.Expect(actor{og, sub, ""}.json("POST", "/v1/reports", string(report)), 201, "report "+strconv.Itoa(i))
+		}
+		oe.Expect(oe.Do("POST", "/v1/reports", AdminToken, "", report), 201, "admin report")
+		oe.Expect(oe.Do("GET", "/v1/skills/ai.openlinker.alice/x", "", "", nil), 200, "reports never hide entries while review is off")
 	})
 }
 
