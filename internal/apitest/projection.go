@@ -484,6 +484,27 @@ func runProjectionReads(t *testing.T, newStore func(t *testing.T) store.Store) {
 		down.Expect(down.Do("GET", v1, reader, "", nil), 200, "restored upstream")
 	})
 
+	t.Run("a mirror backfills an older version restored upstream", func(t *testing.T) {
+		up, alice := projectionEnv(t, newStore(t), Options{})
+		down := NewEnv(t, newStore(t), Options{Loopback: true})
+		ns := generatedNamespace(coreUser, 12)
+		up.Expect(alice.version("p-back", "1", coreBundle("pdf-tools", "Read PDFs", "Use it."), PlatformTerms), 201, "v1")
+		up.Expect(alice.version("p-back", "2", coreBundle("pdf-tools", "Read and split PDFs", "Use it."), PlatformTerms), 201, "v2")
+		up.Expect(alice.state("p-back", visibleState("e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1", 1, "2")), 200, "only v2")
+		down.Expect(down.upstream(map[string]any{"name": "hub", "kind": "openlinker-registry", "base_url": up.Base}), 201, "upstream")
+		down.sync("hub")
+		entry := "/v1/skills/" + ns + "/p-back"
+		down.Expect(down.Do("GET", entry+"/versions/1", "", "", nil), 404, "v1 not mirrored yet")
+		up.Expect(alice.state("p-back", visibleState("e2e2e2e2-e2e2-4e2e-8e2e-e2e2e2e2e2e2", 2, "1", "2")), 200, "restore v1")
+		down.sync("hub")
+		down.Expect(down.Do("GET", entry+"/versions/1", "", "", nil), 200, "v1 backfilled")
+		if r := down.Expect(down.Do("GET", entry, "", "", nil), 200, "detail"); r.JSON["latest_version"] != "2" {
+			t.Fatalf("latest after backfill: %s", r.Body)
+		}
+		down.sync("hub")
+		down.Expect(down.Do("GET", entry+"/versions/1", "", "", nil), 200, "stable after another sync")
+	})
+
 	t.Run("validation needs a public instance", func(t *testing.T) {
 		e := NewEnv(t, newStore(t), Options{Mode: "private"})
 		g := newGateway(t, e, "core", []string{"skills:read", "skills:write"}, []string{"openlinker"})

@@ -1017,6 +1017,13 @@ func (s *Service) mirrorSkill(ctx context.Context, u model.Upstream, c *upstream
 			break
 		}
 	}
+	if exists && tooMany == nil {
+		backfilled, err := s.backfillSkillVersions(ctx, c, u, local, d, visibility, stats)
+		if err != nil {
+			return err
+		}
+		changed = changed || backfilled
+	}
 	if created {
 		// A skill created just now took its visibility and listing from the
 		// first version; its status is still to be set.
@@ -1553,4 +1560,41 @@ func sameManifest(a, b []skill.ManifestEntry) bool {
 		}
 	}
 	return true
+}
+
+func (s *Service) backfillSkillVersions(ctx context.Context, c *upstream.Client, u model.Upstream, local model.Skill, d upstream.SkillDetail,
+	visibility string, stats syncStats) (bool, error) {
+	versions, err := s.Store.ListVersionSummaries(ctx, local.ID)
+	if err != nil || len(versions) == 0 {
+		return false, err
+	}
+	have := map[string]bool{}
+	for _, v := range versions {
+		have[v.Version] = true
+	}
+	newest, changed := versions[0].Version, false
+	for i := len(d.Versions) - 1; i >= 0; i-- {
+		ref := d.Versions[i]
+		if have[ref.Version] || ref.Yanked || !skill.ValidVersion(ref.Version) {
+			continue
+		}
+		sv, err := c.GetSkillVersion(ctx, d.Namespace, d.Name, ref.Version)
+		var ue *upstream.Error
+		if errors.Is(err, upstream.ErrNotFound) || errors.As(err, &ue) {
+			stats.add("skills_incomplete")
+			continue
+		}
+		if err != nil {
+			return changed, err
+		}
+		if _, err := s.mirrorSkillVersion(ctx, u, sv, visibility, d.Listed, newest); err != nil {
+			if isStoreFailure(err) {
+				return changed, err
+			}
+			stats.add("skills_incomplete")
+			continue
+		}
+		newest, changed = sv.Version, true
+	}
+	return changed, nil
 }
