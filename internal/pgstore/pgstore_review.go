@@ -11,19 +11,27 @@ import (
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
 )
 
-func nextReview(ctx context.Context, tx pgx.Tx, table string, id, nsID int64, created bool, current string, rule model.ReviewRule) (string, error) {
+type reviewFields struct {
+	state    string
+	reason   string
+	revision int64
+}
+
+func nextReview(ctx context.Context, tx pgx.Tx, table string, id, nsID int64, created bool, current string, rule model.ReviewRule) (reviewFields, error) {
 	next := rule.Next(current)
 	if created {
 		var trusted bool
 		if err := tx.QueryRow(ctx, `SELECT review_trusted FROM namespaces WHERE id = $1`, nsID).Scan(&trusted); err != nil {
-			return current, err
+			return reviewFields{}, err
 		}
 		next = rule.Initial(trusted)
 	}
-	_, err := tx.Exec(ctx, `UPDATE `+table+` SET review_state = $2,
+	var out reviewFields
+	err := tx.QueryRow(ctx, `UPDATE `+table+` SET review_state = $2,
 		review_reason = CASE WHEN review_state = $2 THEN review_reason ELSE '' END,
-		review_revision = review_revision + 1 WHERE id = $1`, id, next)
-	return next, err
+		review_revision = review_revision + 1 WHERE id = $1
+		RETURNING review_state, review_reason, review_revision`, id, next).Scan(&out.state, &out.reason, &out.revision)
+	return out, err
 }
 
 func (s *Store) ClaimNamespace(ctx context.Context, ns model.Namespace, owner string, audit model.AuditEvent) (model.Namespace, bool, error) {
@@ -102,17 +110,19 @@ func reviewTable(kind string) (string, error) {
 	return "", model.ErrNotFound
 }
 
-func (s *Store) ListReview(ctx context.Context, kind, state string, limit int) ([]model.ReviewItem, error) {
-	query := `SELECT 'skill', s.id, n.name, s.name, s.mode, s.review_state, s.review_reason, s.review_revision, s.visibility,
+func (s *Store) ListReview(ctx context.Context, kind, state, afterKind string, afterID int64, limit int) ([]model.ReviewItem, error) {
+	query := `SELECT * FROM (
+		SELECT 'mcp' AS kind, m.id, n.name AS ns, m.name, m.mode, m.review_state, m.review_reason, m.review_revision, m.visibility,
+			m.created_by, m.updated_at,
+			(SELECT count(*) FROM reports r WHERE r.kind = 'mcp' AND r.entry_id = m.id AND r.state = 'open') AS open_reports
+		FROM mcp_servers m JOIN namespaces n ON n.id = m.namespace_id WHERE m.review_state = $1 AND ($2 = '' OR $2 = 'mcp')
+		UNION ALL
+		SELECT 'skill', s.id, n.name, s.name, s.mode, s.review_state, s.review_reason, s.review_revision, s.visibility,
 			COALESCE((SELECT created_by FROM skill_versions v WHERE v.skill_id = s.id ORDER BY v.id LIMIT 1), ''), s.updated_at,
 			(SELECT count(*) FROM reports r WHERE r.kind = 'skill' AND r.entry_id = s.id AND r.state = 'open')
 		FROM skills s JOIN namespaces n ON n.id = s.namespace_id WHERE s.review_state = $1 AND ($2 = '' OR $2 = 'skill')
-		UNION ALL
-		SELECT 'mcp', m.id, n.name, m.name, m.mode, m.review_state, m.review_reason, m.review_revision, m.visibility, m.created_by, m.updated_at,
-			(SELECT count(*) FROM reports r WHERE r.kind = 'mcp' AND r.entry_id = m.id AND r.state = 'open')
-		FROM mcp_servers m JOIN namespaces n ON n.id = m.namespace_id WHERE m.review_state = $1 AND ($2 = '' OR $2 = 'mcp')
-		ORDER BY 11, 1, 2 LIMIT $3`
-	rows, err := s.pool.Query(ctx, query, state, kind, limit)
+	) q WHERE (q.kind, q.id) > ($3, $4) ORDER BY q.kind, q.id LIMIT $5`
+	rows, err := s.pool.Query(ctx, query, state, kind, afterKind, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +149,9 @@ func (s *Store) DecideReview(ctx context.Context, d model.ReviewDecision, audit 
 		}
 		_, err := tx.Exec(ctx, `UPDATE `+table+` SET review_state = $2, review_reason = $3, updated_at = now() WHERE id = $1`, d.ID, d.State, d.Reason)
 		if err != nil {
+			return err
+		}
+		if err := stampMCPVersions(ctx, tx, d.Kind, d.ID); err != nil {
 			return err
 		}
 		if d.TrustNamespace && d.State == model.ReviewApproved {
@@ -202,6 +215,9 @@ func (s *Store) CreateReport(ctx context.Context, rep model.Report, threshold in
 			review_revision = review_revision + 1, updated_at = now() WHERE id = $1`, rep.EntryID); err != nil {
 			return err
 		}
+		if err := stampMCPVersions(ctx, tx, rep.Kind, rep.EntryID); err != nil {
+			return err
+		}
 		res.Reopened = true
 		return insertAudit(ctx, tx, model.AuditEvent{Actor: audit.Actor, Action: "review.reopen", Namespace: rep.Namespace,
 			Target: rep.Name, Details: map[string]any{"kind": rep.Kind, "open_reports": open}})
@@ -239,12 +255,15 @@ func (s *Store) ResolveReport(ctx context.Context, id int64, state, by string, a
 	return out, err
 }
 
-func (s *Store) MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, audit model.AuditEvent) (model.Skill, error) {
+func (s *Store) MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, expectedRevision int64, audit model.AuditEvent) (model.Skill, error) {
 	var out model.Skill
 	err := s.inTx(ctx, audit, func(tx pgx.Tx) error {
 		k, err := scanSkill(tx.QueryRow(ctx, `SELECT `+skillCols+skillFrom+`WHERE s.id = $1 FOR UPDATE OF s`, skillID))
 		if err != nil {
 			return notFound(err)
+		}
+		if k.ReviewRevision != expectedRevision {
+			return conflict("entry_changed", "the entry changed while the claim was checked; try again")
 		}
 		var nsID, nsUpstream int64
 		if err := tx.QueryRow(ctx, `SELECT id, COALESCE(upstream_id, 0) FROM namespaces WHERE name = $1`, toNamespace).
@@ -280,4 +299,12 @@ func (s *Store) SkillRedirect(ctx context.Context, namespace, name string) (mode
 	k, err := scanSkill(s.pool.QueryRow(ctx, `SELECT `+skillCols+skillFrom+`JOIN skill_redirects r ON r.skill_id = s.id
 		WHERE r.from_namespace = $1 AND r.from_name = $2`, namespace, name))
 	return k, notFound(err)
+}
+
+func stampMCPVersions(ctx context.Context, tx pgx.Tx, kind string, serverID int64) error {
+	if kind != "mcp" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `UPDATE mcp_server_versions SET updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond') WHERE server_id = $1`, serverID)
+	return err
 }

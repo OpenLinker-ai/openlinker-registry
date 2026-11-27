@@ -2,13 +2,17 @@ package apitest
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
+	"github.com/OpenLinker-ai/openlinker-registry/internal/skill"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/store"
 )
 
@@ -123,7 +127,11 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 			e.Expect(g.do("GET", p, nil, "", ""), 404, "gateway "+p)
 			e.Expect(bob.get(p), 404, "other user "+p)
 		}
+		published := r.JSON["review"].(map[string]any)["revision"]
 		r = e.Expect(alice.get(first), 200, "member reads")
+		if r.JSON["review"].(map[string]any)["revision"] != published {
+			t.Fatalf("publish answered a stale revision %v, entry has %s", published, r.Body)
+		}
 		if reviewState(r) != "pending" || r.JSON["visibility"] != "private" {
 			t.Fatalf("member view: %s", r.Body)
 		}
@@ -224,7 +232,7 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 		e.Expect(e.Do("GET", bobSkill, "", "", nil), 404, "rejected hidden")
 		r = e.Expect(bob.send("POST", bobSkill+"/versions?version=2", md("spam", "Not spam", "MIT"), "text/markdown"), 201, "resubmit")
-		if reviewState(r) != "pending" {
+		if reviewState(r) != "pending" || r.JSON["review"].(map[string]any)["reason"] != "" {
 			t.Fatalf("resubmit: %s", r.Body)
 		}
 	})
@@ -254,6 +262,10 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("reports: %s", r.Body)
 		}
 		e.Expect(e.Do("GET", "/v1/admin/reports", bob.g.token, "", nil), 403, "gateway cannot list reports")
+		writeOnly := e.token([]string{"skills:write"}, nil)
+		if r := e.Expect(e.Do("POST", "/v1/reports", writeOnly, "", []byte(report)), 403, "write-only token reports"); errCode(r) != "forbidden" {
+			t.Fatalf("write-only: %s", r.Body)
+		}
 		rid := url.PathEscape(jsonNumber(reports[0].(map[string]any)["id"]))
 		e.Expect(e.Do("POST", "/v1/admin/reports/"+rid+"/resolve", AdminToken, "", map[string]any{"resolution": "dismissed"}), 200, "resolve")
 		e.Expect(e.Do("POST", "/v1/admin/reports/"+rid+"/resolve", AdminToken, "", map[string]any{"resolution": "dismissed"}), 409, "resolve twice")
@@ -270,6 +282,20 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 		if reviewState(r) != "pending" {
 			t.Fatalf("mcp review: %s", r.Body)
 		}
+		if g := e.Expect(bob.get("/v1/mcp/servers/ai.openlinker.bob/weather"), 200, "owner reads"); g.JSON["review"].(map[string]any)["revision"] != r.JSON["review"].(map[string]any)["revision"] {
+			t.Fatalf("mcp publish answered a stale revision: %s vs %s", r.Body, g.Body)
+		}
+		page := e.Expect(e.Do("GET", "/v1/admin/review?state=pending&limit=1", AdminToken, "", nil), 200, "first page")
+		cursor, _ := page.JSON["next_cursor"].(string)
+		if items, _ := page.JSON["items"].([]any); len(items) != 1 || cursor == "" {
+			t.Fatalf("first page: %s", page.Body)
+		}
+		next := e.Expect(e.Do("GET", "/v1/admin/review?state=pending&limit=1&cursor="+url.QueryEscape(cursor), AdminToken, "", nil), 200, "second page")
+		if items, _ := next.JSON["items"].([]any); len(items) != 1 || string(next.Body) == string(page.Body) {
+			t.Fatalf("second page: %s", next.Body)
+		}
+		since := time.Now().UTC().Add(-time.Millisecond).Format(time.RFC3339Nano)
+		time.Sleep(5 * time.Millisecond)
 		esc := url.PathEscape(name)
 		for _, p := range []string{"/v1/mcp/servers/ai.openlinker.bob/weather", "/v1/mcp/servers/ai.openlinker.bob/weather/versions/latest",
 			"/v0.1/servers/" + esc + "/versions/latest", "/v0.1/servers/" + esc + "/versions", "/v0/servers/" + esc + "/versions/1.0.0"} {
@@ -282,6 +308,9 @@ func runReview(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 		e.Expect(e.decide("mcp/servers", "ai.openlinker.bob/weather", map[string]any{"decision": "approve"}), 200, "approve mcp")
 		e.Expect(e.Do("GET", "/v0.1/servers/"+esc+"/versions/latest", "", "", nil), 200, "approved mcp")
+		if !listed(t, e, "", "/v0.1/servers?updated_since="+url.QueryEscape(since), "servers", name) {
+			t.Fatal("an approval must reach incremental readers")
+		}
 		indexed := `{"name":"ai.openlinker.bob/other","description":"Other","version":"1","remotes":[{"type":"sse","url":"https://mcp.other.example/sse"}]}`
 		r = e.Expect(bob.json("POST", "/v1/mcp/servers/ai.openlinker.bob?indexed=true", indexed), 201, "mcp indexed")
 		if reviewState(r) != "pending" {
@@ -393,7 +422,7 @@ func jsonNumber(v any) string {
 }
 
 func runClaims(t *testing.T, newStore func(t *testing.T) store.Store) {
-	e := NewEnv(t, newStore(t), Options{Review: true})
+	e := NewEnv(t, newStore(t), Options{Review: true, UI: true})
 	e.Fake.SetOwner(1, "User")
 	e.Fake.AddUser(1, "acme", "User")
 	e.Fake.AddUser(7, "bob", "User")
@@ -430,9 +459,29 @@ func runClaims(t *testing.T, newStore func(t *testing.T) store.Store) {
 	index(demo)
 	index(single)
 	e.Fake.SetRepoID(0)
-	index(nolic)
+	p := e.Expect(bob.json("POST", "/v1/skills/ai.openlinker.bob/indexes/preview", `{"url":"`+nolic+`"}`), 200, "preview without repository id")
+	if r := e.Expect(bob.json("POST", "/v1/skills/ai.openlinker.bob/indexes", `{"url":"`+nolic+`","commit":"`+p.JSON["commit"].(string)+
+		`","expected_tree_sha":"`+p.JSON["tree_sha"].(string)+`","version":"1"}`), 502, "index without a repository id"); errCode(r) != "github_unavailable" {
+		t.Fatalf("no repository id: %s", r.Body)
+	}
 	e.Fake.SetRepoID(4242)
-	for _, n := range []string{"demo", "single", "nolic"} {
+	e.Fake.RecycleOnLookup(2, 777, 9, "User")
+	p = e.Expect(bob.json("POST", "/v1/skills/ai.openlinker.bob/indexes/preview", `{"url":"`+nolic+`"}`), 200, "preview before recycle")
+	if r := e.Expect(bob.json("POST", "/v1/skills/ai.openlinker.bob/indexes", `{"url":"`+nolic+`","commit":"`+p.JSON["commit"].(string)+
+		`","expected_tree_sha":"`+p.JSON["tree_sha"].(string)+`","version":"1"}`), 502, "repository replaced during indexing"); errCode(r) != "github_unavailable" {
+		t.Fatalf("recycled during indexing: %s", r.Body)
+	}
+	e.Fake.Recycle(4242, 1, "User")
+	legacy := model.Version{Version: "1", FrontmatterName: "nolic", FrontmatterDescription: "Legacy", LicenseKind: "spdx", LicenseID: "MIT",
+		Files: []skill.ManifestEntry{}, ArtifactDigest: sha([]byte("legacy")), ArtifactType: "skill-md", ArtifactSize: 6,
+		Locator:   &model.Locator{Kind: "github", Owner: "acme", Repo: "skills", Commit: C1, Path: "skills/nolic", TreeSHA: C1},
+		IndexedBy: "legacy", CreatedBy: "legacy"}
+	if _, _, err := e.Store.PublishVersion(context.Background(), model.PublishInput{Namespace: "ai.openlinker.bob", Name: "nolic",
+		Mode: "indexed", SourceKey: "github:acme/skills:/skills/nolic", Visibility: "public", Listed: true, Version: legacy},
+		model.AuditEvent{Actor: "test", Action: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"demo", "single"} {
 		e.Expect(e.decide("skills", "ai.openlinker.bob/"+n, map[string]any{"decision": "approve"}), 200, "approve "+n)
 	}
 	before := e.Expect(e.Do("GET", "/v1/skills/ai.openlinker.bob/demo/versions/1", "", "", nil), 200, "before claim")
@@ -469,7 +518,48 @@ func runClaims(t *testing.T, newStore func(t *testing.T) store.Store) {
 	})
 
 	t.Run("claim moves the entry", func(t *testing.T) {
-		r := e.Expect(author.json("POST", "/v1/skills/ai.openlinker.bob/demo/claim", `{}`), 200, "claim")
+		path := "/v1/skills/ai.openlinker.bob/demo/claim"
+		requests := make([]*http.Request, 3)
+		for i := range requests {
+			req, _ := http.NewRequest("POST", e.Base+path, strings.NewReader(`{}`))
+			req.Header.Set("Authorization", "Bearer "+g.token)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("OpenLinker-User-Assertion", g.assertion("POST", path, []byte(`{}`), func(x *Assertion) {
+				x.Sub, x.GH, x.Act = coreUser, "1", []string{"read", "write"}
+			}))
+			requests[i] = req
+		}
+		statuses := make(chan int, len(requests))
+		var wg sync.WaitGroup
+		for _, req := range requests {
+			wg.Add(1)
+			go func(req *http.Request) {
+				defer wg.Done()
+				res, err := noRedirect.Do(req)
+				if err != nil {
+					statuses <- 0
+					return
+				}
+				res.Body.Close()
+				statuses <- res.StatusCode
+			}(req)
+		}
+		wg.Wait()
+		close(statuses)
+		won := 0
+		for st := range statuses {
+			switch st {
+			case 200:
+				won++
+			case 404, 409:
+			default:
+				t.Fatalf("concurrent claim status %d", st)
+			}
+		}
+		if won == 0 {
+			t.Fatal("no concurrent claim succeeded")
+		}
+		r := e.Expect(author.json("POST", "/v1/skills/io.github.acme/demo/claim", `{}`), 200, "claim")
 		if r.JSON["namespace"] != "io.github.acme" || r.JSON["name"] != "demo" || r.JSON["claimed"] != true {
 			t.Fatalf("claim: %s", r.Body)
 		}
@@ -488,6 +578,14 @@ func runClaims(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("import location %q", r.Header.Get("Location"))
 		}
 		e.Expect(author.json("POST", "/v1/skills/io.github.acme/demo/claim", `{}`), 200, "claim again is idempotent")
+		for from, to := range map[string]string{
+			"/ui/skills/ai.openlinker.bob/demo":                     "/registry/ui/skills/io.github.acme/demo",
+			"/ui/skills/ai.openlinker.bob/demo/versions/1/artifact": "/registry/ui/skills/io.github.acme/demo/versions/1/artifact",
+		} {
+			if r := e.Expect(e.Do("GET", from, "", "", nil), 308, "ui redirect "+from); r.Header.Get("Location") != to {
+				t.Fatalf("ui location %q", r.Header.Get("Location"))
+			}
+		}
 		e.Expect(bob.json("POST", "/v1/skills/io.github.acme/demo/yank", `{}`), 403, "indexer lost write access")
 		if r := e.Expect(bob.json("POST", "/v1/skills/ai.openlinker.bob/demo/yank", `{}`), 404, "old coordinate write"); errCode(r) != "not_found" {
 			t.Fatalf("old write: %s", r.Body)

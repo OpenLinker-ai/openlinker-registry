@@ -554,9 +554,23 @@ func (s *Service) IndexGitHub(ctx context.Context, actor, namespace string, req 
 		return model.Skill{}, model.Version{}, fail(http.StatusUnprocessableEntity, "license_not_assertable",
 			"indexed entries take their license from the source; license overrides are only accepted for hosted content")
 	}
+	if s.GitHub == nil {
+		return model.Skill{}, model.Version{}, fail(http.StatusServiceUnavailable, "github_disabled", "GitHub access is not configured")
+	}
+	parsed, err := s.GitHub.ParseURL(req.URL, req.Commit)
+	if err != nil {
+		return model.Skill{}, model.Version{}, err
+	}
+	repoID, err := s.githubRepoID(ctx, parsed.Owner, parsed.Repo)
+	if err != nil {
+		return model.Skill{}, model.Version{}, err
+	}
 	r, snap, err := s.fetchLocked(ctx, req)
 	if err != nil {
 		return model.Skill{}, model.Version{}, err
+	}
+	if after, err := s.githubRepoID(ctx, r.Owner, r.Repo); err != nil || after != repoID {
+		return model.Skill{}, model.Version{}, fail(http.StatusBadGateway, "github_unavailable", "the repository changed while it was being indexed; try again")
 	}
 	o := PublishOptions{Actor: actor, Namespace: namespace, Name: req.Name, Version: req.Version, Visibility: req.Visibility, Listed: req.Listed}
 	defaultVersion(&o, snap.Commit)
@@ -597,7 +611,7 @@ func (s *Service) IndexGitHub(ctx context.Context, actor, namespace string, req 
 	v := b.version
 	v.Version = o.Version
 	v.Locator = &model.Locator{Kind: "github", Owner: r.Owner, Repo: r.Repo, Commit: snap.Commit, Path: r.Dir,
-		TreeSHA: snap.TreeSHA, SingleFile: r.SingleFile, RepoID: s.githubRepoID(ctx, r.Owner, r.Repo)}
+		TreeSHA: snap.TreeSHA, SingleFile: r.SingleFile, RepoID: repoID}
 	v.IndexedBy, v.CreatedBy, v.CheckResult, v.CheckedAt = actor, actor, model.CheckOK, &now
 	listed := true
 	if o.Listed != nil {

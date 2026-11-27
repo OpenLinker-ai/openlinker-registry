@@ -120,9 +120,11 @@ func (s *Store) PublishMCPVersion(ctx context.Context, in model.MCPPublishInput,
 		case srvNS != nsID:
 			return errServerName()
 		}
-		if srv.ReviewState, err = nextReview(ctx, tx, "mcp_servers", srv.ID, nsID, created, srv.ReviewState, in.Review); err != nil {
+		review, err := nextReview(ctx, tx, "mcp_servers", srv.ID, nsID, created, srv.ReviewState, in.Review)
+		if err != nil {
 			return err
 		}
+		srv.ReviewState, srv.ReviewReason, srv.ReviewRevision = review.state, review.reason, review.revision
 		// Under the server lock: the new version takes the flag unless the
 		// current latest is a higher semantic version.
 		var curVersion string

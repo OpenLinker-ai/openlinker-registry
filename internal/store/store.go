@@ -109,12 +109,12 @@ type Store interface {
 
 	ClaimNamespace(ctx context.Context, ns model.Namespace, owner string, audit model.AuditEvent) (model.Namespace, bool, error)
 	SetNamespaceTrusted(ctx context.Context, name string, trusted bool, audit model.AuditEvent) error
-	ListReview(ctx context.Context, kind, state string, limit int) ([]model.ReviewItem, error)
+	ListReview(ctx context.Context, kind, state, afterKind string, afterID int64, limit int) ([]model.ReviewItem, error)
 	DecideReview(ctx context.Context, d model.ReviewDecision, audit model.AuditEvent) error
 	CreateReport(ctx context.Context, rep model.Report, threshold int, reopenNow bool, audit model.AuditEvent) (model.ReportResult, error)
 	ListReports(ctx context.Context, state string, afterID int64, limit int) ([]model.Report, error)
 	ResolveReport(ctx context.Context, id int64, state, by string, at time.Time, audit model.AuditEvent) (model.Report, error)
-	MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, audit model.AuditEvent) (model.Skill, error)
+	MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, expectedRevision int64, audit model.AuditEvent) (model.Skill, error)
 	SkillRedirect(ctx context.Context, namespace, name string) (model.Skill, error)
 
 	// ListMirroredSkills pages through every skill in the namespaces of an

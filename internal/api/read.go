@@ -67,9 +67,13 @@ func (s *Server) loadVisible(r *http.Request) (model.Skill, error) {
 }
 
 func (s *Server) movedTo(r *http.Request, ns, name string, moved model.Skill) error {
-	prefix := "/v1/skills/" + url.PathEscape(ns) + "/" + url.PathEscape(name)
-	rest := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
-	loc := s.BasePath + "/v1/skills/" + url.PathEscape(moved.Namespace) + "/" + url.PathEscape(moved.Name) + rest
+	escaped := r.URL.EscapedPath()
+	old := "/skills/" + url.PathEscape(ns) + "/" + url.PathEscape(name)
+	at := strings.Index(escaped, old)
+	if at < 0 {
+		return errNotFound
+	}
+	loc := s.BasePath + escaped[:at] + "/skills/" + url.PathEscape(moved.Namespace) + "/" + url.PathEscape(moved.Name) + escaped[at+len(old):]
 	if r.URL.RawQuery != "" {
 		loc += "?" + r.URL.RawQuery
 	}

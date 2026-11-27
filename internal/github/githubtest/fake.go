@@ -38,9 +38,11 @@ type Fake struct {
 	// Down makes every request fail with 503.
 	Down atomic.Bool
 
-	repoID int64
-	owners map[int64]account
-	users  map[int64][2]string
+	repoID  int64
+	owners  map[int64]account
+	lookups int
+	recycle *recyclePlan
+	users   map[int64][2]string
 }
 
 type account struct {
@@ -72,6 +74,19 @@ func (f *Fake) SetOwner(id int64, kind string) {
 	f.owners[f.repoID] = account{ID: id, Login: f.Owner, Type: kind}
 }
 
+type recyclePlan struct {
+	after         int
+	repoID, owner int64
+	kind          string
+}
+
+func (f *Fake) RecycleOnLookup(after int, newRepoID, ownerID int64, kind string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookups = 0
+	f.recycle = &recyclePlan{after: after, repoID: newRepoID, owner: ownerID, kind: kind}
+}
+
 func (f *Fake) SetRepoID(id int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -97,6 +112,8 @@ func (f *Fake) AddUser(id int64, login, kind string) {
 // New starts API and raw servers.
 func New(owner, repo string) *Fake {
 	f := &Fake{Owner: owner, Repo: repo, DefaultBranch: "main", refs: map[string]string{}, commits: map[string]map[string]Entry{}, rawOver: map[string][]byte{}}
+	f.repoID = 4242
+	f.owners = map[int64]account{4242: {ID: 1, Login: owner, Type: "User"}}
 	f.API = httptest.NewServer(http.HandlerFunc(f.serveAPI))
 	f.Raw = httptest.NewServer(http.HandlerFunc(f.serveRaw))
 	return f
@@ -169,6 +186,12 @@ func (f *Fake) serveAPI(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(p, prefix)
 	switch {
 	case rest == "":
+		f.lookups++
+		if f.recycle != nil && f.lookups >= f.recycle.after {
+			f.repoID = f.recycle.repoID
+			f.owners[f.recycle.repoID] = account{ID: f.recycle.owner, Login: f.Owner, Type: f.recycle.kind}
+			f.recycle = nil
+		}
 		_ = json.NewEncoder(w).Encode(f.repoJSON(f.repoID))
 	case strings.HasPrefix(rest, "/commits/"):
 		ref := strings.TrimPrefix(rest, "/commits/")

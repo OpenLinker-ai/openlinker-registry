@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/OpenLinker-ai/openlinker-registry/internal/auth"
 	"github.com/OpenLinker-ai/openlinker-registry/internal/model"
@@ -124,6 +125,10 @@ func (s *Server) createReport(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, &registry.Error{Status: http.StatusForbidden, Code: "user_required", Msg: "reports through a gateway need a user assertion"})
 		return
 	}
+	if !p.HasScope(auth.ScopeRead) {
+		s.fail(w, r, &registry.Error{Status: http.StatusForbidden, Code: "forbidden", Msg: "reporting needs the skills:read scope"})
+		return
+	}
 	var req reportRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		s.fail(w, r, err)
@@ -182,7 +187,26 @@ func (s *Server) listReview(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, &registry.Error{Status: http.StatusBadRequest, Code: "invalid_query", Msg: "state must be pending, rejected or approved; kind skill or mcp"})
 		return
 	}
-	items, err := s.Svc.Store.ListReview(r.Context(), kind, state, 200)
+	limit := 100
+	if l := q.Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n < 1 || n > 200 {
+			s.fail(w, r, &registry.Error{Status: http.StatusBadRequest, Code: "invalid_query", Msg: "limit must be 1-200"})
+			return
+		}
+		limit = n
+	}
+	afterKind, afterID := "", int64(0)
+	if c := q.Get("cursor"); c != "" {
+		k, id, ok := strings.Cut(c, ":")
+		n, err := strconv.ParseInt(id, 10, 64)
+		if !ok || (k != "skill" && k != "mcp") || err != nil || n < 0 {
+			s.fail(w, r, &registry.Error{Status: http.StatusBadRequest, Code: "invalid_query", Msg: "invalid cursor"})
+			return
+		}
+		afterKind, afterID = k, n
+	}
+	items, err := s.Svc.Store.ListReview(r.Context(), kind, state, afterKind, afterID, limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -193,7 +217,12 @@ func (s *Server) listReview(w http.ResponseWriter, r *http.Request) {
 			"state": it.State, "reason": it.Reason, "review_revision": it.Revision, "visibility": it.Visibility, "created_by": it.CreatedBy,
 			"open_reports": it.OpenReports, "updated_at": it.UpdatedAt})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": out})
+	body := map[string]any{"items": out}
+	if len(items) == limit {
+		last := items[len(items)-1]
+		body["next_cursor"] = last.Kind + ":" + strconv.FormatInt(last.ID, 10)
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 type decisionRequest struct {

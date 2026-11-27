@@ -168,7 +168,7 @@ func contextGuard(ctx context.Context, tx pgx.Tx) error {
 	if skillID, ns, ok := model.SkillGuardFrom(ctx); ok {
 		var here bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM skills s JOIN namespaces n ON n.id = s.namespace_id
-			WHERE s.id = $1 AND n.name = $2 FOR SHARE OF s)`, skillID, ns).Scan(&here); err != nil {
+			WHERE s.id = $1 AND n.name = $2 FOR UPDATE OF s)`, skillID, ns).Scan(&here); err != nil {
 			return err
 		}
 		if !here {
@@ -485,9 +485,11 @@ func (s *Store) PublishVersion(ctx context.Context, in model.PublishInput, audit
 				return conflict("name_reserved", "this name belonged to an entry that moved; it cannot be reused")
 			}
 		}
-		if k.ReviewState, err = nextReview(ctx, tx, "skills", k.ID, nsID, tag.RowsAffected() == 1, k.ReviewState, in.Review); err != nil {
+		review, err := nextReview(ctx, tx, "skills", k.ID, nsID, tag.RowsAffected() == 1, k.ReviewState, in.Review)
+		if err != nil {
 			return err
 		}
+		k.ReviewState, k.ReviewReason, k.ReviewRevision = review.state, review.reason, review.revision
 		// Checked under the skill row lock, so a concurrent visibility
 		// change cannot interleave with this publish.
 		if in.Mode == "hosted" && k.Visibility == model.VisibilityPublic && in.Version.LicenseKind == "unknown" {
@@ -926,7 +928,7 @@ func (s *Store) IndexCandidates(ctx context.Context, namespace string, aliasOnly
 		if err != nil {
 			return nil, err
 		}
-		if sk.Visibility != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive {
+		if sk.ShownVisibility() != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive {
 			continue
 		}
 		out = append(out, model.IndexCandidate{Skill: sk, Version: v})

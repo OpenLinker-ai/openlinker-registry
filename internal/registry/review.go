@@ -105,14 +105,14 @@ func (s *Service) githubAccount(ctx context.Context, id int64) (githubAccount, e
 	return acct, nil
 }
 
-func (s *Service) githubRepoID(ctx context.Context, owner, repo string) int64 {
+func (s *Service) githubRepoID(ctx context.Context, owner, repo string) (int64, error) {
 	var info struct {
 		ID int64 `json:"id"`
 	}
 	if err := s.GitHub.API(ctx, "/repos/"+owner+"/"+repo, &info); err != nil || info.ID <= 0 {
-		return 0
+		return 0, fail(http.StatusBadGateway, "github_unavailable", "the repository id could not be confirmed on GitHub")
 	}
-	return info.ID
+	return info.ID, nil
 }
 
 func (s *Service) ClaimSkill(ctx context.Context, c Claimant, sk model.Skill, newName string) (model.Skill, error) {
@@ -179,7 +179,7 @@ func (s *Service) ClaimSkill(ctx context.Context, c Claimant, sk model.Skill, ne
 	if newName == "" {
 		newName = sk.Name
 	}
-	return s.Store.MoveSkill(model.WithSkillGuard(ctx, sk.ID, sk.Namespace), sk.ID, ns.Name, newName,
+	return s.Store.MoveSkill(model.WithSkillGuard(ctx, sk.ID, sk.Namespace), sk.ID, ns.Name, newName, sk.ReviewRevision,
 		auditEvent(c.Actor, "skill.claim", ns.Name, newName, map[string]any{"from_namespace": sk.Namespace, "from_name": sk.Name,
 			"indexed_by": vs[len(vs)-1].IndexedBy, "github_id": c.GitHubID, "repo_id": repoID}))
 }

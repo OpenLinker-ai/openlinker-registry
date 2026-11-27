@@ -268,7 +268,7 @@ func (s *Service) VersionURL(ns, name, version, suffix string) string {
 func (s *Service) Eligible(c model.IndexCandidate, entryName string) (IndexEntry, bool, string) {
 	sk, v := c.Skill, c.Version
 	switch {
-	case sk.Visibility != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive || v.YankedAt != nil:
+	case sk.ShownVisibility() != model.VisibilityPublic || !sk.Listed || sk.Status != model.StatusActive || v.YankedAt != nil:
 		return IndexEntry{}, false, "not_public_listed_active"
 	case !skill.ValidSlug(entryName):
 		return IndexEntry{}, false, "name_not_slug"

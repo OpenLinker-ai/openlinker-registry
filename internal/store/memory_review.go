@@ -78,7 +78,7 @@ func (m *Memory) openReports(kind string, id int64) (reporters int) {
 	return len(seen)
 }
 
-func (m *Memory) ListReview(_ context.Context, kind, state string, limit int) ([]model.ReviewItem, error) {
+func (m *Memory) ListReview(_ context.Context, kind, state, afterKind string, afterID int64, limit int) ([]model.ReviewItem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []model.ReviewItem
@@ -107,13 +107,13 @@ func (m *Memory) ListReview(_ context.Context, kind, state string, limit int) ([
 		}
 	}
 	slices.SortFunc(out, func(a, b model.ReviewItem) int {
-		if c := a.UpdatedAt.Compare(b.UpdatedAt); c != 0 {
-			return c
-		}
 		if c := strings.Compare(a.Kind, b.Kind); c != 0 {
 			return c
 		}
 		return int(a.ID - b.ID)
+	})
+	out = slices.DeleteFunc(out, func(it model.ReviewItem) bool {
+		return it.Kind < afterKind || (it.Kind == afterKind && it.ID <= afterID)
 	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
@@ -165,6 +165,7 @@ func (m *Memory) DecideReview(_ context.Context, d model.ReviewDecision, audit m
 		}
 		s.ReviewState, s.ReviewReason, s.UpdatedAt = d.State, d.Reason, now
 		m.mcp[d.ID] = s
+		m.stampMCPVersions(d.ID, now)
 		ns = s.Namespace
 	default:
 		return model.ErrNotFound
@@ -226,6 +227,7 @@ func (m *Memory) CreateReport(_ context.Context, rep model.Report, threshold int
 		s.ReviewState, s.ReviewReason, s.UpdatedAt = model.ReviewPending, "reports", now
 		s.ReviewRevision++
 		m.mcp[rep.EntryID] = s
+		m.stampMCPVersions(rep.EntryID, now)
 	}
 	res.Reopened = true
 	m.appendAudit(model.AuditEvent{Actor: audit.Actor, Action: "review.reopen", Namespace: rep.Namespace, Target: rep.Name,
@@ -265,7 +267,7 @@ func (m *Memory) ResolveReport(_ context.Context, id int64, state, by string, at
 	return r, nil
 }
 
-func (m *Memory) MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, audit model.AuditEvent) (model.Skill, error) {
+func (m *Memory) MoveSkill(ctx context.Context, skillID int64, toNamespace, toName string, expectedRevision int64, audit model.AuditEvent) (model.Skill, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.guard(ctx); err != nil {
@@ -274,6 +276,9 @@ func (m *Memory) MoveSkill(ctx context.Context, skillID int64, toNamespace, toNa
 	s, ok := m.skills[skillID]
 	if !ok {
 		return model.Skill{}, model.ErrNotFound
+	}
+	if s.ReviewRevision != expectedRevision {
+		return model.Skill{}, conflict("entry_changed", "the entry changed while the claim was checked; try again")
 	}
 	ns, ok := m.ns[toNamespace]
 	if !ok {
@@ -306,4 +311,13 @@ func (m *Memory) SkillRedirect(_ context.Context, namespace, name string) (model
 		return model.Skill{}, model.ErrNotFound
 	}
 	return m.withUpstream(s), nil
+}
+
+func (m *Memory) stampMCPVersions(serverID int64, at time.Time) {
+	for id, v := range m.mcpVers {
+		if v.ServerID == serverID {
+			v.UpdatedAt = micro(at)
+			m.mcpVers[id] = v
+		}
+	}
 }
